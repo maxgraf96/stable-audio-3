@@ -51,7 +51,7 @@ def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
         "use_effective_length_for_schedule", False
     )
 
-    pretransform = create_autoencoder_from_config(model_config, sample_rate)
+    pretransform = create_pretransform_from_config(model_config, sample_rate)
     min_input_length = pretransform.downsampling_ratio
 
     conditioning_config = model_config.get("conditioning", None)
@@ -86,13 +86,8 @@ def create_autoencoder_from_config(config, sample_rate):
     # Full SA3 configs nest them inside config["model"]["pretransform"]["config"].
     if "encoder" in config:
         autoencoder_config = config
-        chunked = False
-        iterate_batch = False
     else:
-        pretransform_block = config["pretransform"]
-        autoencoder_config = pretransform_block["config"]
-        chunked = pretransform_block.get("chunked", False)
-        iterate_batch = pretransform_block.get("iterate_batch", False)
+        autoencoder_config = config["pretransform"]["config"]
     encoder = SAMEEncoder(**autoencoder_config["encoder"]["config"])
     decoder = SAMEDecoder(**autoencoder_config["decoder"]["config"])
 
@@ -105,7 +100,7 @@ def create_autoencoder_from_config(config, sample_rate):
     pretransform = PatchedPretransform(**autoencoder_config["pretransform"]["config"])
     bottleneck = SoftNormBottleneck(**autoencoder_config["bottleneck"]["config"])
 
-    autoencoder = AudioAutoencoder(
+    return AudioAutoencoder(
         encoder,
         decoder,
         io_channels=io_channels,
@@ -118,6 +113,13 @@ def create_autoencoder_from_config(config, sample_rate):
         out_channels=out_channels,
         soft_clip=soft_clip,
     )
+
+
+def create_pretransform_from_config(config, sample_rate):
+    pretransform_block = config["pretransform"]
+    autoencoder = create_autoencoder_from_config(config, sample_rate)
+    chunked = pretransform_block.get("chunked", False)
+    iterate_batch = pretransform_block.get("iterate_batch", False)
     return AutoencoderPretransform(
         autoencoder, chunked=chunked, iterate_batch=iterate_batch
     )

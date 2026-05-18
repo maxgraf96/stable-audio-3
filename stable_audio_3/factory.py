@@ -12,7 +12,10 @@ from stable_audio_3.models.conditioners import (
     T5GemmaConditioner,
 )
 from stable_audio_3.models.bottleneck import SoftNormBottleneck
-from stable_audio_3.models.pretransforms import PatchedPretransform
+from stable_audio_3.models.pretransforms import (
+    PatchedPretransform,
+    AutoencoderPretransform,
+)
 
 
 def create_diffusion_cond_from_config(config: tp.Dict[str, tp.Any]):
@@ -83,8 +86,13 @@ def create_autoencoder_from_config(config, sample_rate):
     # Full SA3 configs nest them inside config["model"]["pretransform"]["config"].
     if "encoder" in config:
         autoencoder_config = config
+        chunked = False
+        iterate_batch = False
     else:
-        autoencoder_config = config["pretransform"]["config"]
+        pretransform_block = config["pretransform"]
+        autoencoder_config = pretransform_block["config"]
+        chunked = pretransform_block.get("chunked", False)
+        iterate_batch = pretransform_block.get("iterate_batch", False)
     encoder = SAMEEncoder(**autoencoder_config["encoder"]["config"])
     decoder = SAMEDecoder(**autoencoder_config["decoder"]["config"])
 
@@ -97,7 +105,7 @@ def create_autoencoder_from_config(config, sample_rate):
     pretransform = PatchedPretransform(**autoencoder_config["pretransform"]["config"])
     bottleneck = SoftNormBottleneck(**autoencoder_config["bottleneck"]["config"])
 
-    return AudioAutoencoder(
+    autoencoder = AudioAutoencoder(
         encoder,
         decoder,
         io_channels=io_channels,
@@ -109,6 +117,9 @@ def create_autoencoder_from_config(config, sample_rate):
         in_channels=in_channels,
         out_channels=out_channels,
         soft_clip=soft_clip,
+    )
+    return AutoencoderPretransform(
+        autoencoder, chunked=chunked, iterate_batch=iterate_batch
     )
 
 

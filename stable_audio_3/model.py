@@ -104,6 +104,7 @@ class StableAudioModel:
         apg_scale: float = 1.0,
         dist_shift=None,
         return_latents: bool = False,
+        chunked_decode: tp.Optional[bool] = None,
         **sampler_kwargs,
     ) -> torch.Tensor:
         """
@@ -309,6 +310,7 @@ class StableAudioModel:
             init_data=init_audio,
             init_noise_level=init_noise_level,
             decode=not return_latents,
+            chunked_decode=chunked_decode,
             **sampler_kwargs,
         )
 

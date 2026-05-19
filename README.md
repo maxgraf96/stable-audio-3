@@ -2,16 +2,9 @@
 
 **A state-of-the-art open platform for fast, high-quality generated audio and music.**
 
-[![arXiv](https://img.shields.io/badge/Technical%20Report-XXXX.XXXXX-b31b1b.svg)](https://arxiv.org/abs/XXXX.XXXXX)
-[[TODO:Blog]] <a href="https://discord.gg/cKpvjey8b"><img alt="Join us on Discord" src="https://img.shields.io/discord/823813159592001537?color=5865F2&logo=discord&logoColor=white"></a>
+[Technical Report](https://arxiv.org/abs/2605.17991) · [Blog Post]() · [🤗 Models](https://huggingface.co/collections/stabilityai/stable-audio-3) · [🤗 Extra Models](https://huggingface.co/collections/stabilityai/stable-audio-3-extra) · [Discord](https://discord.gg/cKpvjey8b)
 
 ![Stable Audio 3 Architecture](stable-audio-3.png)
-
-## Abstract
-
-
-TODO:TBD
-
 
 
 Stable Audio 3 is the next generation of Stable Audio: a focused, streamlined platform for inference and fine-tuning, built on lessons from [stable-audio-tools](https://github.com/Stability-AI/stable-audio-tools). If you're doing foundational research or working with previous Stable Audio models, that repo is still the place to go.
@@ -21,12 +14,14 @@ Stable Audio 3 is the next generation of Stable Audio: a focused, streamlined pl
 
 ## Models
 
-| Model | Autoencoder | Hardware | Params | Max length | Use case |
-|---|---|---|---|---|---|
-| **Stable Audio 3 Small-Music** | SAME-Small | CPU | 433M | 120s | Lightweight music-only inference, no GPU required |
-| **Stable Audio 3 Small-SFX** | SAME-Small | CPU | 433M | 120s | Lightweight sound effects-only inference, no GPU required |
-| **Stable Audio 3 Medium** | SAME-Large | GPU (CUDA) | 1.4B | 380s | High Quality, Fast Inference |
-| **Stable Audio 3 Large** | SAME-Large | API only | 2.7B | 380s | Highest quality, API only. Not supported by this repo, see the [API docs](#) |
+| Model | API name | Autoencoder | Hardware | Params | Max length | Use case |
+|---|---|---|---|---|---|---|
+| [**Stable Audio 3 Small-Music**](https://huggingface.co/stabilityai/stable-audio-3-small-music) | `small-music` | SAME-Small | CPU | 433M | 120s | Lightweight music-only inference, no GPU required |
+| [**Stable Audio 3 Small-SFX**](https://huggingface.co/stabilityai/stable-audio-3-small-sfx) | `small-sfx` | SAME-Small | CPU | 433M | 120s | Lightweight sound effects-only inference, no GPU required |
+| [**Stable Audio 3 Medium**](https://huggingface.co/stabilityai/stable-audio-3-medium) | `medium` | SAME-Large | GPU (CUDA) | 1.4B | 380s | High Quality, Fast Inference |
+| **Stable Audio 3 Large** | — | SAME-Large | API only | 2.7B | 380s | Highest quality, API only. Not supported by this repo, see the [API docs](#) |
+
+Base (un-post-trained) checkpoints, the SAME autoencoders, and optimized variants are available in the [Extra Models collection](https://huggingface.co/collections/stabilityai/stable-audio-3-extra).
 
 ### Performance (TODO: finish this)
 

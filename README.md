@@ -289,10 +289,10 @@ For Stable Audio 3, please cite
   title={Stable Audio 3},
   author={Zach Evans and Julian D. Parker and Matthew Rice and CJ Carr and Zack Zukowski and Josiah Taylor and Jordi Pons},
   year={2026},
-  eprint={2605.12345},
+  eprint={2605.17991},
   archivePrefix={arXiv},
   primaryClass={cs.SD},
-  url={https://arxiv.org/abs/2505.12345}
+  url={https://arxiv.org/abs/2605.17991}
 }
 ```
 
@@ -302,9 +302,9 @@ For SAME, please cite
   title={SAME: A Semantically-Aligned Music Autoencoder},
   author={Julian D. Parker and Zach Evans and CJ Carr and Zack Zukowski and Josiah Taylor and Matthew Rice and Jordi Pons},
   year={2026},
-  eprint={2605.12345},
+  eprint={2605.18613},
   archivePrefix={arXiv},
   primaryClass={cs.SD},
-  url={https://arxiv.org/abs/2505.12345}
+  url={https://arxiv.org/abs/2605.18613}
 }
 ```

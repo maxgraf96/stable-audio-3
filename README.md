@@ -25,7 +25,7 @@ Base (un-post-trained) checkpoints, the SAME autoencoders, and optimized variant
 
 ### Performance
 
-| Model | Duration | H200 | H200 + TensorRT | Mac CPU* | Mac CoreML* | Peak VRAM† |
+| Model | Duration | H200 | H200 + TensorRT | Mac CPU* | Mac CoreML | Peak VRAM† |
 |---|---|---|---|---|---|---|
 | `small` | 5s | 0.41s | 0.017s | 0.70s | 0.23s | 1.69 GB |
 | `small` | 30s | 0.46s | 0.022s | 1.72s | 0.63s | 1.89 GB |

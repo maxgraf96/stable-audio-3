@@ -537,7 +537,9 @@ def create_sampling_ui(stable_audio_3_model, default_prompt=None):
         api_name="generate")
 
     def _prompt_assistant_or_download(text, progress=gr.Progress(track_tqdm=True)):
-        _reprompt_get_model(_reprompt_model_id)
+        if not _reprompt_is_model_cached(_reprompt_model_id):
+            _reprompt_get_model(_reprompt_model_id)
+            return text, gr.update(), gr.update(value="Prompt Assistant")
         _, result, _ = _reprompt_fn(text, "Auto", "", _reprompt_model_id, 128, 1.11)
         m = _LENGTH_EXTRACT_RE.search(result)
         if m:
@@ -546,7 +548,7 @@ def create_sampling_ui(stable_audio_3_model, default_prompt=None):
             result = result[:m.start()]
         else:
             seconds = gr.update()
-        return result, seconds, gr.update(value="Prompt Assistant")
+        return result, seconds, gr.update()
 
     prompt_assistant_button.click(
         fn=_prompt_assistant_or_download,

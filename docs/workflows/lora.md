@@ -13,11 +13,9 @@ LoRA fine-tuning lets you adapt a Stable Audio 3 model to a specific style, soun
   | `small` | ~2.5 GB | ~2 GB |
 - The `lora` extra installed: `uv sync --extra lora`
 
-> Because the base model is frozen, training VRAM is roughly the same as inference. See the [performance table](../../README.md#performance) for inference figures.
-
 ## Quick Start
 
-We don't claim these are optimal settings — LoRA behavior varies a lot with dataset size, style, and hardware. But these are the configurations we've found work well for most datasets and are good starting points before tuning.
+We don't claim these are optimal settings, LoRA behavior varies a lot with dataset size, style, and hardware. But these are the configurations we've found work well for most datasets and are good starting points before tuning.
 
 **Standard (recommended starting point)**
 ```bash

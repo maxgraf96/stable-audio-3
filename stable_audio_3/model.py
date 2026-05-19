@@ -367,12 +367,12 @@ class StableAudioModel:
         """Returns (conditioning, negative_conditioning) lists of dicts."""
 
         def _to_list(value, name):
-            """Broadcast a scalar or validate a list to length batch_size."""
-            if isinstance(value, list):
+            """Broadcast a scalar or validate a sequence to length batch_size."""
+            if isinstance(value, (list, tuple)):
                 assert len(value) == batch_size, (
                     f"Length of {name} ({len(value)}) must match batch_size ({batch_size})"
                 )
-                return value
+                return list(value)
             return [value] * batch_size
 
         prompts = _to_list(prompt, "prompt")

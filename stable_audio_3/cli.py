@@ -6,6 +6,7 @@ Basic usage::
     stable-audio --model small-music -p "lo-fi hip hop beat, 90 BPM" --duration 30 -o beat.wav
 
 """
+
 import argparse
 import os
 import warnings

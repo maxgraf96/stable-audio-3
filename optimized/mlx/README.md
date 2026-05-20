@@ -4,8 +4,8 @@ Apple-Silicon-native inference for **Stable Audio 3**, with no PyTorch,
 transformers, or stable-audio-tools at runtime.
 
 ```bash
-./install.sh                                        # one-time setup
-./sa3 --prompt "lofi house loop" --play             # generates + plays
+./install.sh                                              # one-time setup
+./sa3 --prompt "Epic orchestral buildup" --play           # generates + plays
 ```
 
 ## Three models, three modes

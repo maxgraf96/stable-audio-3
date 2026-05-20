@@ -9,7 +9,7 @@
 #   curl -LsSf <URL>/bootstrap.sh | bash
 #   curl -LsSf <URL>/bootstrap.sh | bash -s -- --prompt "ambient drone" --dit medium --decoder same-l
 #
-# Default demo prompt is "Death Metal" (just because).
+# Default demo prompt is "Epic orchestral buildup".
 #
 # What it does:
 #   1. Verifies you're on Apple Silicon.
@@ -17,7 +17,7 @@
 #      via a tarball (curl + tar — no git, no Xcode CLT needed). Sibling
 #      optimized/{tensorrt,coreml,...} subdirs are skipped.
 #   3. Runs ./install.sh -y inside it (uv + Python 3.11 + venv + weight downloads).
-#   4. Runs ./sa3 with whatever args you passed (default: "Death Metal" demo + --play).
+#   4. Runs ./sa3 with whatever args you passed (default: "Epic orchestral buildup" demo + --play).
 #
 set -euo pipefail
 
@@ -26,7 +26,7 @@ REPO_NAME="stable-audio-3"
 BRANCH="main"
 SUBDIR_IN_REPO="optimized/mlx"
 LOCAL_DIR="sa3_mlx"
-DEFAULT_ARGS=(--prompt "Death Metal" --dit sm-music --decoder same-s --seconds 10 --play)
+DEFAULT_ARGS=(--prompt "Epic orchestral buildup" --dit sm-music --decoder same-s --seconds 10 --play)
 
 TAR_URL="https://github.com/$REPO_OWNER/$REPO_NAME/archive/refs/heads/$BRANCH.tar.gz"
 TAR_INNER="$REPO_NAME-$BRANCH/$SUBDIR_IN_REPO"

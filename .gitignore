@@ -168,3 +168,9 @@ wandb/*
 .DS_Store
 *.safetensors
 .claude
+
+# remix webapp: keep tree, ignore dropped-in model + wasm artifacts
+web/static/models/*
+!web/static/models/.gitkeep
+web/static/wasm/*
+!web/static/wasm/.gitkeep

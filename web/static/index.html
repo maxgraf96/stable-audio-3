@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Remix — A/B lab</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&display=swap">
+    <link rel="stylesheet" href="/css/styles.css">
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@dev/dist/ort.webgpu.min.js"></script>
+</head>
+
+<body>
+    <div class="app">
+
+        <header class="hd">
+            <button class="hd-brand" id="brandHome" title="Back to start">
+                <div class="hd-name"><b>Remix</b></div>
+            </button>
+            <div class="hd-right" id="hdRight">
+                <span class="meta">Stable Audio 3 · <b>medium</b></span>
+                <button class="hd-link" id="helpBtn">Help</button>
+            </div>
+        </header>
+
+        <div class="stage">
+            <!-- Reel A · Source -->
+            <div class="reel reel-a" id="reelA">
+                <div class="reel-head">
+                    <div class="reel-head-l">
+                        <div class="reel-role"><span class="dot">A</span><span>Source</span></div>
+                        <div class="reel-title" id="aTitle" hidden></div>
+                        <div class="reel-stats" id="aStats" hidden></div>
+                    </div>
+                </div>
+                <div class="reel-body" id="aBody">
+                    <div class="reel-empty" id="dropzone">
+                        <div class="drop-icon">↓</div>
+                        <div class="empty-title">Drop a track here</div>
+                        <div class="empty-sub">or <button type="button" id="browseBtn">browse your files</button></div>
+                        <div class="formats">mp3 · wav · flac · ogg — up to 6:20</div>
+                    </div>
+                </div>
+                <div class="reel-footer" id="aFooter" hidden>
+                    <div class="specs" id="aSpecs"></div>
+                    <div class="reel-actions">
+                        <button class="btn-soft" id="replaceBtn"><span class="icon">↺</span> Replace</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Reel B · Remix -->
+            <div class="reel reel-b" id="reelB">
+                <div class="reel-head">
+                    <div class="reel-head-l">
+                        <div class="reel-role">
+                            <span class="dot">B</span><span>Remix</span>
+                        </div>
+                        <div class="reel-title" id="bTitleEmpty">No remix yet</div>
+                        <div id="bVersionWrap" hidden>
+                            <div class="b-version-row">
+                                <select class="version-select" id="versionSelect"></select>
+                                <span class="b-runtime">rendered in <span id="bRuntime">—</span></span>
+                            </div>
+                            <div class="b-prompt" id="bPrompt" title=""></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="reel-body" id="bBody">
+                    <div class="reel-await">
+                        <div class="await-mark">B</div>
+                        <div class="await-title">No remix yet</div>
+                        <div class="await-sub">
+                            Press <b>Remix track</b> to render the first variation. It usually takes 10–20 seconds.
+                        </div>
+                    </div>
+                </div>
+                <div class="reel-footer" id="bFooter" hidden>
+                    <div class="diff-row" id="bMeta"></div>
+                    <div class="reel-actions">
+                        <button class="btn-soft" id="regenerateBtn"><span class="icon">↻</span> Regenerate</button>
+                        <a class="btn-soft primary" id="downloadBtn" download="remix.wav"><span class="icon">↓</span>
+                            WAV</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Variants strip — visible when variants exist -->
+        <div class="variants" id="variantsStrip" hidden>
+            <span class="variants-label">Variations</span>
+            <div id="variantChips" class="variant-chips-wrap"></div>
+            <button class="variant-add" id="addVariantBtn">
+                <span class="plus">+</span> New variation
+                <span class="cost">~12s</span>
+            </button>
+        </div>
+
+        <!-- Transport -->
+        <div class="transport" id="transport" hidden>
+            <div class="tp-left">
+                <button class="tp-play" id="tpPlay" aria-label="Play / pause">
+                    <svg viewBox="0 0 14 14" fill="currentColor" id="tpPlayIcon">
+                        <path d="M3 1.5 L12 7 L3 12.5 Z" />
+                    </svg>
+                </button>
+                <div class="tp-time">
+                    <span id="tpNow">0:00</span>
+                    <span class="sep">/</span>
+                    <span class="tot" id="tpTotal">0:00</span>
+                </div>
+            </div>
+            <div class="tp-bar" id="tpBar">
+                <div class="tp-fill" id="tpFill"></div>
+                <div class="tp-head" id="tpHead"></div>
+            </div>
+            <div class="tp-right">
+                <span class="listening">
+                    <span>Listening to</span>
+                    <span class="now" id="tpListening">
+                        <span class="role-dot" id="tpRoleDot"></span><span id="tpRoleLabel">Source</span>
+                    </span>
+                </span>
+                <button class="swap-btn" id="swapBtn" title="Swap A/B">⇄ Swap <span class="kbd">X</span></button>
+            </div>
+        </div>
+
+        <!-- Remix-in-progress card -->
+        <div class="progress-card" id="progressCard" hidden>
+            <div class="progress-head">
+                <div class="title">
+                    <span id="pcTitle">Rendering variation 1</span>
+                    <span class="small" id="pcSubtitle">Separating vocals…</span>
+                </div>
+                <div class="elapsed">
+                    <span id="pcElapsed">0.0</span><span class="unit">s</span>
+                    <span class="eta" id="pcEta">~12s remaining</span>
+                </div>
+            </div>
+            <div class="progress-bar">
+                <div class="fill" id="pcFill"></div>
+            </div>
+            <div class="stage-list" id="pcStageList"></div>
+        </div>
+
+        <!-- Controls -->
+        <div class="controls" id="controls" hidden>
+            <!-- Prompt card -->
+            <div class="card prompt-card">
+                <div class="section-title">
+                    <span>Prompt</span>
+                </div>
+                <div class="prompt-wrap">
+                    <textarea id="prompt" spellcheck="false"
+                        placeholder="e.g. Bossa nova jazz, brushed drums, Brazilian violins.">TrackType: Music, VocalType: Vocal harmonies. Bossa nova jazz background harmonies. Light acoustic guitar, Brazilian percussion and upright bass.</textarea>
+                    <div class="prompt-suffix">
+                        <span class="lbl">Auto-appended on submit:</span>
+                        <span class="auto">BPM <b id="suffixBpm">—</b></span>
+                        <span class="auto">Key <b id="suffixKey">—</b></span>
+                    </div>
+                </div>
+                <div class="prompt-cta">
+                    <div class="lead">
+                        <b id="promptCharCount">0</b> characters
+                    </div>
+                    <button class="remix-btn" id="remixBtn">
+                        <span class="arr" id="remixArr">▶</span>
+                        <span id="remixLabel">Remix track</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Right column: meta + recipe -->
+            <div class="controls-right">
+                <div class="meta-grid">
+                    <div class="meta-field">
+                        <div class="label">
+                            <span>Tempo</span>
+                            <span class="status" id="bpmStatus" hidden></span>
+                        </div>
+                        <input type="text" id="bpm" inputmode="decimal" placeholder="auto">
+                    </div>
+                    <div class="meta-field">
+                        <div class="label">
+                            <span>Key</span>
+                            <span class="status" id="keyStatus" hidden></span>
+                        </div>
+                        <input type="text" id="key" placeholder="auto">
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="section-title">
+                        <span>How much to change</span>
+                        <span class="help">From a nudge to a full rewrite.</span>
+                    </div>
+                    <div class="recipe-row">
+                        <div class="recipe-label">
+                            <span>Remix amount</span>
+                            <span class="val" id="noiseVal">0.54</span>
+                        </div>
+                        <div class="preset-chips" id="presetChips">
+                            <button data-preset="subtle" data-val="0.30">Subtle<span class="num">0.30</span></button>
+                            <button data-preset="strong" data-val="0.54" class="active">Strong<span
+                                    class="num">0.54</span></button>
+                            <button data-preset="wild" data-val="0.82">Wild<span class="num">0.82</span></button>
+                        </div>
+                        <input type="range" class="slider" id="noise" min="0.05" max="1" step="0.01" value="0.54">
+                        <div class="slider-ticks">
+                            <span>preserve melody</span><span>balanced</span><span>full transform</span>
+                        </div>
+                    </div>
+
+                    <div class="recipe-row" style="margin-top:12px">
+                        <div class="recipe-label">
+                            <span>Prompt adherence <span class="help">CFG</span></span>
+                            <span class="val" id="cfgVal">4.0</span>
+                        </div>
+                        <input type="range" class="slider" id="cfg" min="0" max="15" step="0.1" value="4.0">
+                        <div class="slider-ticks positioned">
+                            <span class="t" style="left:0%">loose</span>
+                            <span class="t" style="left:26.67%; transform:translateX(-50%)">default 4.0</span>
+                            <span class="t" style="right:0%">strict</span>
+                        </div>
+                    </div>
+
+                    <div style="border-top:1px solid var(--line-soft); padding-top:20px; margin-top:12px">
+                        <div class="section-title" style="margin-bottom:14px">
+                            <span>Vocals</span>
+                            <span class="help">Runs in your browser. ~10s on first track.</span>
+                        </div>
+                        <div class="tog-row">
+                            <div class="tog on" id="separateTog" role="switch" aria-checked="true"></div>
+                            <div class="tog-text">
+                                <div class="tog-title">Strip vocals before remixing</div>
+                                <div class="tog-sub">The model only sees the instrumental. Recommended — vocals don't
+                                    survive the trip otherwise.</div>
+                            </div>
+                        </div>
+                        <div class="tog-row">
+                            <div class="tog on" id="readdTog" role="switch" aria-checked="true"></div>
+                            <div class="tog-text">
+                                <div class="tog-title">Mix originals back on top</div>
+                                <div class="tog-sub">Layer the source vocals over the remix. Covers anything the model
+                                    invented vocally.</div>
+                            </div>
+                        </div>
+                        <div class="recipe-row" id="vocalGainRow"
+                            style="margin-top:18px; padding-top:18px; border-top:1px solid var(--line-soft)">
+                            <div class="recipe-label">
+                                <span>Vocal level</span>
+                                <span class="val" id="vocalGainVal">1.00×</span>
+                            </div>
+                            <input type="range" class="slider" id="vocalGain" min="0" max="2" step="0.01" value="1.0">
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Empty-state guide (visible only in empty stage) -->
+        <div class="guide" id="emptyGuide">
+            <div class="step">
+                <div class="num">01</div>
+                <div class="title">Add a reference track</div>
+                <div class="body">
+                    Anything up to 6:20. Tempo and key are detected in the background while you write the prompt.
+                </div>
+            </div>
+            <div class="step">
+                <div class="num">02</div>
+                <div class="title">Describe the version you want</div>
+                <div class="body">
+                    Tags work better than prose. Try <code>Lofi, Rhodes piano, brushed drums, no vocals</code> or
+                    <code>Bossa nova, Brazilian violins</code>. We append BPM and key automatically so tempo stays
+                    locked.
+                </div>
+            </div>
+            <div class="step">
+                <div class="num">03</div>
+                <div class="title">Compare without losing your place</div>
+                <div class="body">
+                    A/B switching is sample-aligned. Generate up to four variations and
+                    toggle between them on the same playhead.
+                </div>
+            </div>
+
+            <div class="compat-note">
+                <strong>A note on compatibility.</strong>
+                Vocal separation runs locally in your browser via Demucs (ONNX Runtime
+                Web). It works best on desktop <strong>Chrome</strong> or
+                <strong>Edge</strong>, where WebGPU is available; it falls back to a
+                slower WASM path on Safari and Firefox, and may not run reliably on
+                iOS. If separation fails on your setup, turn off both vocal toggles to
+                remix the full track directly.
+                <details class="compat-matrix">
+                    <summary>View full compatibility matrix</summary>
+                    <img src="/img/webgpucompattable.png" alt="WebGPU / ONNX Runtime Web browser compatibility matrix">
+                </details>
+            </div>
+        </div>
+
+        <div id="errorBox" class="notice warn" hidden></div>
+    </div>
+
+    <input type="file" id="fileInput" accept="audio/*" hidden>
+
+    <script type="module" src="/js/app.js"></script>
+</body>
+
+</html>

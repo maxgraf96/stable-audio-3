@@ -30,6 +30,13 @@ lora = [
   "dill>=0.4.1",
 ]
 
+web = [
+  "fastapi>=0.118",
+  "uvicorn[standard]>=0.34",
+  "python-multipart>=0.0.20",
+  "httpx>=0.27",
+]
+
 [[tool.uv.index]]
 name = "pytorch-cu126"
 url = "https://download.pytorch.org/whl/cu126"

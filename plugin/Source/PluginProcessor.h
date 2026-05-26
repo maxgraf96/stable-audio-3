@@ -5,15 +5,25 @@
 // background thread and play back the generated WAV from the audio thread.
 #pragma once
 
+#include <mutex>
+
 #include <JuceHeader.h>
 
-#include "PipelineLoader.h"
+#include "VariationsEngine.h"
 
 class SA3AudioProcessor : public juce::AudioProcessor
 {
 public:
-    sa3plugin::PipelineLoader& getPipelineLoader() { return pipelineLoader; }
-    const sa3plugin::PipelineLoader& getPipelineLoader() const { return pipelineLoader; }
+    sa3plugin::VariationsEngine& getVariationsEngine() { return variationsEngine; }
+    const sa3plugin::VariationsEngine& getVariationsEngine() const { return variationsEngine; }
+
+    // Opaque blob the editor uses to round-trip JS-side UI state through
+    // getStateInformation / setStateInformation. We persist a JSON string
+    // (preset, noise, bpm, key, prompt) — small, schema-flexible, no need
+    // for a binary format. The audio file is intentionally not persisted:
+    // re-base64ing it across save/load would bloat project files.
+    juce::String getPersistedUiStateJson() const;
+    void         setPersistedUiStateJson(juce::String json);
 
     SA3AudioProcessor();
     ~SA3AudioProcessor() override;
@@ -43,11 +53,21 @@ public:
     void setStateInformation(const void* data, int sizeInBytes) override;
 
 private:
-    // Background-thread loader. Constructed in NotLoaded state; load is
-    // triggered on first createEditor() call (so plugin scan / auval don't
-    // pay the cost). Lifetime tied to the processor — destructor joins the
-    // worker on plugin unload.
-    sa3plugin::PipelineLoader pipelineLoader;
+    // Single MLX-owning worker thread.  Handles both the one-shot pipeline
+    // load (triggered on first createEditor() so plugin scan / auval don't
+    // pay the cost) and every subsequent variation generate request from
+    // the WebView editor.  MLX binds default streams to the thread that
+    // first touches them — one worker means one stream context, so arrays
+    // created at load time stay reachable from generate calls.  Destructor
+    // joins the worker on plugin unload.
+    sa3plugin::VariationsEngine variationsEngine;
+
+    // JS-side UI state (preset, noise, bpm, key, prompt) round-tripped as a
+    // JSON string.  Written by the editor's setUiState native fn; read by
+    // get/setStateInformation.  Mutex protects access from the JUCE message
+    // thread (writes) and DAW serialization thread (reads).
+    mutable std::mutex uiStateMutex;
+    juce::String       uiStateJson;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SA3AudioProcessor)
 };

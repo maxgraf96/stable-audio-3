@@ -1,14 +1,23 @@
 :root {
   color-scheme: dark;
   --bg: #1c1c1e;
+  --panel: #2c2c2e;
+  --panel-2: #3a3a3c;
+  --border: #48484a;
   --fg: #f2f2f7;
   --muted: #8e8e93;
   --accent: #5e5ce6;
+  --accent-hover: #7d7bf2;
   --error: #ff453a;
   --ok: #30d158;
 }
 
 * { box-sizing: border-box; }
+
+/* The HTML `hidden` attribute defaults to `display: none`, but our `.row`
+   rule sets `display: flex` which wins on specificity.  Force the hidden
+   attribute to take precedence so toggling it actually hides the row. */
+[hidden] { display: none !important; }
 
 html, body {
   height: 100%;
@@ -17,31 +26,188 @@ html, body {
   background: var(--bg);
   color: var(--fg);
   -webkit-font-smoothing: antialiased;
+  font-size: 13px;
+  overflow: hidden;
 }
 
 main {
   height: 100%;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 24px;
+  gap: 12px;
+  padding: 16px;
+  overflow-y: auto;
 }
 
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
 h1 {
   margin: 0;
-  font-size: 48px;
+  font-size: 24px;
   font-weight: 700;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.01em;
 }
-
 .status {
   margin: 0;
-  font-size: 14px;
+  font-size: 12px;
   color: var(--muted);
+  text-align: right;
 }
-
 .status-loading { color: var(--muted); }
 .status-ready   { color: var(--ok); }
+.status-busy    { color: var(--accent-hover); }
 .status-error   { color: var(--error); }
+
+/* Drop zone */
+.dropzone {
+  border: 2px dashed var(--border);
+  border-radius: 10px;
+  padding: 18px;
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.dropzone.drag-over {
+  border-color: var(--accent);
+  background: rgba(94, 92, 230, 0.08);
+}
+.dropzone.has-file {
+  border-style: solid;
+  border-color: var(--border);
+}
+.dropzone-hint   { margin: 0; color: var(--muted); }
+.dropzone-meta   { margin: 0; font-size: 12px; color: var(--fg); font-weight: 500; }
+.dropzone audio  { width: 100%; max-width: 540px; }
+
+/* Controls */
+.controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: var(--panel);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.row label {
+  min-width: 60px;
+  color: var(--muted);
+}
+.row label.inline { min-width: auto; margin-left: 8px; }
+.row .num {
+  font-variant-numeric: tabular-nums;
+  min-width: 36px;
+  color: var(--fg);
+}
+input[type="number"], input[type="text"], select {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-family: inherit;
+}
+input[type="number"]:focus, input[type="text"]:focus, select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+input[type="text"]   { flex: 1; min-width: 120px; }
+input[type="number"] { width: 80px; flex: 0 0 auto; }
+input[type="range"]  { flex: 1; accent-color: var(--accent); }
+select               { flex: 1; }
+
+button.primary {
+  flex: 1;
+  background: var(--accent);
+  color: white;
+  border: none;
+  padding: 9px 14px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+button.primary:hover:not(:disabled) { background: var(--accent-hover); }
+button.primary:disabled {
+  background: var(--panel-2);
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+/* Error banner — persistent until the user dismisses it. The status line
+   updates regardless; the banner just stops failures from scrolling past
+   unnoticed. */
+.error-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(255, 69, 58, 0.15);
+  border: 1px solid var(--error);
+  color: var(--error);
+  border-radius: 8px;
+  padding: 8px 10px 8px 14px;
+  font-size: 12px;
+}
+.error-text { flex: 1; word-break: break-word; }
+.error-dismiss {
+  background: transparent;
+  border: none;
+  color: var(--error);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+.error-dismiss:hover { background: rgba(255, 69, 58, 0.18); }
+
+/* Variation pads */
+.variations {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+}
+.variation {
+  background: var(--panel);
+  border-radius: 8px;
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.variation-label {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--muted);
+  min-width: 28px;
+  text-align: center;
+}
+.variation-steer {
+  flex: 1 1 0;
+  color: var(--fg);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.variation audio {
+  flex: 0 0 260px;
+  height: 32px;
+}
+.variation.empty audio { opacity: 0.35; pointer-events: none; }

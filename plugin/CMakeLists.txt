@@ -56,7 +56,7 @@ juce_generate_juce_header(SA3)
 target_sources(SA3 PRIVATE
     Source/PluginProcessor.cpp
     Source/PluginEditor.cpp
-    Source/PipelineLoader.cpp
+    Source/VariationsEngine.cpp
 )
 
 target_compile_definitions(SA3 PUBLIC

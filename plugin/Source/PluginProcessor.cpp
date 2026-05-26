@@ -41,7 +41,7 @@ juce::AudioProcessorEditor* SA3AudioProcessor::createEditor()
     // First editor open triggers the background model load. Idempotent: no-op
     // on subsequent calls or once the load has finished. Plugin scan never
     // opens the editor, so AU validation / DAW scan stays fast.
-    pipelineLoader.requestLoad();
+    variationsEngine.requestLoad();
     return new SA3AudioProcessorEditor(*this);
 }
 
@@ -60,8 +60,30 @@ void SA3AudioProcessor::setCurrentProgram(int /*index*/)              {}
 const juce::String SA3AudioProcessor::getProgramName(int /*index*/)   { return {}; }
 void SA3AudioProcessor::changeProgramName(int, const juce::String&)   {}
 
-void SA3AudioProcessor::getStateInformation(juce::MemoryBlock& /*destData*/)        {}
-void SA3AudioProcessor::setStateInformation(const void* /*data*/, int /*sizeInBytes*/) {}
+juce::String SA3AudioProcessor::getPersistedUiStateJson() const
+{
+    std::lock_guard<std::mutex> lk(uiStateMutex);
+    return uiStateJson;
+}
+
+void SA3AudioProcessor::setPersistedUiStateJson(juce::String json)
+{
+    std::lock_guard<std::mutex> lk(uiStateMutex);
+    uiStateJson = std::move(json);
+}
+
+void SA3AudioProcessor::getStateInformation(juce::MemoryBlock& destData)
+{
+    const juce::String json = getPersistedUiStateJson();
+    destData.append(json.toRawUTF8(), json.getNumBytesAsUTF8());
+}
+
+void SA3AudioProcessor::setStateInformation(const void* data, int sizeInBytes)
+{
+    if (data == nullptr || sizeInBytes <= 0) return;
+    setPersistedUiStateJson(juce::String::fromUTF8(
+        static_cast<const char*>(data), sizeInBytes));
+}
 
 // JUCE entry point for the plugin factory.
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()

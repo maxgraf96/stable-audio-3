@@ -60,12 +60,27 @@ target_sources(SA3 PRIVATE
 )
 
 target_compile_definitions(SA3 PUBLIC
-    # Trim JUCE's optional features we don't need — smaller binary, fewer deps.
-    JUCE_WEB_BROWSER=0
+    # WebView UI (HTML/CSS/JS via WebBrowserComponent + native bridge); CURL
+    # stays off — we don't talk to the network at runtime.
+    JUCE_WEB_BROWSER=1
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
     JUCE_DISPLAY_SPLASH_SCREEN=0
 )
+
+# ── Embedded UI resources (BinaryData) ────────────────────────────────
+# Resources/index.html, app.js, styles.css are baked into BinaryData.h/cpp and
+# served by the editor's WebView resource provider. For dev iteration without
+# rebuilding, set SA3_PLUGIN_RESOURCES=<repo>/plugin/Resources before launching
+# the standalone — the resource provider prefers disk over BinaryData.
+file(GLOB SA3_WEB_RESOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/*.html"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/*.js"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/*.css")
+juce_add_binary_data(SA3Resources
+    HEADER_NAME BinaryData.h
+    NAMESPACE BinaryData
+    SOURCES ${SA3_WEB_RESOURCES})
 
 # ── SA3 C++ port (optimized/cpp/) ─────────────────────────────────────
 # Phase 2: pull in the bit-exact C++ inference path. The orchestrator
@@ -78,6 +93,8 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../optimized/cpp
 target_link_libraries(SA3 PRIVATE
     juce::juce_audio_utils
     juce::juce_audio_processors
+    juce::juce_gui_extra            # WebBrowserComponent + native bridge
+    SA3Resources                    # baked HTML/CSS/JS (BinaryData.h)
     sa3_orchestrator
     PUBLIC
     juce::juce_recommended_config_flags

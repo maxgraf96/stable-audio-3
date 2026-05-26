@@ -34,9 +34,9 @@ FetchContent_MakeAvailable(JUCE)
 
 # ── Plugin target ────────────────────────────────────────────────────
 juce_add_plugin(SA3
-    PRODUCT_NAME              "SA3"
+    PRODUCT_NAME              "SA3 Variations"
     COMPANY_NAME              "MaxGraf"
-    BUNDLE_ID                 "com.maxgraf.sa3"
+    BUNDLE_ID                 "com.maxgraf.sa3variations"
     PLUGIN_MANUFACTURER_CODE  "Maxg"
     PLUGIN_CODE               "Sa3p"
     FORMATS                   AU VST3 Standalone

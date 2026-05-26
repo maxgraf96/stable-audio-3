@@ -3,61 +3,107 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>SA3 Variations</title>
+  <title>SA3 · Variations</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Inter+Tight:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <main>
-    <header>
-      <h1>SA3</h1>
-      <p id="status" class="status status-loading">starting…</p>
+  <div class="hl">
+    <!-- Top bar -->
+    <header class="top">
+      <div class="brand">
+        <h1>SA3</h1>
+        <span class="tag">Variations</span>
+      </div>
+      <div class="status" id="status">
+        <span class="dot"></span>
+        <span id="status-text">Starting</span>
+      </div>
     </header>
 
-    <div id="error-banner" class="error-banner" hidden>
+    <!-- Error banner: hidden until something goes wrong -->
+    <div class="error-banner" id="error-banner" hidden>
       <span class="error-text" id="error-text"></span>
       <button type="button" class="error-dismiss" id="error-dismiss"
-              aria-label="Dismiss error">×</button>
+              aria-label="Dismiss">×</button>
     </div>
 
-    <section id="dropzone" class="dropzone">
-      <p class="dropzone-hint">Drag a WAV / AIFF / FLAC / Ogg loop here</p>
-      <p class="dropzone-meta" id="source-meta"></p>
-      <audio id="source-audio" controls hidden></audio>
+    <!-- Source: shared between empty/loaded states. The whole div is the
+         drop target; .empty centres the prompt, .loaded shows the source
+         waveform + play head + duration. -->
+    <section class="source empty" id="source">
+      <div class="source-empty" id="source-empty">
+        <div class="drophint"><b>Drop</b> a loop, or <b>browse&hairsp;…</b></div>
+        <div class="formats">WAV · AIFF · FLAC · OGG</div>
+      </div>
+      <div class="source-loaded" id="source-loaded" hidden>
+        <div class="srcname">
+          <b id="srcname-text"></b>
+          <span id="srcdur-text" class="srcdur"></span>
+        </div>
+        <div class="srcwave" id="srcwave"></div>
+        <div class="srcrow">
+          <button type="button" class="playbtn" id="src-play"
+                  aria-label="Play source">
+            <svg class="play-ico"  width="9" height="9" viewBox="0 0 9 9"><polygon points="2,1 8,4.5 2,8" fill="currentColor"/></svg>
+            <svg class="pause-ico" width="9" height="9" viewBox="0 0 9 9"><rect x="1.5" y="1" width="2" height="7" fill="currentColor"/><rect x="5.5" y="1" width="2" height="7" fill="currentColor"/></svg>
+          </button>
+          <span class="srctime" id="src-time-cur">0:00</span>
+          <div style="flex: 1"></div>
+          <span class="srctime" id="src-time-rem">0:00</span>
+        </div>
+        <!-- Hidden — playback is JUCE-native now, no <audio> element. -->
+      </div>
     </section>
 
+    <!-- Controls -->
     <section class="controls">
       <div class="row">
-        <label for="preset">Preset</label>
-        <select id="preset">
-          <option value="free">Free variation (unconditional)</option>
-          <option value="app">Preserve sound (steered + bar-aware inpaints)</option>
-        </select>
+        <span class="lbl">Preset</span>
+        <div class="preset" id="preset">
+          <button type="button" class="field" id="preset-toggle">
+            <span class="preset-label" id="preset-label">Free variation</span>
+            <span class="sub" id="preset-sub">unconditional</span>
+            <span class="car">▾</span>
+          </button>
+          <div class="menu" id="preset-menu" hidden></div>
+        </div>
       </div>
-      <div class="row">
-        <label for="noise">Noise (σmax)</label>
-        <input type="range" id="noise" min="0.10" max="0.90" step="0.01" value="0.45" />
-        <span class="num" id="noise-value">0.45</span>
-      </div>
+
+      <!-- App-preset-only rows: surface bar-aware controls + text steering -->
       <div class="row app-only" hidden>
-        <label for="bpm">BPM</label>
-        <input type="number" id="bpm" min="40" max="240" step="1" placeholder="auto" />
-        <label for="key" class="inline">Key</label>
+        <span class="lbl">BPM · Key</span>
+        <input type="number" id="bpm" placeholder="auto" min="40" max="240" step="1" />
         <input type="text" id="key" placeholder="e.g. A minor" />
       </div>
       <div class="row app-only" hidden>
-        <label for="user-prompt">Prompt</label>
+        <span class="lbl">Prompt</span>
         <input type="text" id="user-prompt"
-               placeholder="e.g. muted electric piano, Rhodes amp tone" />
+               placeholder="e.g. muted electric piano, Rhodes tone" />
       </div>
+
       <div class="row">
-        <button id="generate" class="primary" disabled>Generate 5 variations</button>
+        <span class="lbl">Noise σ</span>
+        <input type="range" id="noise" min="0.10" max="0.90" step="0.01" value="0.45" />
+        <span class="val" id="noise-value">0.45</span>
       </div>
+
+      <button type="button" class="gen" id="generate" disabled>Generate 5 variations</button>
     </section>
 
-    <section class="variations" id="variations">
-      <!-- 5 audition pads populated on each run -->
+    <!-- Results: 5 slots. Hidden until first generate. -->
+    <section class="results" id="results" hidden>
+      <div class="res-head">
+        <span class="h">Variations</span>
+        <span class="meta" id="res-meta">5 · σ 0.45</span>
+      </div>
+      <div id="slots"></div>
+      <div class="kbd-hint">Use <kbd>↑</kbd> <kbd>↓</kbd> to cycle</div>
     </section>
-  </main>
+  </div>
+
   <script src="app.js"></script>
 </body>
 </html>

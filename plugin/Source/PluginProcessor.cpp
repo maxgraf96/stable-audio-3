@@ -10,8 +10,16 @@ SA3AudioProcessor::SA3AudioProcessor()
 
 SA3AudioProcessor::~SA3AudioProcessor() = default;
 
-void SA3AudioProcessor::prepareToPlay(double /*sampleRate*/, int /*samplesPerBlock*/) {}
-void SA3AudioProcessor::releaseResources() {}
+void SA3AudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
+{
+    // Forward to the engine — it acts as the audio source pulling stored
+    // decoded source / variation buffers into the host's output block.
+    variationsEngine.prepareToPlay(samplesPerBlock, sampleRate);
+}
+void SA3AudioProcessor::releaseResources()
+{
+    variationsEngine.releaseResources();
+}
 
 bool SA3AudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
 {
@@ -25,15 +33,12 @@ bool SA3AudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
 void SA3AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& /*midi*/)
 {
     juce::ScopedNoDenormals noDenormals;
-    // Phase 1: silent passthrough. Clear any output channels beyond the input
-    // count so the host doesn't get uninitialized memory.
-    const auto numIn  = getTotalNumInputChannels();
-    const auto numOut = getTotalNumOutputChannels();
-    for (int ch = numIn; ch < numOut; ++ch)
-        buffer.clear(ch, 0, buffer.getNumSamples());
-    // For now: zero out the output. Phase 2 will fill from the generated WAV.
-    for (int ch = 0; ch < numOut; ++ch)
-        buffer.clear(ch, 0, buffer.getNumSamples());
+    // Always replace the host's input — we're a generator, not an effect.
+    // The engine writes the active source/variation buffer at its own play
+    // position; if nothing's playing it fills with silence via
+    // clearActiveBufferRegion inside getNextAudioBlock.
+    juce::AudioSourceChannelInfo info(&buffer, 0, buffer.getNumSamples());
+    variationsEngine.getNextAudioBlock(info);
 }
 
 juce::AudioProcessorEditor* SA3AudioProcessor::createEditor()

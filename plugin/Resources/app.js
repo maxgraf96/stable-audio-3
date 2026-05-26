@@ -1,12 +1,13 @@
-// SA3 plugin — WebView front end.
+// SA3 plugin — Hairline WebView front end.
 //
-// JUCE 8 injects window.__JUCE__.backend automatically when the editor is built
-// with WebBrowserComponent::Options::withNativeIntegrationEnabled(true). All
-// native calls go through a single "__juce__invoke" event channel and replies
-// land in "__juce__complete" — exactly what the JUCE-bundled JS helper does.
-// Inlining the helper here avoids the import/MIME-type ceremony of pulling in
-// juce_gui_extra/native/javascript/index.js.
+// All audio I/O is JUCE-native: the source file is decoded by the engine on
+// upload (and peaks come back across the bridge), the variation WAVs live
+// as juce::AudioBuffer<float> in the engine, and playback is driven by
+// Processor::processBlock pulling from the engine. The WebView never touches
+// AudioContext or <audio> — that's important for running in a DAW where the
+// host owns the audio device.
 
+// ── JUCE bridge plumbing ─────────────────────────────────────────────
 const promises = new Map();
 let nextPromiseId = 0;
 
@@ -29,49 +30,175 @@ function getNativeFunction(name) {
   });
 }
 
-const getStatus  = getNativeFunction("getStatus");
-const generate   = getNativeFunction("generate");
-const getUiState = getNativeFunction("getUiState");
-const setUiState = getNativeFunction("setUiState");
+const getStatus    = getNativeFunction("getStatus");
+const getUiState   = getNativeFunction("getUiState");
+const setUiState   = getNativeFunction("setUiState");
+const uploadSource = getNativeFunction("uploadSource");
+const generate     = getNativeFunction("generate");
+const play         = getNativeFunction("play");
+const pause        = getNativeFunction("pause");
+const stop         = getNativeFunction("stop");
+const seek         = getNativeFunction("seek");
+const getPlayState = getNativeFunction("getPlayState");
+
+// ── Constants ────────────────────────────────────────────────────────
+const PRESETS = [
+  { value: "free", label: "Free variation", sub: "unconditional" },
+  { value: "app",  label: "Preserve sound", sub: "steered · bar-aware" },
+];
+
+const SOURCE_PEAKS_N = 220;
+const SLOT_PEAKS_N   = 140;
+
+const COLOR_FG     = "oklch(0.96 0.005 60)";
+const COLOR_ACCENT = "oklch(0.84 0.05 60)";
 
 // ── DOM refs ─────────────────────────────────────────────────────────
-const statusEl     = document.getElementById("status");
-const errorBanner  = document.getElementById("error-banner");
-const errorText    = document.getElementById("error-text");
-const errorDismiss = document.getElementById("error-dismiss");
-const dropEl       = document.getElementById("dropzone");
-const sourceAudio  = document.getElementById("source-audio");
-const sourceMeta   = document.getElementById("source-meta");
-const presetSel    = document.getElementById("preset");
-const noiseInput   = document.getElementById("noise");
-const noiseValue   = document.getElementById("noise-value");
-const bpmInput     = document.getElementById("bpm");
-const keyInput     = document.getElementById("key");
-const userPrompt   = document.getElementById("user-prompt");
-const generateBtn  = document.getElementById("generate");
-const variationsEl = document.getElementById("variations");
-const appOnlyRows  = document.querySelectorAll(".app-only");
+const $ = (id) => document.getElementById(id);
+const statusEl     = $("status");
+const statusText   = $("status-text");
+const errorBanner  = $("error-banner");
+const errorText    = $("error-text");
+const errorDismiss = $("error-dismiss");
 
-// ── State ─────────────────────────────────────────────────────────────
+const sourceEl       = $("source");
+const sourceEmpty    = $("source-empty");
+const sourceLoaded   = $("source-loaded");
+const srcNameEl      = $("srcname-text");
+const srcDurEl       = $("srcdur-text");
+const srcWaveEl      = $("srcwave");
+const srcPlayBtn     = $("src-play");
+const srcTimeCurEl   = $("src-time-cur");
+const srcTimeRemEl   = $("src-time-rem");
+
+const presetEl       = $("preset");
+const presetToggle   = $("preset-toggle");
+const presetLabelEl  = $("preset-label");
+const presetSubEl    = $("preset-sub");
+const presetMenuEl   = $("preset-menu");
+
+const bpmInput       = $("bpm");
+const keyInput       = $("key");
+const userPrompt     = $("user-prompt");
+
+const noiseInput     = $("noise");
+const noiseValueEl   = $("noise-value");
+
+const generateBtn    = $("generate");
+const resultsEl      = $("results");
+const resMetaEl      = $("res-meta");
+const slotsEl        = $("slots");
+const appOnlyRows    = document.querySelectorAll(".app-only");
+
+// ── State ────────────────────────────────────────────────────────────
 const state = {
-  audioBase64:   null,
-  audioMime:     null,
   fileName:      null,
+  hasSource:     false,
   fileSeconds:   null,
+  sourcePeaks:   null,
+  preset:        "free",
+  presetOpen:    false,
+  variations:    [],          // [{ steer, mode, peaks, duration }]
+  expected:      0,
   busy:          false,
   pipelineReady: false,
-  // Set true after we've finished applying any persisted state; before then
-  // we suppress save-on-change so rehydration doesn't echo back as a write.
   rehydrated:    false,
+  // Mirror of native play state (updated by poll).
+  playingIdx:    -2,          // -2 idle, -1 source, 0..4 slot
+  playing:       false,
+  progress:      0,
 };
 
-// 5-slot fallback labels — used if the engine response doesn't include
-// steers (defensive; the engine always sets them post-2.3d).
-const slotLabelsFree = ["1", "2", "3", "4", "5"];
-const slotLabelsApp  = ["A1", "A2", "A3", "I1", "I2"];
+// ── Time formatting ──────────────────────────────────────────────────
+function fmtTime(s) {
+  if (!isFinite(s) || s < 0) s = 0;
+  const m = Math.floor(s / 60);
+  const r = Math.floor(s % 60);
+  return `${m}:${String(r).padStart(2, "0")}`;
+}
 
-// ── Filename BPM/Key sniffing (mirrors parse_bpm_key_from_filename in
-// sa3_variations.py — same regexes, same precedence rules) ────────────
+// ── Waveform renderer (one SVG mount per call; setProgress is cheap) ──
+function escapeAttr(s) { return String(s).replace(/"/g, "&quot;"); }
+
+let waveformIdCounter = 0;
+
+function mountWaveform(el, peaks, opts = {}) {
+  const {
+    kind     = "line",
+    height   = 28,
+    barWidth = 1,
+    gap      = 1,
+    color    = "currentColor",
+    onSeek   = null,
+  } = opts;
+
+  const totalWidth = peaks.length * (barWidth + gap) - gap;
+  const cy         = height / 2;
+  const clipId     = `wf-${++waveformIdCounter}`;
+
+  let bgMarkup, fgMarkup;
+  if (kind === "filled") {
+    let d = `M 0 ${cy}`;
+    for (let i = 0; i < peaks.length; i++) {
+      const x    = i * (barWidth + gap) + barWidth / 2;
+      const half = peaks[i] * (height * 0.46);
+      d += ` L ${x} ${cy - half}`;
+    }
+    for (let i = peaks.length - 1; i >= 0; i--) {
+      const x    = i * (barWidth + gap) + barWidth / 2;
+      const half = peaks[i] * (height * 0.46);
+      d += ` L ${x} ${cy + half}`;
+    }
+    d += " Z";
+    bgMarkup = `<path d="${d}" fill="${escapeAttr(color)}" fill-opacity="0.22" />`;
+    fgMarkup = `<path d="${d}" fill="${escapeAttr(color)}" />`;
+  } else {
+    const bg = [], fg = [];
+    for (let i = 0; i < peaks.length; i++) {
+      const x    = i * (barWidth + gap) + barWidth / 2;
+      const half = peaks[i] * (height * 0.45);
+      const line = `x1="${x}" y1="${cy - half}" x2="${x}" y2="${cy + half}" stroke-width="${barWidth}" stroke-linecap="round"`;
+      bg.push(`<line ${line} stroke="${escapeAttr(color)}" stroke-opacity="0.22" />`);
+      fg.push(`<line ${line} stroke="${escapeAttr(color)}" />`);
+    }
+    bgMarkup = bg.join("");
+    fgMarkup = fg.join("");
+  }
+
+  el.innerHTML = `
+    <svg viewBox="0 0 ${totalWidth} ${height}" preserveAspectRatio="none"
+         width="100%" height="${height}"
+         style="display:block; cursor:${onSeek ? "pointer" : "default"}">
+      <defs>
+        <clipPath id="${clipId}">
+          <rect class="wf-progress" x="0" y="0" width="0" height="${height}" />
+        </clipPath>
+      </defs>
+      ${bgMarkup}
+      <g clip-path="url(#${clipId})">${fgMarkup}</g>
+    </svg>
+  `;
+
+  const svg          = el.querySelector("svg");
+  const progressRect = el.querySelector(".wf-progress");
+
+  if (onSeek) {
+    svg.addEventListener("click", (e) => {
+      const r = svg.getBoundingClientRect();
+      const p = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+      onSeek(p);
+    });
+  }
+
+  return {
+    setProgress(p) {
+      const clamped = Math.max(0, Math.min(1, p));
+      progressRect.setAttribute("width", String(totalWidth * clamped));
+    },
+  };
+}
+
+// ── BPM/Key filename sniff (port of parse_bpm_key_from_filename) ─────
 const KEY_TOKEN_RE = /^([A-G])([#b]?)(m|min|minor|maj|major)?$/i;
 
 function matchKeyToken(part) {
@@ -80,7 +207,7 @@ function matchKeyToken(part) {
   const note = m[1].toUpperCase() + (m[2] || "");
   const qual = (m[3] || "").toLowerCase();
   if (qual === "m" || qual === "min" || qual === "minor") return `${note} minor`;
-  if (qual === "maj" || qual === "major") return `${note} major`;
+  if (qual === "maj" || qual === "major")                 return `${note} major`;
   return note;
 }
 
@@ -113,19 +240,16 @@ function parseBpmKeyFromFilename(name) {
   return { bpm, key };
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────
+// ── File → base64 (chunked to avoid btoa() call-stack limits) ────────
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload  = () => {
       const buf = new Uint8Array(reader.result);
-      // btoa needs a binary string; chunked apply() avoids the call-stack
-      // limit on multi-MB files.
       const CHUNK = 0x8000;
       let binary = "";
       for (let i = 0; i < buf.length; i += CHUNK) {
-        binary += String.fromCharCode.apply(
-          null, buf.subarray(i, i + CHUNK));
+        binary += String.fromCharCode.apply(null, buf.subarray(i, i + CHUNK));
       }
       resolve(btoa(binary));
     };
@@ -136,140 +260,432 @@ function fileToBase64(file) {
 
 async function loadFile(file) {
   clearVariations();
+  clearError();
+  await stop();   // wipe any in-flight playback
+
+  state.fileName = file.name;
+  renderSource(/*pending=*/true);
 
   const b64 = await fileToBase64(file);
-  state.audioBase64 = b64;
-  state.audioMime   = file.type || "audio/wav";
-  state.fileName    = file.name;
 
-  sourceAudio.src    = `data:${state.audioMime};base64,${b64}`;
-  sourceAudio.hidden = false;
-  sourceAudio.onloadedmetadata = () => {
-    state.fileSeconds = sourceAudio.duration || null;
-    updateMeta();
-    updateButton();
-  };
+  // Native side decodes (any format JUCE supports), resamples to 44.1k
+  // stereo, stores the AudioBuffer, computes peaks, returns them here.
+  let resp;
+  try {
+    resp = await uploadSource({
+      audioBase64: b64,
+      peaksN:      SOURCE_PEAKS_N,
+    });
+  } catch (e) {
+    showError("Source upload bridge error: " + e);
+    return;
+  }
+  if (!resp || !resp.ok) {
+    showError((resp && resp.error) || "uploadSource failed");
+    state.hasSource = false;
+    renderSource();
+    return;
+  }
 
-  // Best-effort filename sniff — only fills fields the user hasn't touched.
+  state.hasSource   = true;
+  state.fileSeconds = Number(resp.duration) || null;
+  state.sourcePeaks = (resp.peaks || []).map(Number);
+
+  // Best-effort filename sniff — only fills empty inputs.
   const { bpm, key } = parseBpmKeyFromFilename(file.name);
   if (bpm !== null && bpmInput.value === "") { bpmInput.value = String(bpm); saveUiSoon(); }
   if (key !== null && keyInput.value === "") { keyInput.value = key;         saveUiSoon(); }
 
-  dropEl.classList.add("has-file");
-  updateMeta();
+  renderSource();
   updateButton();
 }
 
-function updateMeta() {
-  if (!state.fileName) {
-    sourceMeta.textContent = "";
+// ── Render: source ───────────────────────────────────────────────────
+let srcWfHandle = null;
+
+function renderSource(pending = false) {
+  if (!state.hasSource && !state.fileName) {
+    sourceEmpty.hidden  = false;
+    sourceLoaded.hidden = true;
+    sourceEl.classList.add("empty");
     return;
   }
-  const d = state.fileSeconds
-    ? ` · ${state.fileSeconds.toFixed(2)}s` : "";
-  sourceMeta.textContent = state.fileName + d;
-}
+  sourceEl.classList.remove("empty");
+  sourceEmpty.hidden  = true;
+  sourceLoaded.hidden = false;
 
-function updateButton() {
-  const can = state.pipelineReady && state.audioBase64 && !state.busy;
-  generateBtn.disabled = !can;
-  generateBtn.textContent = state.busy
-    ? "Generating..."
-    : "Generate 5 variations";
-}
+  srcNameEl.textContent = state.fileName || "";
+  srcDurEl.textContent  = state.fileSeconds
+    ? ` ${state.fileSeconds.toFixed(2)}s · 44.1 kHz`
+    : (pending ? " decoding..." : "");
 
-function applyPresetVisibility() {
-  const isApp = presetSel.value === "app";
-  appOnlyRows.forEach((r) => { r.hidden = !isApp; });
-}
-
-function renderSlots(slots) {
-  const fallback = presetSel.value === "app" ? slotLabelsApp : slotLabelsFree;
-  variationsEl.innerHTML = "";
-  for (let i = 0; i < slots.length && i < 5; i++) {
-    const s = slots[i];
-    const row = document.createElement("div");
-    row.className = "variation";
-
-    const label = document.createElement("span");
-    label.className   = "variation-label";
-    label.textContent = fallback[i] || String(i + 1);
-
-    const steer = document.createElement("span");
-    steer.className   = "variation-steer";
-    steer.textContent = s.steer || "";
-    steer.title       = s.steer || "";   // full text in tooltip when truncated
-
-    const audio = document.createElement("audio");
-    audio.controls = true;
-    audio.preload  = "none";
-    audio.src      = s.url;
-
-    row.appendChild(label);
-    row.appendChild(steer);
-    row.appendChild(audio);
-    variationsEl.appendChild(row);
+  if (state.sourcePeaks && state.sourcePeaks.length > 0) {
+    srcWfHandle = mountWaveform(srcWaveEl, state.sourcePeaks, {
+      kind:   "filled",
+      height: 36,
+      color:  COLOR_FG,
+      onSeek: (p) => seekIdx(-1, p),
+    });
+  } else {
+    srcWaveEl.innerHTML = "";
+    srcWfHandle = null;
   }
+  updateSrcTimes();
+  updateSrcPlayState();
 }
+
+// ── Render: results ──────────────────────────────────────────────────
+const slotHandles = [];
 
 function clearVariations() {
-  variationsEl.innerHTML = "";
+  state.variations = [];
+  state.expected   = 0;
+  slotHandles.length = 0;
+  slotsEl.innerHTML  = "";
+  resultsEl.hidden   = true;
 }
 
-// ── Error banner ──────────────────────────────────────────────────────
-function showError(msg) {
-  errorText.textContent = msg;
-  errorBanner.hidden    = false;
-}
-function clearError() {
-  errorBanner.hidden    = true;
-  errorText.textContent = "";
-}
-errorDismiss.addEventListener("click", clearError);
+function renderResults() {
+  if (state.variations.length === 0 && state.expected === 0) {
+    resultsEl.hidden = true; return;
+  }
+  resultsEl.hidden = false;
+  const noiseDisplay = Number(noiseInput.value).toFixed(2);
+  const count = Math.max(state.expected, state.variations.length);
+  resMetaEl.textContent = `${count} · σ ${noiseDisplay}`;
 
-function showStatusFromBackend(s) {
+  slotsEl.innerHTML  = "";
+  slotHandles.length = 0;
+
+  for (let i = 0; i < count; i++) {
+    const v = state.variations[i] || null;
+    const ready  = !!(v && v.peaks && v.peaks.length > 0);
+    const active = state.playingIdx === i;
+
+    const slot = document.createElement("div");
+    slot.className = "slot"
+      + (ready ? "" : " empty")
+      + (active ? " active" : "");
+    slot.innerHTML = `
+      <span class="idx">${String(i + 1).padStart(2, "0")}</span>
+      <div class="wf-wrap">
+        <div class="wf"></div>
+        <span class="steer"></span>
+      </div>
+      <span class="dur"></span>
+      <button type="button" class="row-play" aria-label="Play variation ${i + 1}">
+        <svg class="play-ico"  width="9" height="9" viewBox="0 0 9 9"><polygon points="2,1 8,4.5 2,8" fill="currentColor"/></svg>
+        <svg class="pause-ico" width="9" height="9" viewBox="0 0 9 9"><rect x="1.5" y="1" width="2" height="7" fill="currentColor"/><rect x="5.5" y="1" width="2" height="7" fill="currentColor"/></svg>
+      </button>
+    `;
+    slotsEl.appendChild(slot);
+
+    const wfHost  = slot.querySelector(".wf");
+    const steerEl = slot.querySelector(".steer");
+    const durEl   = slot.querySelector(".dur");
+    const playBtn = slot.querySelector(".row-play");
+
+    steerEl.textContent = v ? (v.steer || "") : "";
+    durEl.textContent   = (v && v.duration) ? `${v.duration.toFixed(2)}s` : "——";
+
+    let wfMount = null;
+    if (ready) {
+      wfMount = mountWaveform(wfHost, v.peaks, {
+        kind:   "line",
+        height: 22,
+        color:  active ? COLOR_ACCENT : COLOR_FG,
+        onSeek: (p) => seekIdx(i, p),
+      });
+    } else {
+      wfHost.innerHTML = `<div class="skel"></div>`;
+      playBtn.disabled = true;
+    }
+
+    playBtn.addEventListener("click", (e) => {
+      e.stopPropagation();   // don't double-fire the slot click
+      if (!ready) return;
+      togglePlay(i);
+    });
+
+    // Clicking anywhere else on the row switches to (and plays) that
+    // variation — UX shortcut. Skip clicks on the waveform (own seek
+    // handler) and the play button (handled above).
+    slot.addEventListener("click", (e) => {
+      if (!ready) return;
+      if (e.target.closest(".row-play")) return;
+      if (e.target.closest("svg"))       return;
+      // play(idx) on the engine resets position when switching buffers,
+      // so this is a "switch to this variation and start" not a toggle.
+      play(i).then(() => getPlayState()).then(applyPlayState);
+    });
+    slot.style.cursor = ready ? "pointer" : "default";
+
+    slotHandles[i] = { wfMount, slotEl: slot, playBtn };
+  }
+  updatePlayStateUI();
+}
+
+// ── Status / play polling ────────────────────────────────────────────
+function updateStatus(s) {
   if (!s || typeof s !== "object") {
-    statusEl.textContent = String(s ?? "");
-    statusEl.className   = "status status-loading";
+    statusText.textContent = String(s ?? "");
+    statusEl.className     = "status";
     return;
   }
-  const phase   = String(s.phase || "");
-  const status  = String(s.status ?? "");
-  const busy    = !!s.busy;
+  const phase  = String(s.phase  || "");
+  const status = String(s.status || "");
+  const busy   = !!s.busy;
 
   state.busy          = busy;
   state.pipelineReady = phase === "loaded";
-  updateButton();
 
   let cls = "status";
-  if      (phase === "error") cls += " status-error";
-  else if (! state.pipelineReady) cls += " status-loading";
-  else if (busy)              cls += " status-busy";
-  else if (status.startsWith("Error")) cls += " status-error";
-  else                        cls += " status-ready";
-  statusEl.textContent = status;
-  statusEl.className   = cls;
+  let text = status;
+  if (phase === "error") {
+    cls += " error";
+    text = "error";
+  } else if (!state.pipelineReady) {
+    text = phase === "loading" ? "Loading" : (status || "Idle");
+  } else if (busy) {
+    cls += " accent";
+    text = status.replace(/\.\.\.$/, "");
+  } else if (status.startsWith("Error")) {
+    cls += " error";
+    text = "Error";
+  } else {
+    text = "Ready";
+  }
+  statusText.textContent = text;
+  statusEl.className     = cls;
 
-  // Mirror persistent errors into the banner so the user can't miss them.
-  // Recoverable transitions (Loading → Ready) auto-clear it.
   if (phase === "error" || status.startsWith("Error")) {
     showError(status);
   }
+  updateButton();
 }
 
-async function pollStatus() {
-  try { showStatusFromBackend(await getStatus()); }
-  catch (e) { /* swallow — next tick retries */ }
+function applyPlayState(ps) {
+  if (!ps || typeof ps !== "object") return;
+  const prevIdx     = state.playingIdx;
+  const prevPlaying = state.playing;
+  state.playingIdx = Number.isFinite(ps.idx)      ? ps.idx      : -2;
+  state.playing    = !!ps.playing;
+  state.progress   = Number.isFinite(ps.progress) ? ps.progress : 0;
+  // Re-render the slot grid (cheap, ≤5 rows) when the active row changes
+  // OR play/pause flips — keeps the colour tint in sync. Inline progress
+  // overlay updates happen every poll.
+  if (prevIdx !== state.playingIdx || prevPlaying !== state.playing) {
+    updatePlayStateUI();
+  }
+  updateProgressOverlays();
+  updateSrcTimes();
 }
 
-// ── UI state persistence ──────────────────────────────────────────────
-// We round-trip a small JSON object through getStateInformation. The audio
-// file isn't persisted (would bloat project files); the user re-drops on
-// reload. Saves are debounced so dragging the noise slider doesn't fire a
-// native call per pixel.
+function updateButton() {
+  const can = state.pipelineReady && state.hasSource && !state.busy;
+  generateBtn.disabled = !can;
+  generateBtn.classList.toggle("busy", state.busy);
+  if (state.busy) {
+    const m = /(\d+)\/(\d+)/.exec(statusText.textContent || "");
+    generateBtn.textContent = m
+      ? `Generating  ${m[1]} / ${m[2]}`
+      : "Generating…";
+  } else {
+    generateBtn.textContent = "Generate 5 variations";
+  }
+}
+
+// ── Error banner ─────────────────────────────────────────────────────
+function showError(msg) { errorText.textContent = msg; errorBanner.hidden = false; }
+function clearError() { errorBanner.hidden = true; errorText.textContent = ""; }
+errorDismiss.addEventListener("click", clearError);
+
+// ── Preset dropdown ──────────────────────────────────────────────────
+function renderPreset() {
+  const meta = PRESETS.find((p) => p.value === state.preset) || PRESETS[0];
+  presetLabelEl.textContent = meta.label;
+  presetSubEl.textContent   = meta.sub;
+  presetMenuEl.hidden       = !state.presetOpen;
+
+  appOnlyRows.forEach((r) => { r.hidden = state.preset !== "app"; });
+
+  if (state.presetOpen) {
+    presetMenuEl.innerHTML = PRESETS.map((p) => `
+      <button type="button" class="opt ${p.value === state.preset ? "sel" : ""}"
+              data-value="${p.value}">
+        <span>${p.label}</span>
+        <span class="sub">${p.sub}</span>
+      </button>
+    `).join("");
+    presetMenuEl.querySelectorAll(".opt").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        state.preset      = btn.dataset.value;
+        state.presetOpen  = false;
+        renderPreset();
+        clearVariations();
+        saveUiSoon();
+      });
+    });
+  }
+}
+
+presetToggle.addEventListener("click", (e) => {
+  e.stopPropagation();
+  state.presetOpen = !state.presetOpen;
+  renderPreset();
+});
+document.addEventListener("click", (e) => {
+  if (!state.presetOpen) return;
+  if (presetEl.contains(e.target)) return;
+  state.presetOpen = false;
+  renderPreset();
+});
+
+// ── Playback (delegates to native) ───────────────────────────────────
+async function togglePlay(idx) {
+  if (state.playingIdx === idx && state.playing) {
+    await pause();
+  } else {
+    await play(idx);
+  }
+  // Push an immediate poll so the UI doesn't lag the next 100ms tick.
+  applyPlayState(await getPlayState());
+}
+
+async function seekIdx(idx, fraction) {
+  if (state.playingIdx !== idx) {
+    await play(idx);
+  }
+  await seek(fraction);
+  applyPlayState(await getPlayState());
+}
+
+function updateProgressOverlays() {
+  if (srcWfHandle) {
+    srcWfHandle.setProgress(state.playingIdx === -1 ? state.progress : 0);
+  }
+  for (let i = 0; i < slotHandles.length; i++) {
+    const h = slotHandles[i];
+    if (!h || !h.wfMount) continue;
+    h.wfMount.setProgress(state.playingIdx === i ? state.progress : 0);
+  }
+}
+
+function updateSrcTimes() {
+  const dur = state.fileSeconds || 0;
+  if (!state.hasSource) {
+    srcTimeCurEl.textContent = "0:00";
+    srcTimeRemEl.textContent = "0:00";
+    return;
+  }
+  const cur = (state.playingIdx === -1) ? state.progress * dur : 0;
+  srcTimeCurEl.textContent =  fmtTime(cur);
+  srcTimeRemEl.textContent = "−" + fmtTime(Math.max(0, dur - cur));
+}
+
+function updateSrcPlayState() {
+  const playing = state.playingIdx === -1 && state.playing;
+  srcPlayBtn.classList.toggle("active",  playing);
+  srcPlayBtn.classList.toggle("playing", playing);   // controls icon swap
+}
+
+function updatePlayStateUI() {
+  updateSrcPlayState();
+  for (let i = 0; i < slotHandles.length; i++) {
+    const h = slotHandles[i];
+    if (!h) continue;
+    const active = state.playingIdx === i;
+    h.slotEl.classList.toggle("active", active);
+    const playingThis = active && state.playing;
+    h.playBtn.classList.toggle("playing", playingThis);   // CSS swaps icons
+    // Re-tint the waveform colour when active state changes.
+    const v = state.variations[i];
+    if (v && v.peaks && v.peaks.length > 0) {
+      const wfHost = h.slotEl.querySelector(".wf");
+      h.wfMount = mountWaveform(wfHost, v.peaks, {
+        kind:   "line",
+        height: 22,
+        color:  active ? COLOR_ACCENT : COLOR_FG,
+        onSeek: (p) => seekIdx(i, p),
+      });
+      h.wfMount.setProgress(active ? state.progress : 0);
+    }
+  }
+  updateProgressOverlays();
+}
+
+srcPlayBtn.addEventListener("click", () => togglePlay(-1));
+
+// Arrow up / down cycle through ready variations.  play(idx) on the engine
+// preserves the playback fraction across switches, so this gives A/B-style
+// scrubbing through the 5 candidates without losing your place.
+document.addEventListener("keydown", (e) => {
+  // Stay out of the way while the user is typing in BPM / Key / Prompt.
+  const tag = (e.target && e.target.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "textarea" || tag === "select") return;
+  if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+
+  const ready = state.variations
+    .map((v, i) => ({ v, i }))
+    .filter(({ v }) => v && v.peaks && v.peaks.length > 0);
+  if (ready.length === 0) return;
+
+  e.preventDefault();
+
+  let pos = ready.findIndex(({ i }) => i === state.playingIdx);
+  if (pos === -1) {
+    // Nothing-or-source playing → jump to the first (Down) or last (Up).
+    pos = e.key === "ArrowUp" ? ready.length - 1 : 0;
+  } else {
+    const delta = e.key === "ArrowUp" ? -1 : 1;
+    pos = (pos + delta + ready.length) % ready.length;
+  }
+  const targetIdx = ready[pos].i;
+  play(targetIdx).then(() => getPlayState()).then(applyPlayState);
+});
+
+// ── Drop / pick ──────────────────────────────────────────────────────
+sourceEl.addEventListener("click", () => {
+  if (state.hasSource) return;
+  const input  = document.createElement("input");
+  input.type   = "file";
+  input.accept = "audio/wav,audio/aiff,audio/flac,audio/ogg,.wav,.aiff,.aif,.flac,.ogg";
+  input.onchange = () => input.files[0] && loadFile(input.files[0]);
+  input.click();
+});
+
+["dragenter", "dragover"].forEach((ev) => {
+  sourceEl.addEventListener(ev, (e) => {
+    e.preventDefault();
+    sourceEl.classList.add("drag");
+  });
+});
+["dragleave", "drop"].forEach((ev) => {
+  sourceEl.addEventListener(ev, (e) => {
+    e.preventDefault();
+    sourceEl.classList.remove("drag");
+  });
+});
+sourceEl.addEventListener("drop", (e) => {
+  const file = e.dataTransfer.files[0];
+  if (file) loadFile(file);
+});
+
+// ── Noise slider ─────────────────────────────────────────────────────
+noiseInput.addEventListener("input", () => {
+  noiseValueEl.textContent = Number(noiseInput.value).toFixed(2);
+  saveUiSoon();
+});
+
+// ── BPM / Key / Prompt ───────────────────────────────────────────────
+bpmInput.addEventListener("input",   saveUiSoon);
+keyInput.addEventListener("input",   saveUiSoon);
+userPrompt.addEventListener("input", saveUiSoon);
+
+// ── State persistence ────────────────────────────────────────────────
 function snapshotUi() {
   return {
-    preset:     presetSel.value,
+    preset:     state.preset,
     noise:      Number(noiseInput.value),
     bpm:        bpmInput.value,
     key:        keyInput.value,
@@ -279,11 +695,10 @@ function snapshotUi() {
 
 let saveTimer = null;
 function saveUiSoon() {
-  if (! state.rehydrated) return;
+  if (!state.rehydrated) return;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
-    try { await setUiState(JSON.stringify(snapshotUi())); }
-    catch (e) { /* non-fatal; the DAW save just won't capture latest state */ }
+    try { await setUiState(JSON.stringify(snapshotUi())); } catch (e) {}
   }, 200);
 }
 
@@ -293,96 +708,77 @@ async function rehydrateUi() {
     const json = typeof blob === "string" ? blob : "";
     if (json) {
       const s = JSON.parse(json);
-      if (s.preset === "free" || s.preset === "app") presetSel.value = s.preset;
-      if (Number.isFinite(s.noise))                  noiseInput.value = s.noise;
-      if (typeof s.bpm === "string")                 bpmInput.value   = s.bpm;
-      if (typeof s.key === "string")                 keyInput.value   = s.key;
-      if (typeof s.userPrompt === "string")          userPrompt.value = s.userPrompt;
+      if (s.preset === "free" || s.preset === "app") state.preset = s.preset;
+      if (Number.isFinite(s.noise))           noiseInput.value = s.noise;
+      if (typeof s.bpm === "string")          bpmInput.value   = s.bpm;
+      if (typeof s.key === "string")          keyInput.value   = s.key;
+      if (typeof s.userPrompt === "string")   userPrompt.value = s.userPrompt;
     }
-  }
-  catch (e) { /* corrupt blob — fall back to defaults */ }
-  noiseValue.textContent = Number(noiseInput.value).toFixed(2);
-  applyPresetVisibility();
+  } catch (e) {}
+  noiseValueEl.textContent = Number(noiseInput.value).toFixed(2);
+  renderPreset();
   state.rehydrated = true;
 }
 
-// ── Events ────────────────────────────────────────────────────────────
-dropEl.addEventListener("click", () => {
-  const input = document.createElement("input");
-  input.type   = "file";
-  input.accept = "audio/wav,audio/aiff,audio/flac,audio/ogg,.wav,.aiff,.aif,.flac,.ogg";
-  input.onchange = () => input.files[0] && loadFile(input.files[0]);
-  input.click();
-});
-
-["dragenter", "dragover"].forEach((ev) => {
-  dropEl.addEventListener(ev, (e) => {
-    e.preventDefault();
-    dropEl.classList.add("drag-over");
-  });
-});
-["dragleave", "drop"].forEach((ev) => {
-  dropEl.addEventListener(ev, (e) => {
-    e.preventDefault();
-    dropEl.classList.remove("drag-over");
-  });
-});
-dropEl.addEventListener("drop", (e) => {
-  const file = e.dataTransfer.files[0];
-  if (file) loadFile(file);
-});
-
-noiseInput.addEventListener("input", () => {
-  noiseValue.textContent = Number(noiseInput.value).toFixed(2);
-  saveUiSoon();
-});
-
-presetSel.addEventListener("change", () => {
-  applyPresetVisibility();
-  clearVariations();
-  saveUiSoon();
-});
-
-bpmInput.addEventListener("input",   saveUiSoon);
-keyInput.addEventListener("input",   saveUiSoon);
-userPrompt.addEventListener("input", saveUiSoon);
-
+// ── Generate ─────────────────────────────────────────────────────────
 generateBtn.addEventListener("click", async () => {
-  if (! state.audioBase64) return;
+  if (!state.hasSource) return;
+  await stop();
   clearError();
-  clearVariations();
-  state.busy = true; updateButton();
+
+  state.expected   = 5;
+  state.variations = Array.from({ length: 5 }, () => ({
+    steer: "", mode: "", peaks: null, duration: null,
+  }));
+  renderResults();
 
   const req = {
-    preset:       presetSel.value,
-    seconds:      state.fileSeconds || 0,
-    noise:        Number(noiseInput.value),
-    bpm:          presetSel.value === "app" && bpmInput.value
-                    ? Number(bpmInput.value) : null,
-    key:          presetSel.value === "app" ? keyInput.value : "",
-    userPrompt:   presetSel.value === "app" ? userPrompt.value : "",
-    audioBase64:  state.audioBase64,
-    audioMime:    state.audioMime,
-    seed:         Math.floor(Math.random() * 1_000_000),
-    steps:        8,
+    preset:      state.preset,
+    seconds:     state.fileSeconds || 0,
+    noise:       Number(noiseInput.value),
+    bpm:         state.preset === "app" && bpmInput.value
+                   ? Number(bpmInput.value) : null,
+    key:         state.preset === "app" ? keyInput.value : "",
+    userPrompt:  state.preset === "app" ? userPrompt.value : "",
+    seed:        Math.floor(Math.random() * 1_000_000),
+    steps:       8,
+    peaksN:      SLOT_PEAKS_N,
   };
 
   try {
     const res = await generate(req);
-    if (! res || ! res.ok) {
-      showError(res && res.error || "unknown error");
-    } else {
-      renderSlots(res.slots || []);
+    if (!res || !res.ok) {
+      showError((res && res.error) || "unknown error");
+      clearVariations();
+      return;
     }
+    state.variations = (res.slots || []).map((s) => ({
+      steer:    s.steer || "",
+      mode:     s.mode  || "",
+      peaks:    (s.peaks || []).map(Number),
+      duration: Number(s.duration) || 0,
+    }));
+    state.expected = state.variations.length;
+    renderResults();
   } catch (err) {
     showError("Bridge error: " + err);
-  } finally {
-    state.busy = false; updateButton();
+    clearVariations();
   }
 });
 
-// ── Boot ──────────────────────────────────────────────────────────────
-clearVariations();
+// ── Polling ──────────────────────────────────────────────────────────
+async function pollStatus() {
+  try { updateStatus(await getStatus()); } catch (e) {}
+}
+async function pollPlayState() {
+  try { applyPlayState(await getPlayState()); } catch (e) {}
+}
+
+// ── Boot ─────────────────────────────────────────────────────────────
+renderPreset();
+renderSource();
+renderResults();
 rehydrateUi();
 pollStatus();
-setInterval(pollStatus, 250);
+setInterval(pollStatus,    250);
+setInterval(pollPlayState, 60);   // ~16fps playhead — enough for 10s clips

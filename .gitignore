@@ -174,3 +174,7 @@ wandb/*
 
 # C++ port build artifacts (CMake out-of-source build dir)
 /optimized/cpp/build/
+
+# JUCE plugin build artifacts (CMake out-of-source build dir; first configure
+# also vendors JUCE source under _deps/, ~500 MB)
+/plugin/build/

@@ -6,11 +6,70 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 
 #include <mlx/mlx.h>
 
+#include "samel_common.h"   // to_row_contiguous
+
 namespace sa3 {
 namespace orch {
+
+// ── patch_audio (free helper) ────────────────────────────────────────
+// rearrange("b c (l h) -> b (c h) l", h=patch_size) — the inverse of
+// patched_decode. Takes (B, C, T_audio) and returns (B, C*patch_size,
+// T_audio / patch_size). Mirrors patch_audio() in optimized/mlx/scripts/sa3_mlx.py.
+static mx::array patch_audio(const mx::array& audio, int patch_size = 256) {
+    const auto& s = audio.shape();
+    if (s.size() != 3) {
+        throw std::runtime_error("patch_audio expects (B, C, T) shape");
+    }
+    const int B = s[0], C = s[1], T = s[2];
+    if (T % patch_size != 0) {
+        throw std::runtime_error("patch_audio: T=" + std::to_string(T) +
+                                 " not divisible by patch_size=" + std::to_string(patch_size));
+    }
+    const int L = T / patch_size;
+    mx::array x = mx::reshape(audio, {B, C, L, patch_size});
+    x = mx::transpose(x, {0, 1, 3, 2});               // (B, C, patch, L)
+    return mx::reshape(x, {B, C * patch_size, L});
+}
+
+// Encode raw init audio → init latents in dit_dtype.
+//
+// audio: (channels=2, samples) PLANAR fp32 at SAMPLE_RATE, in [-1, 1].
+// Pads/truncates to target_samples = T_lat * SAMPLES_PER_LATENT before encoding.
+// Returns (1, IO_CHANNELS=256, T_lat) at dit_dtype, ready to mix into noise or
+// build inpaint conditioning from.
+static mx::array encode_init_audio(
+    const Pipeline& pipe,
+    const InitAudio& a,
+    int T_lat)
+{
+    if (a.channels != 2) {
+        throw std::runtime_error("encode_init_audio: expected stereo (channels=2)");
+    }
+    const int target_samples = T_lat * SAMPLES_PER_LATENT;
+
+    // Pad or truncate to target_samples; layout stays planar (C, T).
+    std::vector<float> buf(static_cast<size_t>(a.channels) * target_samples, 0.0f);
+    const int copy_samples = std::min(a.samples, target_samples);
+    for (int c = 0; c < a.channels; ++c) {
+        std::copy(a.data + c * a.samples,
+                  a.data + c * a.samples + copy_samples,
+                  buf.data() + c * target_samples);
+    }
+    // (channels, target_samples) → (1, channels, target_samples)
+    mx::array audio(buf.data(),
+                    mx::Shape{1, a.channels, target_samples},
+                    mx::float32);
+
+    // patch + encode at fp32 (SAME-L encoder is loaded as fp32).
+    mx::array patches = patch_audio(audio, /*patch_size=*/256);
+    mx::array init_latents = pipe.encoder(patches);
+    mx::eval(init_latents);
+    return mx::astype(init_latents, pipe.dit_dtype);
+}
 
 // ── Pipeline::generate ───────────────────────────────────────────────
 mx::array Pipeline::generate(
@@ -21,7 +80,9 @@ mx::array Pipeline::generate(
     float cfg,
     float apg,
     const std::string& negative_prompt,
-    float sigma_max) const
+    float sigma_max,
+    std::optional<InitAudio> init_audio,
+    std::optional<std::pair<float, float>> inpaint_range_seconds) const
 {
     // 1. T_lat from seconds. SAME-L has no even-T_lat constraint.
     const int T_lat = std::max(1, static_cast<int>(
@@ -51,26 +112,75 @@ mx::array Pipeline::generate(
     }
     mx::eval(cross_attn, global_cond, null_cross_attn);
 
-    // 4. Pingpong schedule (sigma_max → 0) + initial noise.
+    // 4. (Optional) Encode init audio → init_latents at dit_dtype.
+    std::optional<mx::array> init_latents;
+    if (init_audio.has_value()) {
+        init_latents = encode_init_audio(*this, *init_audio, T_lat);
+    }
+
+    // 5. Pingpong schedule + initial noise (optionally mixed with init_latents).
     mx::array sigmas = build_pingpong_schedule(steps, sigma_max, /*use_logsnr_shift=*/true);
     mx::array key = mx::random::key(seed);
-    mx::array noise = mx::random::normal(
+    mx::array pure_noise = mx::random::normal(
         {1, dit::IO_CHANNELS, T_lat}, dit_dtype, key);
+
+    // For a2a (init_audio but no inpaint range), mix: noise = lat*(1-σ) + n*σ.
+    // For inpaint, the unmasked latent is restored by paste_back at every step
+    // so we start from pure noise instead.
+    mx::array noise = (init_latents.has_value() && !inpaint_range_seconds.has_value())
+        ? *init_latents * (1.0f - sigma_max) + pure_noise * sigma_max
+        : pure_noise;
     mx::eval(noise);
 
-    // 5. model_fn — wraps DiT call, with optional batched CFG + APG.
+    // 6. (Optional) Build inpaint local_add_cond + paste_back.
+    std::optional<mx::array> local_add_cond;
+    std::optional<std::pair<mx::array, mx::array>> paste_back;
+    if (inpaint_range_seconds.has_value()) {
+        if (!init_latents.has_value()) {
+            throw std::runtime_error("inpaint_range_seconds requires init_audio");
+        }
+        const float start_s = inpaint_range_seconds->first;
+        const float end_s   = inpaint_range_seconds->second;
+        const int s0 = std::max(0, static_cast<int>(std::round(
+            start_s * SAMPLE_RATE / static_cast<float>(SAMPLES_PER_LATENT))));
+        const int s1 = std::min(T_lat, static_cast<int>(std::round(
+            end_s   * SAMPLE_RATE / static_cast<float>(SAMPLES_PER_LATENT))));
+        if (s1 <= s0) {
+            throw std::runtime_error("inpaint_range_seconds rounds to empty latent span");
+        }
+        // mask shape (1, 1, T_lat); 1=keep, 0=inpaint.
+        std::vector<float> mask_data(T_lat, 1.0f);
+        for (int i = s0; i < s1; ++i) mask_data[i] = 0.0f;
+        mx::array mask = mx::array(mask_data.data(), mx::Shape{1, 1, T_lat}, mx::float32);
+        mx::array masked_input = mx::astype(*init_latents, mx::float32) * mask;
+        // DiT's local_add_cond expects (B, T_lat, 257) at dit_dtype:
+        //   concat([mask, masked_input], axis=1) → (1, 257, T_lat) → transpose
+        mx::array lac = mx::concatenate({mask, masked_input}, /*axis=*/1);
+        lac = mx::transpose(lac, {0, 2, 1});
+        lac = mx::astype(lac, dit_dtype);
+        local_add_cond = lac;
+        paste_back = std::make_pair(*init_latents, mask);
+        mx::eval(*local_add_cond);
+    }
+
+    // 7. model_fn — wraps DiT call, with optional batched CFG + APG.
     //    Matches optimized/mlx/scripts/sa3_mlx.py exactly.
     const auto& dit_local = dit;
     ModelFn model_fn = [&](const mx::array& x, const mx::array& t) -> mx::array {
         if (cfg == 1.0f) {
-            return dit_local(x, t, cross_attn, global_cond, std::nullopt);
+            return dit_local(x, t, cross_attn, global_cond, local_add_cond);
         }
-        // Batched cond + uncond forward in one DiT call.
+        // Batched cond + uncond forward in one DiT call. local_add_cond is
+        // duplicated along batch dim to match (cf. sa3_mlx.py model_fn).
+        std::optional<mx::array> lac2;
+        if (local_add_cond.has_value()) {
+            lac2 = mx::concatenate({*local_add_cond, *local_add_cond}, /*axis=*/0);
+        }
         mx::array x2     = mx::concatenate({x, x}, 0);
         mx::array t2     = mx::concatenate({t, t}, 0);
         mx::array cross2 = mx::concatenate({cross_attn, null_cross_attn}, 0);
         mx::array glob2  = mx::concatenate({global_cond, global_cond}, 0);
-        mx::array v_batched = dit_local(x2, t2, cross2, glob2, std::nullopt);
+        mx::array v_batched = dit_local(x2, t2, cross2, glob2, lac2);
         auto parts = mx::split(v_batched, 2, /*axis=*/0);
         mx::array cond_v   = parts[0];
         mx::array uncond_v = parts[1];
@@ -104,8 +214,9 @@ mx::array Pipeline::generate(
         return mx::astype(cfg_v, x.dtype());
     };
 
-    // 6. Sample.
-    mx::array latents = sample_flow_pingpong(model_fn, noise, sigmas, /*seed=*/seed + 1);
+    // 8. Sample.
+    mx::array latents = sample_flow_pingpong(model_fn, noise, sigmas,
+                                              /*seed=*/seed + 1, paste_back);
     mx::eval(latents);
 
     // 7. Decode at fp32 (SAME-L is loaded as fp32).
@@ -139,6 +250,7 @@ mx::array Pipeline::generate(
 Pipeline load_pipeline(
     const std::string& t5gemma_path,
     const std::string& dit_path,
+    const std::string& samel_encoder_path,
     const std::string& samel_decoder_path,
     mx::Dtype dit_dtype)
 {
@@ -152,6 +264,11 @@ Pipeline load_pipeline(
     auto conditioner = load_conditioner(dit_tensors, /*prefix=*/"cond.");
     auto dit = dit::load_dit(dit_tensors, /*T_lat=*/320, dit_dtype);
 
+    // SAME-L encoder (fp32, matches Python sa3_mlx.py defaults — used only
+    // for init_audio paths; text-to-audio runs ignore it).
+    auto enc_loaded = mx::load_safetensors(samel_encoder_path);
+    auto encoder = samel::load_samel_encoder(enc_loaded.first, mx::float32);
+
     // SAME-L decoder (fp32, matches Python sa3_mlx.py defaults)
     auto dec_loaded = mx::load_safetensors(samel_decoder_path);
     auto decoder = samel::load_samel_decoder(dec_loaded.first, mx::float32);
@@ -160,6 +277,7 @@ Pipeline load_pipeline(
         std::move(t5),
         std::move(conditioner),
         std::move(dit),
+        std::move(encoder),
         std::move(decoder),
         dit_dtype,
     };
@@ -244,6 +362,98 @@ void save_wav_pcm16(
     std::fwrite(hdr.data(), 1, hdr.size(), f);
     std::fwrite(pcm.data(), sizeof(int16_t), pcm.size(), f);
     std::fclose(f);
+}
+
+// ── read_wav_pcm16 ───────────────────────────────────────────────────
+// Minimal RIFF/WAVE reader for 16-bit PCM. Skips through chunks until it
+// finds 'fmt ' + 'data'. Returns planar (channels, samples) fp32 in [-1, 1].
+// Mono input is duplicated to stereo so the orchestrator's encode path
+// always gets a 2-channel buffer.
+static uint16_t read_u16_le(const uint8_t* p) {
+    return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
+}
+static uint32_t read_u32_le(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) |
+           (static_cast<uint32_t>(p[1]) << 8)  |
+           (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+
+std::vector<float> read_wav_pcm16(
+    const std::string& path,
+    int& out_sample_rate,
+    int& out_channels,
+    int& out_samples)
+{
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        throw std::runtime_error("read_wav_pcm16: cannot open '" + path + "'");
+    }
+    uint8_t hdr12[12];
+    if (std::fread(hdr12, 1, 12, f) != 12 ||
+        std::memcmp(hdr12, "RIFF", 4) != 0 ||
+        std::memcmp(hdr12 + 8, "WAVE", 4) != 0) {
+        std::fclose(f);
+        throw std::runtime_error("read_wav_pcm16: not a RIFF/WAVE file: " + path);
+    }
+
+    // Walk chunks until we have fmt + data.
+    int sample_rate = 0, channels = 0, bits = 0;
+    uint16_t fmt = 0;
+    std::vector<uint8_t> data_bytes;
+    bool have_fmt = false, have_data = false;
+    while (!(have_fmt && have_data)) {
+        uint8_t ch[8];
+        if (std::fread(ch, 1, 8, f) != 8) break;
+        const uint32_t sz = read_u32_le(ch + 4);
+        if (std::memcmp(ch, "fmt ", 4) == 0) {
+            std::vector<uint8_t> buf(sz);
+            if (std::fread(buf.data(), 1, sz, f) != sz) break;
+            fmt          = read_u16_le(buf.data() + 0);
+            channels     = read_u16_le(buf.data() + 2);
+            sample_rate  = static_cast<int>(read_u32_le(buf.data() + 4));
+            bits         = read_u16_le(buf.data() + 14);
+            have_fmt = true;
+        } else if (std::memcmp(ch, "data", 4) == 0) {
+            data_bytes.resize(sz);
+            if (std::fread(data_bytes.data(), 1, sz, f) != sz) break;
+            have_data = true;
+        } else {
+            // Skip unknown chunk (LIST/JUNK/etc.); chunks are 2-byte aligned.
+            const uint32_t skip = sz + (sz & 1u);
+            if (std::fseek(f, static_cast<long>(skip), SEEK_CUR) != 0) break;
+        }
+    }
+    std::fclose(f);
+    if (!have_fmt || !have_data) {
+        throw std::runtime_error("read_wav_pcm16: missing fmt or data chunk: " + path);
+    }
+    if (fmt != 1 /* PCM */ || bits != 16) {
+        throw std::runtime_error(
+            "read_wav_pcm16: only 16-bit PCM supported (fmt=" +
+            std::to_string(fmt) + ", bits=" + std::to_string(bits) + "): " + path);
+    }
+    if (channels != 1 && channels != 2) {
+        throw std::runtime_error("read_wav_pcm16: only mono or stereo supported");
+    }
+
+    const int frame_bytes = channels * 2;
+    const int samples = static_cast<int>(data_bytes.size()) / frame_bytes;
+    const int16_t* pcm = reinterpret_cast<const int16_t*>(data_bytes.data());
+
+    // Always return stereo (duplicate mono to L+R) so encode_init_audio gets 2ch.
+    const int out_ch = 2;
+    std::vector<float> out(static_cast<size_t>(out_ch) * samples);
+    for (int t = 0; t < samples; ++t) {
+        const float L = pcm[t * channels + 0] / 32768.0f;
+        const float R = (channels == 2) ? pcm[t * channels + 1] / 32768.0f : L;
+        out[0 * samples + t] = L;
+        out[1 * samples + t] = R;
+    }
+    out_sample_rate = sample_rate;
+    out_channels    = out_ch;
+    out_samples     = samples;
+    return out;
 }
 
 }  // namespace orch

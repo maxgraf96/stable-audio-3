@@ -15,6 +15,8 @@ constexpr const char* kT5GemmaPath =
     "/Users/max/Code/stable-audio-3/optimized/mlx/models/mlx/t5gemma_f16.safetensors";
 constexpr const char* kDitPath =
     "/Users/max/Code/stable-audio-3/optimized/mlx/models/mlx/dit_medium_f16.safetensors";
+constexpr const char* kEncoderPath =
+    "/Users/max/Code/stable-audio-3/optimized/mlx/models/mlx/same_l_encoder_f32.safetensors";
 constexpr const char* kDecoderPath =
     "/Users/max/Code/stable-audio-3/optimized/mlx/models/mlx/same_l_decoder_f32.safetensors";
 }  // namespace
@@ -59,7 +61,8 @@ void PipelineLoader::run() {
     try {
         // Run at fp16 — same default as optimized/cpp/sa3_cli.
         auto p = std::make_unique<sa3::orch::Pipeline>(
-            sa3::orch::load_pipeline(kT5GemmaPath, kDitPath, kDecoderPath,
+            sa3::orch::load_pipeline(kT5GemmaPath, kDitPath,
+                                     kEncoderPath, kDecoderPath,
                                      mlx::core::float16));
         pipeline_ = std::move(p);
         {

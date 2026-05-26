@@ -5,7 +5,7 @@ the .npz weight files as .safetensors once, then the C++ plugin loads them
 directly.
 
 Usage:
-    python cpp_spike/convert_npz.py optimized/mlx/models/mlx/same_l_encoder_f32.npz
+    python optimized/cpp/convert_npz.py optimized/mlx/models/mlx/same_l_encoder_f32.npz
 
 Writes <input_stem>.safetensors next to the input.
 """

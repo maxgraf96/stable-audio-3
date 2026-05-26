@@ -1,4 +1,4 @@
-"""Python reference for cpp_spike/test_samel_decoder.cpp.
+"""Python reference for optimized/cpp/test_samel_decoder.cpp.
 
 Runs both:
   T1 single-shot: input (1, 256, 16), bit-exact decode
@@ -12,7 +12,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO / "optimized/mlx"))
 sys.path.insert(0, str(REPO / "optimized/mlx/scripts"))
 

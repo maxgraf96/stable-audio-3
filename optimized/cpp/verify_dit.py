@@ -1,4 +1,4 @@
-"""Python reference for cpp_spike/test_dit.cpp.
+"""Python reference for optimized/cpp/test_dit.cpp.
 
 Same fp32 forward pass with the same deterministic inputs (arange/total).
 """
@@ -10,7 +10,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO / "optimized/mlx"))
 sys.path.insert(0, str(REPO / "optimized/mlx/scripts"))
 

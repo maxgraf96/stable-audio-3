@@ -1,4 +1,4 @@
-"""Python reference for cpp_spike/test_samel_encoder.cpp.
+"""Python reference for optimized/cpp/test_samel_encoder.cpp.
 
 Loads the same npz, builds the same input (arange / total_size shaped 1x512x128),
 runs the SAME-L encoder at fp32, and prints the first 16 output values plus
@@ -14,7 +14,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO / "optimized/mlx"))
 sys.path.insert(0, str(REPO / "optimized/mlx/scripts"))
 

@@ -12,7 +12,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent.parent
 NPZ = REPO / "optimized/mlx/models/mlx/same_l_encoder_f32.npz"
 WEIGHT_NAME = "mapping.weight"
 

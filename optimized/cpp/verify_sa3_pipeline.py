@@ -1,4 +1,4 @@
-"""Python reference for cpp_spike/test_sa3_pipeline.cpp.
+"""Python reference for optimized/cpp/test_sa3_pipeline.cpp.
 
 Mirrors each test exactly with the original sa3_pipeline.py functions. Outputs
 should match the C++ side bit-exactly at fp32.
@@ -12,7 +12,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO / "optimized/mlx"))
 sys.path.insert(0, str(REPO / "optimized/mlx/scripts"))
 

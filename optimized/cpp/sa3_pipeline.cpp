@@ -113,18 +113,30 @@ mx::array sample_flow_pingpong(
     mx::array key = mx::random::key(seed);
 
     for (int i = 0; i < num_steps; ++i) {
-        float t_curr = sigma_data[i];
-        float t_next = sigma_data[i + 1];
+        float t_curr_f = sigma_data[i];
+        float t_next_f = sigma_data[i + 1];
 
-        mx::array t_tensor = t_curr * mx::ones({x.shape()[0]}, x.dtype());
+        // t_tensor: Python writes `t_curr * mx.ones(..., x.dtype)` without an
+        // astype — t_curr (fp32) * ones (fp16) promotes to fp32. Mirror by
+        // passing the raw float (C++ `float * fp16_array` also promotes to fp32).
+        mx::array t_tensor = t_curr_f * mx::ones({x.shape()[0]}, x.dtype());
         mx::array v = model_fn(x, t_tensor);
-        mx::array denoised = x - t_curr * v;
 
-        if (i < num_steps - 1 && t_next > 0.0f) {
-            auto split = mx::random::split(key);   // returns std::pair<array, array>
+        // denoised: Python uses `t_curr.astype(x.dtype) * v` — t_curr ROUNDED
+        // to x.dtype before multiplying. C++ `float * fp32_v` skips that
+        // fp16 rounding step. At fp16 this compounds across steps; at fp32
+        // it's a no-op.
+        mx::array denoised = x - mx::array(t_curr_f, x.dtype()) * v;
+
+        if (i < num_steps - 1 && t_next_f > 0.0f) {
+            auto split = mx::random::split(key);
             key = split.first;
             mx::array noise = mx::random::normal(x.shape(), x.dtype(), split.second);
-            x = (1.0f - t_next) * denoised + t_next * noise;
+            // Python: `(1.0 - t_next).astype(x.dtype) * denoised + t_next.astype(x.dtype) * noise`
+            // — both factors rounded to x.dtype before the multiply.
+            mx::array one_minus_t = mx::array(1.0f - t_next_f, x.dtype());
+            mx::array t_next_a    = mx::array(t_next_f,         x.dtype());
+            x = one_minus_t * denoised + t_next_a * noise;
         } else {
             x = denoised;
         }

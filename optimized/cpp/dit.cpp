@@ -195,7 +195,7 @@ mx::array ExpoFourierFeatures::operator()(const mx::array& t) const {
     return mx::concatenate({mx::cos(args), mx::sin(args)}, -1);
 }
 
-static ExpoFourierFeatures make_timestep_features(mx::Dtype dt) {
+static ExpoFourierFeatures make_timestep_features(mx::Dtype /*dt*/) {
     constexpr int half = TIMESTEP_FEAT_DIM / 2;
     constexpr float MIN_FREQ = 0.5f;
     constexpr float MAX_FREQ = 10000.0f;
@@ -209,7 +209,12 @@ static ExpoFourierFeatures make_timestep_features(mx::Dtype dt) {
     // Match Python: `freqs * 2 * math.pi` (left-associative).
     freqs = freqs * 2.0f * static_cast<float>(M_PI);
     mx::eval(freqs);
-    return ExpoFourierFeatures{mx::astype(freqs, dt)};
+    // Keep freqs at fp32 regardless of DiT dtype: Python's ExpoFourierFeatures
+    // creates this buffer with mx.linspace (default fp32) and never casts it.
+    // Downstream `t (fp16) * freqs (fp32)` then promotes to fp32 — which is
+    // what cascades global_embed and the per-block scale/shift/gate into fp32.
+    // Casting freqs to fp16 here breaks bit-exactness against Python.
+    return ExpoFourierFeatures{freqs};
 }
 
 // ── DiT::operator() ──────────────────────────────────────────────────
@@ -244,10 +249,13 @@ mx::array DiT::operator()(
     mx::array x_lc = mx::transpose(x, {0, 2, 1});                     // (B, T_lat, IO_CHANNELS)
     mx::array x_pp = mx::conv1d(x_lc, preprocess_conv_w) + x_lc;
 
-    // local_add_cond: explicit or zero default.
+    // local_add_cond: explicit or zero default sized to the *input's* T_lat.
+    // The stored `T_lat` field is a vestigial preallocation hint from the
+    // Python port; x.shape()[2] is the ground truth for the actual seq length.
+    const int actual_T_lat = x.shape()[2];
     mx::array local = local_add_cond.has_value()
         ? *local_add_cond
-        : mx::zeros({B, T_lat, LOCAL_ADD_COND_DIM}, x_pp.dtype());
+        : mx::zeros({B, actual_T_lat, LOCAL_ADD_COND_DIM}, x_pp.dtype());
 
     mx::array h = transformer(x_pp, context, global_embed, local);    // (B, T_lat, IO_CHANNELS)
 

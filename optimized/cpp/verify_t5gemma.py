@@ -1,8 +1,8 @@
-"""Python reference for cpp_spike/test_t5gemma_encode.cpp.
+"""Python reference for optimized/cpp/test_t5gemma.cpp.
 
-Tokenizes the exact same prompts via SentencePiece + runs the T5Gemma encoder.
-Prints the same labelled IDs / mask / embedding values so a `diff` against the
-C++ output is meaningful.
+Runs the T5Gemma encoder against the same deterministic token IDs and prints
+the same per-value + summary stats. Skips SentencePiece tokenization (the C++
+side does too — that's a separate concern from encoder correctness).
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
-REPO = Path(__file__).resolve().parent.parent
+REPO = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO / "optimized/mlx"))
 sys.path.insert(0, str(REPO / "optimized/mlx/scripts"))
 
@@ -21,17 +21,7 @@ from models.defs.t5gemma_mlx import T5Gemma  # noqa: E402
 NPZ = REPO / "optimized/mlx/models/mlx/t5gemma_f16.npz"
 
 
-def print_ids(label: str, ids: mx.array) -> None:
-    mx.eval(ids)
-    arr = np.array(ids)
-    B, S = arr.shape
-    print(f"[{label}] shape=({B}, {S})")
-    for i in range(B):
-        row = ", ".join(str(int(x)) for x in arr[i])
-        print(f"  row {i}: [{row}]")
-
-
-def dump_embeds(label: str, a: mx.array, n: int = 16) -> None:
+def dump(label: str, a: mx.array, n: int = 16) -> None:
     a_fp32 = a.astype(mx.float32)
     mean = mx.mean(a_fp32)
     std_ = mx.sqrt(mx.mean((a_fp32 - mean) * (a_fp32 - mean)))
@@ -51,21 +41,13 @@ def dump_embeds(label: str, a: mx.array, n: int = 16) -> None:
 def main() -> int:
     t5 = T5Gemma.from_npz(str(NPZ))
 
-    prompts = [
-        "A beautiful piano arpeggio grows into a grand cinematic climax",
-        "lofi house loop",
-        "Amen break 174 BPM",
-        "",
-    ]
-    max_len = 20
+    B, S = 1, 30
+    ids = mx.arange(1, B * S + 1, dtype=mx.int32).reshape(B, S)
+    mask = mx.ones((B, S), dtype=mx.int32)
 
-    ids, mask = t5.tokenize(prompts, max_len=max_len)
-    print_ids("ids", ids)
-    print_ids("mask", mask)
-
-    embeds, _mask = t5.encode(prompts, max_len=max_len)
-    mx.eval(embeds)
-    dump_embeds("T5G", embeds)
+    out = t5.encoder(ids, mask)
+    mx.eval(out)
+    dump("T5G", out)
     return 0
 
 

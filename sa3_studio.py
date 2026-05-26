@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """SA3 Studio — local drag-and-drop web UI for the variation harness.
 
-Open in a browser, drop a WAV, get 5 variations to listen to. Wraps
-sa3_variations.py --preset app under the hood. Stdlib only.
+Open in a browser, drop a WAV, get 5 variations to listen to. Calls
+`sa3_variations.run_variations()` in-process and keeps a long-lived MLX
+Pipeline resident across clicks (rebuilt only when the audio duration
+changes, since the DiT's `_local_zeros_1` buffer is sized to T_lat).
 
 Usage:
   optimized/mlx/.venv/bin/python sa3_studio.py
@@ -14,9 +16,10 @@ import argparse
 import http.server
 import json
 import socketserver
-import subprocess
 import sys
+import threading
 import time
+import traceback
 import urllib.parse
 import webbrowser
 from email.parser import BytesParser
@@ -24,9 +27,14 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 SA3_ROOT = SCRIPT_DIR
-VARIATIONS_PY = SCRIPT_DIR / "sa3_variations.py"
-VENV_PYTHON = SCRIPT_DIR / "optimized" / "mlx" / ".venv" / "bin" / "python"
 RUNS_DIR = SCRIPT_DIR / "runs"
+
+# Pipeline state shared across requests. The HTTP server is multi-threaded,
+# but the MLX pipeline isn't thread-safe (single mx context), so we serialize
+# generate() calls behind a lock. A generation crash takes down the studio —
+# that's the tradeoff for not paying ~1.3s of model load on every click.
+_pipeline_lock = threading.Lock()
+_pipeline = None  # type: ignore[var-annotated]  # sa3_pipeline.Pipeline | None
 
 HTML = """<!doctype html>
 <html lang="en">
@@ -65,11 +73,15 @@ HTML = """<!doctype html>
     .seg-btn:not(:last-child) { border-right: 1px solid #bbb; }
     .seg-btn.active { background: #4a90e2; color: white; }
     .preset-hint { font-size: 12px; color: #888; margin: -4px 0 12px; }
+    .controls label.app-only { display: none; }
+    .controls.show-app label.app-only { display: inline-flex; }
     input[type="number"], input[type="text"] {
       padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px;
       font-size: 13px; width: 90px;
     }
     input[type="text"] { width: 120px; }
+    input[type="range"] { width: 110px; vertical-align: middle; }
+    .noise-val { display: inline-block; width: 32px; font-variant-numeric: tabular-nums; color: #555; font-size: 12px; }
     button {
       padding: 8px 16px; border: none; border-radius: 6px;
       background: #4a90e2; color: white; font-weight: 600; cursor: pointer;
@@ -113,14 +125,15 @@ HTML = """<!doctype html>
 
   <div class="controls">
     <div class="seg" id="preset">
-      <button type="button" class="seg-btn active" data-preset="app">Preserve sound</button>
-      <button type="button" class="seg-btn" data-preset="free">Free variation</button>
+      <button type="button" class="seg-btn active" data-preset="free">Free variation</button>
+      <button type="button" class="seg-btn" data-preset="app">Preserve sound</button>
     </div>
-    <label>BPM <input type="number" id="bpm" step="0.1" placeholder="optional"></label>
-    <label>Key <input type="text" id="key" placeholder="optional"></label>
+    <label class="app-only">BPM <input type="number" id="bpm" step="0.1" placeholder="optional"></label>
+    <label class="app-only">Key <input type="text" id="key" placeholder="optional"></label>
+    <label title="Noise level for a2a candidates. 0.45 = default. Lower preserves timbre, higher drifts further.">Noise <input type="range" id="noise" min="0.10" max="1.00" step="0.01" value="0.45"><span class="noise-val" id="noise-val">0.45</span></label>
     <button id="gen" disabled>Generate</button>
   </div>
-  <div class="preset-hint" id="preset-hint">3 global reharmonizations + 2 sectional rewrites. Keeps timbre.</div>
+  <div class="preset-hint" id="preset-hint">5 unconditional a2a samples at n=0.45. Preserves harmonic context, lets timbre/instrument drift.</div>
 
   <div class="status" id="status"></div>
 
@@ -128,7 +141,7 @@ HTML = """<!doctype html>
 
   <script>
     let selectedFile = null;
-    let currentPreset = 'app';
+    let currentPreset = 'free';
     const drop = document.getElementById('drop');
     const fileInput = document.getElementById('file');
     const genBtn = document.getElementById('gen');
@@ -136,19 +149,37 @@ HTML = """<!doctype html>
     const output = document.getElementById('output');
     const presetEl = document.getElementById('preset');
     const presetHint = document.getElementById('preset-hint');
+    const noiseEl = document.getElementById('noise');
+    const noiseValEl = document.getElementById('noise-val');
 
-    const PRESET_HINTS = {
-      app: '3 global reharmonizations + 2 sectional rewrites. Keeps timbre.',
-      free: '5 unconditional a2a samples at n=0.52. Preserves harmonic context, lets timbre/instrument drift.',
-    };
+    function currentNoise() { return Number(noiseEl.value).toFixed(2); }
+    function updateHint() {
+      const n = currentNoise();
+      if (currentPreset === 'free') {
+        presetHint.textContent = `5 unconditional a2a samples at n=${n}. Preserves harmonic context, lets timbre/instrument drift.`;
+      } else {
+        presetHint.textContent = `3 a2a (n=${n}, cfg=4) + 2 inpaint (n=0.85, cfg=4) with per-candidate steers. Keeps timbre when n is low.`;
+      }
+    }
+    noiseEl.addEventListener('input', () => {
+      noiseValEl.textContent = currentNoise();
+      updateHint();
+    });
 
+    const controlsEl = document.querySelector('.controls');
+    function applyPresetVisibility() {
+      controlsEl.classList.toggle('show-app', currentPreset === 'app');
+    }
     presetEl.addEventListener('click', e => {
       const btn = e.target.closest('.seg-btn');
       if (!btn) return;
       currentPreset = btn.dataset.preset;
       [...presetEl.querySelectorAll('.seg-btn')].forEach(b => b.classList.toggle('active', b === btn));
-      presetHint.textContent = PRESET_HINTS[currentPreset] || '';
+      applyPresetVisibility();
+      updateHint();
     });
+    applyPresetVisibility();
+    updateHint();
 
     function setFile(f) {
       selectedFile = f;
@@ -244,6 +275,7 @@ HTML = """<!doctype html>
       fd.append('bpm', document.getElementById('bpm').value);
       fd.append('key', document.getElementById('key').value);
       fd.append('preset', currentPreset);
+      fd.append('noise', currentNoise());
       try {
         const res = await fetch('/generate', { method: 'POST', body: fd });
         const data = await res.json();
@@ -355,9 +387,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(size))
         self.send_header("Accept-Ranges", "bytes")
         self.end_headers()
-        with path.open("rb") as fh:
-            while chunk := fh.read(64 * 1024):
-                self.wfile.write(chunk)
+        try:
+            with path.open("rb") as fh:
+                while chunk := fh.read(64 * 1024):
+                    self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            # Browser cancelled the <audio> stream (seek, navigate, replace src).
+            # Harmless — silence the noisy stack trace.
+            sys.stderr.write(f"[studio] client disconnected mid-stream: {path.name}\n")
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
@@ -397,9 +434,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         filename, audio_bytes = audio
         bpm_str = fields.get("bpm", "").strip() if isinstance(fields.get("bpm"), str) else ""
         key_str = fields.get("key", "").strip() if isinstance(fields.get("key"), str) else ""
-        preset_str = fields.get("preset", "app").strip() if isinstance(fields.get("preset"), str) else "app"
+        preset_str = fields.get("preset", "free").strip() if isinstance(fields.get("preset"), str) else "free"
         if preset_str not in ("app", "free"):
-            preset_str = "app"
+            preset_str = "free"
 
         ts = time.strftime("%Y%m%d_%H%M%S")
         outdir = RUNS_DIR / f"studio_{ts}_{preset_str}"
@@ -410,41 +447,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
         input_wav = outdir / ("upload_" + safe_name)
         input_wav.write_bytes(audio_bytes)
 
-        cmd = [
-            str(VENV_PYTHON), str(VARIATIONS_PY),
-            "--sa3-root", str(SA3_ROOT),
-            "--input", str(input_wav),
-            "--kind", "melodic",
-            "--preset", preset_str,
-            "--outdir", str(outdir),
-        ]
+        overrides = dict(
+            sa3_root=SA3_ROOT,
+            input=input_wav,
+            outdir=outdir,
+            kind="melodic",
+            preset=preset_str,
+        )
         try:
-            bpm_val = float(bpm_str)
-            cmd.extend(["--bpm", str(bpm_val)])
+            overrides["bpm"] = float(bpm_str)
         except ValueError:
             pass
         if key_str:
-            cmd.extend(["--key", key_str])
+            overrides["key"] = key_str
+        noise_str = fields.get("noise", "").strip() if isinstance(fields.get("noise"), str) else ""
+        try:
+            noise_val = float(noise_str)
+            if 0.01 <= noise_val <= 2.0:
+                overrides["noise_a2a"] = noise_val
+        except ValueError:
+            pass
 
-        sys.stderr.write(f"[studio] running: {' '.join(cmd)}\n")
+        from sa3_variations import make_default_args, run_variations
+        ns = make_default_args(**overrides)
+
+        global _pipeline
+        sys.stderr.write(
+            f"[studio] generating preset={preset_str} input={input_wav.name} outdir={outdir.name}\n"
+        )
         t0 = time.time()
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            with _pipeline_lock:
+                result = run_variations(ns, pipeline=_pipeline)
+                _pipeline = result["pipeline"]
+        except Exception as exc:
+            tb = traceback.format_exc()
+            sys.stderr.write(tb)
+            self._send_json(
+                {"error": f"run_variations failed: {exc}", "trace": tb[-2000:]},
+                status=500,
+            )
+            return
         elapsed = time.time() - t0
-        if proc.returncode != 0:
-            self._send_json({
-                "error": f"sa3_variations.py exited with code {proc.returncode}",
-                "stderr": (proc.stderr or "")[-2000:],
-            }, status=500)
-            return
-
-        manifest = outdir / "manifest.jsonl"
-        if not manifest.exists():
-            self._send_json({"error": "manifest.jsonl not written"}, status=500)
-            return
 
         variations = []
-        for line in manifest.read_text().splitlines():
-            row = json.loads(line)
+        for row in result["rows"]:
             spec = row["spec"]
             variations.append({
                 "index": spec["index"],
@@ -455,9 +502,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "path": str(Path(spec["out_path"]).resolve()),
                 "mask": list(spec["inpaint_range"]) if spec.get("inpaint_range") else None,
             })
-        source = outdir / "source_44100_stereo_s16.wav"
         self._send_json({
-            "source": str(source.resolve()),
+            "source": str(result["prepared"].resolve()),
             "variations": variations,
             "elapsed": elapsed,
         })
@@ -470,6 +516,13 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            # Client went away mid-response — common for <audio> seek / src swap.
+            return
+        super().handle_error(request, client_address)
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Local web UI for SA3 sample variations")
@@ -477,10 +530,13 @@ def main() -> int:
     ap.add_argument("--no-open", action="store_true", help="Don't auto-open browser")
     args = ap.parse_args()
 
-    if not VENV_PYTHON.exists():
-        sys.exit(f"error: MLX venv Python not found at {VENV_PYTHON}")
-    if not VARIATIONS_PY.exists():
-        sys.exit(f"error: sa3_variations.py not found at {VARIATIONS_PY}")
+    try:
+        import sa3_variations  # noqa: F401
+    except ImportError as exc:
+        sys.exit(
+            f"error: cannot import sa3_variations ({exc}). Run with the MLX venv:\n"
+            f"  optimized/mlx/.venv/bin/python {Path(__file__).name}"
+        )
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
     url = f"http://localhost:{args.port}"

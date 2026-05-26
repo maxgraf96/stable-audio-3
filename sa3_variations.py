@@ -431,13 +431,14 @@ def negative_prompt_for_kind(kind: str) -> str:
 
 
 def quality_defaults(quality: str) -> tuple[str, str, int]:
-    """Return (default_dit, default_decoder, default_steps) for a quality preset."""
+    """Return (default_dit, default_decoder, default_steps) for a quality preset.
+
+    Steps is 8 for every quality: the rf_denoiser is distilled at 8 and >8
+    gives diminishing returns on SA3 medium in practice.
+    """
     if quality == "fast":
         return ("sm-music", "same-s", 8)
-    if quality == "best":
-        return ("medium", "same-l", 16)
-    # "good" — recommended on M4 Max
-    return ("medium", "same-l", 12)
+    return ("medium", "same-l", 8)
 
 
 def choose_model(kind: str, requested: str, quality: str) -> tuple[str, str]:
@@ -656,14 +657,14 @@ def build_app_preset(
     cfg_a2a: float,
     cfg_inpaint: float,
     apg: float,
+    noise_a2a: float = 0.45,
 ) -> list[CandidateSpec]:
     """Five-shot preset matching the product shape:
-      3 × a2a (global reharmonization) at n=0.50/0.52/0.55
+      3 × a2a (global reharmonization) at n=noise_a2a (default 0.45)
       2 × inpaint (sectional rewrite) at n=0.85, middle-bar and first-2-bars
 
-    All five configurations sit in empirically validated sweet spots from the
-    earlier exploration sweeps. Melodic only for now — drum/oneshot/sfx have
-    not been validated with the same depth."""
+    Melodic only — drum/oneshot/sfx have not been validated with the same
+    depth. noise_a2a is slider-controllable from the studio."""
     if kind != "melodic":
         raise SystemExit(
             "error: --preset app is currently tuned for --kind melodic only. "
@@ -681,13 +682,12 @@ def build_app_preset(
         first_2_bars = clamp_range(0.0, duration * 0.5, duration)
 
     slots: list[tuple[str, Optional[tuple[float, float]], float, str]] = [
-        # a2a noise band tightened to 0.27–0.35 after the diagnose preset
-        # confirmed n>=0.45 drifts timbre on tonal content without a
-        # named-instrument prompt. n=0.35 was the empirical sweet spot
-        # ("small flourish, timbre intact").
-        ("a2a", None, 0.27, "extra passing notes and ornaments"),
-        ("a2a", None, 0.31, "alternate phrasing, same harmonic feel"),
-        ("a2a", None, 0.35, "small melodic variation with different note choices"),
+        # a2a slots all share noise_a2a (default 0.45, slider-controllable from
+        # the studio) paired with cfg=4.0. The three steers vary the musical
+        # direction while noise/CFG stay constant within a run.
+        ("a2a", None, noise_a2a, "extra passing notes and ornaments"),
+        ("a2a", None, noise_a2a, "alternate phrasing, same harmonic feel"),
+        ("a2a", None, noise_a2a, "small melodic variation with different note choices"),
         ("inpaint_middle_bar", middle_bar, 0.85, "subtly different chord progression, same key"),
         ("inpaint_first_2_bars", first_2_bars, 0.85, "small reharmonization while preserving the melodic contour"),
     ]
@@ -730,19 +730,18 @@ def build_free_preset(
     decoder: str,
     outdir: Path,
     steps: int,
+    noise_a2a: float = 0.45,
 ) -> list[CandidateSpec]:
     """Five-shot 'free variation' preset — the unconditional / no-prompt regime.
 
-    All a2a, empty prompt, cfg=1.0, n=0.52, only seeds vary. This is the same
-    setup as diag_000 in the diagnose preset (which scored 'terrible' under
-    the timbre-preservation target) — but evaluated under a different goal:
-    keep the harmonic context and feel, let timbre / instrumentation drift.
-    Complement to --preset app for when the user wants 'fits in this slot'
-    rather than 'same sample, varied'."""
+    All a2a, empty prompt, cfg=1.0, seeds vary; noise_a2a defaults to 0.45
+    (tighter than the friend's 0.52 — empirically a better balance of
+    variation and preserved feel on melodic loops) and is slider-controllable
+    from the studio."""
     candidates: list[CandidateSpec] = []
     for i in range(5):
         cand_seed = seed + i * 1009
-        out_path = outdir / f"var_{i:03d}_{kind}_free_n0.52_s{cand_seed}.wav"
+        out_path = outdir / f"var_{i:03d}_{kind}_free_n{noise_a2a:.2f}_s{cand_seed}.wav"
         candidates.append(
             CandidateSpec(
                 index=i,
@@ -756,7 +755,7 @@ def build_free_preset(
                 decoder=decoder,
                 seconds=duration,
                 steps=steps,
-                init_noise_level=0.52,
+                init_noise_level=float(noise_a2a),
                 cfg=1.0,
                 apg=1.0,
                 inpaint_range=None,
@@ -969,11 +968,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--preset",
         choices=["grid", "app", "free", "diagnose"],
-        default="grid",
-        help="grid (default): exploration sweep of --count candidates. "
-             "app: 5-shot 'preserve sound' preset (3 a2a + 2 inpaint, melodic only). "
-             "free: 5-shot 'free variation' preset (a2a unconditional at n=0.52, seeds vary; "
-             "preserves harmonic context, lets timbre/instrument drift). "
+        default="free",
+        help="free (default): 5-shot unconditional a2a at n=0.45, seeds vary "
+             "— keeps harmonic context and feel, lets timbre/instrument drift. "
+             "app: 5-shot 'preserve sound' preset (3 a2a + 2 inpaint with steers, melodic only). "
+             "grid: exploration sweep of --count candidates. "
              "diagnose: 4-shot a2a-only set isolating cfg vs noise. "
              "app/free/diagnose ignore --count.",
     )
@@ -983,19 +982,32 @@ def parse_args() -> argparse.Namespace:
         "--quality",
         choices=["fast", "good", "best"],
         default="good",
-        help="fast = sm-music + same-s, 8 steps. good = medium + same-l, 12 steps (default, M4 Max-friendly). best = medium + same-l, 16 steps.",
+        help="fast = sm-music + same-s. good/best = medium + same-l. All run at 8 steps by default (rf_denoiser sweet spot); --steps overrides.",
     )
-    ap.add_argument("--steps", type=int, default=None, help="Override sampler steps; default comes from --quality")
+    ap.add_argument("--steps", type=int, default=None, help="Override sampler steps; default 8")
     ap.add_argument("--dit", default="auto", choices=["auto", "sm-music", "sm-sfx", "medium"], help="Override the DiT picked by --quality")
+    ap.add_argument(
+        "--noise-a2a",
+        type=float,
+        default=0.45,
+        help="Noise level (σmax) for audio-to-audio candidates in --preset free "
+             "and --preset app. Default 0.45 (slightly tighter than the friend's "
+             "0.52 setup — empirically keeps harmonic context with less "
+             "timbre/instrument drift on melodic loops). Lower values (0.25-0.35) "
+             "preserve timbre more tightly; higher values (>0.65) drift further "
+             "from the source. Inpaint candidates ignore this and use their own "
+             "hardcoded noise (0.85).",
+    )
     ap.add_argument(
         "--cfg-a2a",
         type=float,
-        default=2.0,
-        help="CFG scale for audio-to-audio candidates. Lower than --cfg-inpaint "
-             "because a2a has no paste-back: every sample is regenerated, so "
-             "the init_audio latent has to anchor timbre on its own. High CFG "
-             "(~4) amplifies generic text guidance and pulls timbre away from "
-             "the source when no instrument-specific prompt is provided.",
+        default=4.0,
+        help="CFG scale for audio-to-audio candidates. Default 4.0 (matches "
+             "--cfg-inpaint) — paired with init_noise_level=0.45, the strong "
+             "guidance keeps the steer text effective while init_audio provides "
+             "the harmonic/feel anchor. With weaker prompts (no instrument "
+             "name) the timbre may drift; drop to ~2.0 if you need closer "
+             "timbre preservation at the cost of less steer responsiveness.",
     )
     ap.add_argument(
         "--cfg-inpaint",
@@ -1018,16 +1030,64 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
-    args.sa3_root = args.sa3_root.expanduser().resolve()
-    args.input = args.input.expanduser().resolve()
-    args.outdir = args.outdir.expanduser().resolve()
+def make_default_args(**overrides) -> argparse.Namespace:
+    """Build an argparse.Namespace with the CLI defaults, for callers that
+    don't go through argparse (e.g. sa3_studio.py). Pass overrides as kwargs;
+    `sa3_root`, `input`, and `outdir` are required overrides."""
+    defaults = dict(
+        sa3_root=None,
+        input=None,
+        outdir=None,
+        kind="melodic",
+        prompt="",
+        negative_prompt=None,
+        bpm=None,
+        key=None,
+        beats_per_bar=4,
+        preset="free",
+        count=24,
+        seed=1234,
+        quality="good",
+        steps=None,
+        dit="auto",
+        noise_a2a=0.45,
+        cfg_a2a=4.0,
+        cfg_inpaint=4.0,
+        apg=1.0,
+        duration=None,
+        dry_run=False,
+        skip_existing=False,
+    )
+    defaults.update(overrides)
+    for k in ("sa3_root", "input", "outdir"):
+        if defaults[k] is None:
+            raise ValueError(f"make_default_args: '{k}' is required")
+    return argparse.Namespace(**defaults)
+
+
+def run_variations(args, pipeline=None) -> dict:
+    """Execute the variations grid against an `argparse.Namespace`-like object.
+
+    `pipeline` (optional) is a pre-loaded `sa3_pipeline.Pipeline` to reuse. If
+    its (dit, decoder, seconds) match the candidates, it's reused as-is;
+    otherwise it's replaced with a freshly-loaded one. The (possibly-new)
+    pipeline is returned in the result dict so callers can hold it across calls.
+
+    Returns:
+      {
+        "outdir": Path, "prepared": Path,
+        "manifest": Path, "review": Optional[Path],
+        "rows": list[dict], "elapsed": float,
+        "pipeline": Optional[Pipeline],
+      }
+    """
+    args.sa3_root = Path(args.sa3_root).expanduser().resolve()
+    args.input = Path(args.input).expanduser().resolve()
+    args.outdir = Path(args.outdir).expanduser().resolve()
     args.outdir.mkdir(parents=True, exist_ok=True)
 
     require_file(args.input, "input audio")
-    runner = find_mlx_runner(args.sa3_root)
-    mlx_dir = runner.parent
+    runner = find_mlx_runner(args.sa3_root)  # kept for manifest "command" field (equivalent CLI)
 
     if args.bpm is None or args.key is None:
         fn_bpm, fn_key = parse_bpm_key_from_filename(args.input.name)
@@ -1066,93 +1126,152 @@ def main() -> int:
 
     if args.preset == "free":
         candidates = build_free_preset(
-            kind=args.kind,
-            duration=duration,
-            seed=args.seed,
-            dit=dit,
-            decoder=decoder,
-            outdir=args.outdir,
-            steps=steps,
+            kind=args.kind, duration=duration, seed=args.seed,
+            dit=dit, decoder=decoder, outdir=args.outdir, steps=steps,
+            noise_a2a=args.noise_a2a,
         )
     elif args.preset == "diagnose":
         candidates = build_diagnose_preset(
-            kind=args.kind,
-            duration=duration,
-            seed=args.seed,
-            base_prompt_builder=base_prompt_builder,
-            negative_prompt=negative_prompt,
-            dit=dit,
-            decoder=decoder,
-            outdir=args.outdir,
-            steps=steps,
-            apg=args.apg,
+            kind=args.kind, duration=duration, seed=args.seed,
+            base_prompt_builder=base_prompt_builder, negative_prompt=negative_prompt,
+            dit=dit, decoder=decoder, outdir=args.outdir, steps=steps, apg=args.apg,
         )
     elif args.preset == "app":
         candidates = build_app_preset(
-            kind=args.kind,
-            duration=duration,
-            seed=args.seed,
-            base_prompt_builder=base_prompt_builder,
-            negative_prompt=negative_prompt,
-            bpm=args.bpm,
-            beats_per_bar=args.beats_per_bar,
-            dit=dit,
-            decoder=decoder,
-            outdir=args.outdir,
-            steps=steps,
-            cfg_a2a=args.cfg_a2a,
-            cfg_inpaint=args.cfg_inpaint,
-            apg=args.apg,
+            kind=args.kind, duration=duration, seed=args.seed,
+            base_prompt_builder=base_prompt_builder, negative_prompt=negative_prompt,
+            bpm=args.bpm, beats_per_bar=args.beats_per_bar,
+            dit=dit, decoder=decoder, outdir=args.outdir, steps=steps,
+            cfg_a2a=args.cfg_a2a, cfg_inpaint=args.cfg_inpaint, apg=args.apg,
+            noise_a2a=args.noise_a2a,
         )
     else:
         candidates = build_candidates(
-            kind=args.kind,
-            duration=duration,
-            count=args.count,
-            seed=args.seed,
-            base_prompt_builder=base_prompt_builder,
-            negative_prompt=negative_prompt,
-            bpm=args.bpm,
-            beats_per_bar=args.beats_per_bar,
-            dit=dit,
-            decoder=decoder,
-            outdir=args.outdir,
-            steps=steps,
-            cfg_a2a=args.cfg_a2a,
-            cfg_inpaint=args.cfg_inpaint,
-            apg=args.apg,
+            kind=args.kind, duration=duration, count=args.count, seed=args.seed,
+            base_prompt_builder=base_prompt_builder, negative_prompt=negative_prompt,
+            bpm=args.bpm, beats_per_bar=args.beats_per_bar,
+            dit=dit, decoder=decoder, outdir=args.outdir, steps=steps,
+            cfg_a2a=args.cfg_a2a, cfg_inpaint=args.cfg_inpaint, apg=args.apg,
         )
 
     rows: list[dict] = []
     t0 = time.time()
-    for spec in candidates:
-        out_path = Path(spec.out_path)
-        if args.skip_existing and out_path.exists():
-            print(f"Skipping existing {out_path}")
-        else:
-            cmd = mlx_command(runner, prepared, spec)
-            run(cmd, cwd=mlx_dir, dry_run=args.dry_run)
+    n = len(candidates)
+    manifest_path = args.outdir / "manifest.jsonl"
 
-        row = {"spec": asdict(spec), "command": mlx_command(runner, prepared, spec)}
-        if out_path.exists() and not args.dry_run:
+    if args.dry_run:
+        for spec in candidates:
+            cmd = mlx_command(runner, prepared, spec)
+            print("$", " ".join(shlex_quote(x) for x in cmd))
+            rows.append({"spec": asdict(spec), "command": cmd})
+            write_jsonl(manifest_path, rows)
+        return {
+            "outdir": args.outdir, "prepared": prepared,
+            "manifest": manifest_path, "review": None,
+            "rows": rows, "elapsed": time.time() - t0,
+            "pipeline": pipeline,
+        }
+
+    to_run = [s for s in candidates if not (args.skip_existing and Path(s.out_path).exists())]
+    if to_run:
+        first = to_run[0]
+        # All candidates in a run share dit/decoder/seconds — Pipeline is built once for these.
+        for s in to_run[1:]:
+            if (s.model_dit, s.decoder, s.seconds) != (first.model_dit, first.decoder, first.seconds):
+                raise RuntimeError(
+                    f"candidates must share (dit, decoder, seconds); "
+                    f"got {(s.model_dit, s.decoder, s.seconds)} vs "
+                    f"{(first.model_dit, first.decoder, first.seconds)}"
+                )
+        from sa3_pipeline import Pipeline, read_wav_44k_stereo_s16
+        want = (first.model_dit, first.decoder, float(first.seconds))
+        have = (
+            (pipeline.dit_name, pipeline.decoder_name, pipeline.seconds)
+            if pipeline is not None else None
+        )
+        if pipeline is None or have != want:
+            if pipeline is not None:
+                print(f"[pipeline] reloading: {have} → {want}", file=sys.stderr)
+            else:
+                print(
+                    f"[pipeline] loading dit={want[0]} decoder={want[1]} "
+                    f"seconds={want[2]:.1f}s",
+                    file=sys.stderr,
+                )
+            t_load = time.time()
+            pipeline = Pipeline(
+                dit=first.model_dit, decoder=first.decoder, seconds=float(first.seconds),
+                dit_dtype="fp16", load_encoder_now=True, verbose=True,
+            )
+            print(
+                f"[pipeline] ready in {time.time()-t_load:.1f}s; running {len(to_run)}/{n} candidate(s)",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[pipeline] reusing resident dit={want[0]} decoder={want[1]} "
+                f"seconds={want[2]:.1f}s; running {len(to_run)}/{n} candidate(s)",
+                file=sys.stderr,
+            )
+        init_audio = read_wav_44k_stereo_s16(prepared)
+    elif args.skip_existing:
+        print(f"All {n} candidates exist; nothing to generate.", file=sys.stderr)
+        init_audio = None
+
+    for i, spec in enumerate(candidates, 1):
+        out_path = Path(spec.out_path)
+        cmd_for_manifest = mlx_command(runner, prepared, spec)
+        if args.skip_existing and out_path.exists():
+            print(f"[{i}/{n}] skip-existing  {out_path.name}", file=sys.stderr)
+        else:
+            t_g0 = time.time()
+            pipeline.generate(
+                prompt=spec.prompt,
+                negative_prompt=spec.negative_prompt or None,
+                seed=spec.seed,
+                steps=spec.steps,
+                init_noise_level=spec.init_noise_level,
+                cfg=spec.cfg,
+                apg=spec.apg,
+                init_audio_np=init_audio,
+                inpaint_range_seconds=spec.inpaint_range,
+                out_path=str(out_path),
+            )
+            print(
+                f"[{i}/{n}] {spec.mode:<22}  n={spec.init_noise_level:.2f} "
+                f"cfg={spec.cfg:.1f} seed={spec.seed}  →  {out_path.name}   "
+                f"({time.time()-t_g0:.1f}s)",
+                file=sys.stderr,
+            )
+        row = {"spec": asdict(spec), "command": cmd_for_manifest}
+        if out_path.exists():
             try:
                 row["metrics"] = asdict(compute_metrics(prepared, out_path))
             except Exception as exc:
                 row["metrics_error"] = str(exc)
         rows.append(row)
-        write_jsonl(args.outdir / "manifest.jsonl", rows)
+        write_jsonl(manifest_path, rows)
 
-    if not args.dry_run:
-        review = write_review_html(args.outdir, prepared, rows)
-    else:
-        review = args.outdir / "review.html"
+    review = write_review_html(args.outdir, prepared, rows)
+    return {
+        "outdir": args.outdir, "prepared": prepared,
+        "manifest": manifest_path, "review": review,
+        "rows": rows, "elapsed": time.time() - t0,
+        "pipeline": pipeline,
+    }
 
-    elapsed = time.time() - t0
+
+def main() -> int:
+    args = parse_args()
+    result = run_variations(args)
     print()
-    print(f"Wrote manifest: {args.outdir / 'manifest.jsonl'}")
-    if not args.dry_run:
-        print(f"Wrote review:   {review}")
-    print(f"Done in {elapsed:.1f}s")
+    print(f"Wrote manifest: {result['manifest']}")
+    if result["review"] is not None:
+        print(f"Wrote review:   {result['review']}")
+    if args.dry_run:
+        print(f"Dry run done in {result['elapsed']:.1f}s ({len(result['rows'])} candidate(s))")
+    else:
+        print(f"Done in {result['elapsed']:.1f}s")
     return 0
 
 

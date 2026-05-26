@@ -11,18 +11,18 @@ Two scripts:
 
 The variation problem has two valid framings that lead to very different parameter regimes. The harness supports both as distinct presets.
 
-| | Preserve sound (`--preset app`) | Free variation (`--preset free`) |
+| | Free variation (`--preset free`, **default**) | Preserve sound (`--preset app`) |
 |---|---|---|
-| Goal | Same sample, varied | Different sounds, same musical slot |
-| Sound identity | preserved (Splice-like) | varies freely |
-| Timbre | must survive | can drift |
-| Instrument | must stay | may change |
-| Harmonic context | varies subtly | preserved |
-| Productive noise band | a2a 0.25–0.35, inpaint 0.85 | a2a 0.52 |
-| Guidance | cfg=2 for a2a, cfg=4 for inpaint | cfg=1.0 (unconditional) |
-| Per-candidate steers | yes (musical directions) | none, empty prompt |
+| Goal | Different sounds, same musical slot | Same sample, varied |
+| Sound identity | varies freely | preserved (Splice-like) |
+| Timbre | can drift | must survive |
+| Instrument | may change | must stay |
+| Harmonic context | preserved | varies subtly |
+| Noise level | a2a 0.45 (slider-controllable in studio) | a2a 0.45 (slider-controllable), inpaint 0.85 |
+| Guidance | cfg=1.0 (unconditional) | cfg=4 for a2a, cfg=4 for inpaint |
+| Per-candidate steers | none, empty prompt | yes (musical directions) |
 
-Both produce 5 candidates per run from the same input. Neither is "wrong" — they solve different problems and a real product probably offers both.
+Both produce 5 candidates per run from the same input. Neither is "wrong" — they solve different problems and a real product probably offers both. `free` is the default because it consistently produces a nice neighbourhood around the original with no prompt engineering on the user's part; `app` is for when you specifically need the timbre to stay put.
 
 ## Quick start
 
@@ -32,7 +32,7 @@ Both produce 5 candidates per run from the same input. Neither is "wrong" — th
 optimized/mlx/.venv/bin/python sa3_studio.py
 ```
 
-Opens `http://localhost:8765`. Drop a WAV, toggle **Preserve sound** vs **Free variation**, click Generate. ~30s for 5 candidates on M4 Max.
+Opens `http://localhost:8765`. Drop a WAV and click Generate — **Free variation** is the default-on preset; toggle to **Preserve sound** if you need to lock timbre instead. ~7.7s for 5 candidates on M4 Max once the pipeline is warm (10s loop, medium + same-l, 8 steps), ~9.8s on the first click while the pipeline loads. The pipeline stays resident across clicks for the same audio duration; a new duration triggers a ~1.3s rebuild.
 
 The studio auto-detects BPM and key from the dropped filename using the common `<bpm>_<key>_<name>` convention (Noiiz / Loopmasters / older Splice). Examples:
 
@@ -48,11 +48,10 @@ optimized/mlx/.venv/bin/python sa3_variations.py \
   --sa3-root . \
   --input <some.wav> \
   --kind melodic \
-  --preset app \
   --outdir ./runs/<name>
 ```
 
-Filename-based BPM/key auto-detection runs by default; `--bpm` / `--key` override.
+Defaults to `--preset free` (unconditional a2a at n=0.45, varied seeds). Add `--preset app` for the prompt-anchored "preserve sound" regime. Use `--noise-a2a` to override the noise level (mirrors the studio slider). Filename-based BPM/key auto-detection runs by default for `app` (which uses BPM for bar-aware inpaint masks); `--bpm` / `--key` override. `free` ignores both since it sends an empty prompt and has no inpaint candidates.
 
 ## What we learned about SA3 for variation
 
@@ -147,8 +146,10 @@ BPM is constrained to the 40–240 range to avoid false matches like `kick_440Hz
 
 | Preset | Slots | Mode mix | Noise | CFG | Prompt | Use |
 |---|---|---|---|---|---|---|
-| `app` | 5 | 3 a2a + 2 inpaint | a2a 0.27/0.31/0.35, inpaint 0.85 | a2a 2.0, inpaint 4.0 | per-candidate steer | "preserve sound" product |
-| `free` | 5 | 5 a2a | 0.52 | 1.0 | empty | "free variation" product |
+| `app` | 5 | 3 a2a + 2 inpaint | a2a 0.45*, inpaint 0.85 | a2a 4.0, inpaint 4.0 | per-candidate steer | "preserve sound" product |
+| `free` | 5 | 5 a2a | 0.45* | 1.0 | empty | "free variation" product (default) |
+
+\* a2a noise is `--noise-a2a` on the CLI / the slider in the studio. 0.45 is the default; the original friend's setup used 0.52 (see §8).
 | `diagnose` | 4 | 4 a2a | 0.50 / 0.25 / 0.35 / 0.45 | 1.0 / 2.0 / 2.0 / 2.0 | neutral steer | isolate cfg vs noise as drift source |
 | `grid` | `--count` | inpaint-dominant | melodic a2a 0.25–0.35, inpaint 0.85 | per-mode | per-candidate steer | exploration sweep |
 

@@ -66,11 +66,33 @@ target_compile_definitions(SA3 PUBLIC
     JUCE_DISPLAY_SPLASH_SCREEN=0
 )
 
+# ── SA3 C++ port (optimized/cpp/) ─────────────────────────────────────
+# Phase 2: pull in the bit-exact C++ inference path. The orchestrator
+# target transitively depends on t5gemma, dit, samel, sa3_pipeline, and
+# mlx. After this add_subdirectory call, sa3_orchestrator (along with its
+# test executables and dependencies) is part of the plugin's build.
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../optimized/cpp
+                 ${CMAKE_BINARY_DIR}/sa3_cpp_build)
+
 target_link_libraries(SA3 PRIVATE
     juce::juce_audio_utils
     juce::juce_audio_processors
+    sa3_orchestrator
     PUBLIC
     juce::juce_recommended_config_flags
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags
 )
+
+# libmlx.dylib lives inside the project venv. Embed an rpath into the
+# plugin bundles so they can find it at runtime without DYLD_LIBRARY_PATH.
+# When we ship the plugin, libmlx.dylib will be vendored into the bundle's
+# Contents/Frameworks/ and the rpath swapped to @loader_path/../Frameworks.
+get_filename_component(MLX_LIB_DIR "${MLX_VENV_CMAKE}/../../../lib" ABSOLUTE)
+foreach(fmt SA3_AU SA3_VST3 SA3_Standalone)
+    if(TARGET ${fmt})
+        set_target_properties(${fmt} PROPERTIES
+            INSTALL_RPATH "${MLX_LIB_DIR}"
+            BUILD_RPATH   "${MLX_LIB_DIR}")
+    endif()
+endforeach()

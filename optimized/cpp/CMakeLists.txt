@@ -8,7 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Point at the MLX package shipped inside the project venv.  When you eventually
 # vendor MLX into the plugin tree, swap this for an in-tree path.
 set(MLX_VENV_CMAKE
-    "${CMAKE_SOURCE_DIR}/../mlx/.venv/lib/python3.11/site-packages/mlx/share/cmake/MLX"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mlx/.venv/lib/python3.11/site-packages/mlx/share/cmake/MLX"
     CACHE PATH "Location of MLX CMake config (from `pip install mlx`)")
 
 list(PREPEND CMAKE_PREFIX_PATH "${MLX_VENV_CMAKE}")

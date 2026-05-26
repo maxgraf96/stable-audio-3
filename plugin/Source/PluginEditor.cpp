@@ -10,7 +10,10 @@ SA3AudioProcessorEditor::SA3AudioProcessorEditor(SA3AudioProcessor& p)
     titleLabel.setJustificationType(juce::Justification::centred);
     addAndMakeVisible(titleLabel);
 
-    statusLabel.setText("Phase 1 skeleton  ·  no inference wired yet",
+    // Explicit UTF-8 — juce::String from a raw const char* assumes Latin-1 by
+    // default, so a multi-byte UTF-8 sequence like `·` (0xC2 0xB7) gets read
+    // as two glyphs (Â + ·).  fromUTF8 takes the literal as UTF-8.
+    statusLabel.setText(juce::String::fromUTF8("Phase 2 skeleton  ·  sa3_orchestrator linked"),
                        juce::dontSendNotification);
     statusLabel.setFont(juce::Font(juce::FontOptions(14.0f)));
     statusLabel.setJustificationType(juce::Justification::centred);

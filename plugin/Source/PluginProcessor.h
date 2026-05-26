@@ -7,9 +7,14 @@
 
 #include <JuceHeader.h>
 
+#include "PipelineLoader.h"
+
 class SA3AudioProcessor : public juce::AudioProcessor
 {
 public:
+    sa3plugin::PipelineLoader& getPipelineLoader() { return pipelineLoader; }
+    const sa3plugin::PipelineLoader& getPipelineLoader() const { return pipelineLoader; }
+
     SA3AudioProcessor();
     ~SA3AudioProcessor() override;
 
@@ -38,5 +43,11 @@ public:
     void setStateInformation(const void* data, int sizeInBytes) override;
 
 private:
+    // Background-thread loader. Constructed in NotLoaded state; load is
+    // triggered on first createEditor() call (so plugin scan / auval don't
+    // pay the cost). Lifetime tied to the processor — destructor joins the
+    // worker on plugin unload.
+    sa3plugin::PipelineLoader pipelineLoader;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SA3AudioProcessor)
 };

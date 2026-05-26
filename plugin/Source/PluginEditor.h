@@ -8,7 +8,8 @@
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
 
-class SA3AudioProcessorEditor : public juce::AudioProcessorEditor
+class SA3AudioProcessorEditor : public juce::AudioProcessorEditor,
+                                private juce::Timer
 {
 public:
     explicit SA3AudioProcessorEditor(SA3AudioProcessor&);
@@ -18,6 +19,8 @@ public:
     void resized() override;
 
 private:
+    void timerCallback() override;   // polls PipelineLoader status
+
     SA3AudioProcessor& processorRef;
     juce::Label titleLabel;
     juce::Label statusLabel;

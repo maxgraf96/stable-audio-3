@@ -13,12 +13,16 @@ SA3AudioProcessorEditor::SA3AudioProcessorEditor(SA3AudioProcessor& p)
     // Explicit UTF-8 — juce::String from a raw const char* assumes Latin-1 by
     // default, so a multi-byte UTF-8 sequence like `·` (0xC2 0xB7) gets read
     // as two glyphs (Â + ·).  fromUTF8 takes the literal as UTF-8.
-    statusLabel.setText(juce::String::fromUTF8("Phase 2 skeleton  ·  sa3_orchestrator linked"),
+    statusLabel.setText(processorRef.getPipelineLoader().getStatus(),
                        juce::dontSendNotification);
     statusLabel.setFont(juce::Font(juce::FontOptions(14.0f)));
     statusLabel.setJustificationType(juce::Justification::centred);
     statusLabel.setColour(juce::Label::textColourId, juce::Colours::grey);
     addAndMakeVisible(statusLabel);
+
+    // Poll the background loader's status 10×/s while the editor is open.
+    // Cheap (mutex-protected string read); auto-stops when the editor closes.
+    startTimerHz(10);
 }
 
 SA3AudioProcessorEditor::~SA3AudioProcessorEditor() = default;
@@ -34,4 +38,10 @@ void SA3AudioProcessorEditor::resized()
     titleLabel.setBounds(bounds.removeFromTop(80));
     bounds.removeFromTop(8);
     statusLabel.setBounds(bounds.removeFromTop(24));
+}
+
+void SA3AudioProcessorEditor::timerCallback()
+{
+    statusLabel.setText(processorRef.getPipelineLoader().getStatus(),
+                        juce::dontSendNotification);
 }

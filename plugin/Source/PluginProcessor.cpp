@@ -38,6 +38,10 @@ void SA3AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mid
 
 juce::AudioProcessorEditor* SA3AudioProcessor::createEditor()
 {
+    // First editor open triggers the background model load. Idempotent: no-op
+    // on subsequent calls or once the load has finished. Plugin scan never
+    // opens the editor, so AU validation / DAW scan stays fast.
+    pipelineLoader.requestLoad();
     return new SA3AudioProcessorEditor(*this);
 }
 

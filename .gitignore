@@ -171,3 +171,6 @@ wandb/*
 
 # Variation harness output directory (sa3_variations.py / sa3_studio.py)
 /runs/
+
+# C++ port spike build artifacts (CMake out-of-source build dir)
+/cpp_spike/build/

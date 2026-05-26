@@ -98,15 +98,20 @@ ensure_uv
 step "Creating virtual environment at .venv/ with Python $PY_VERSION"
 if [[ -d "$VENV_DIR" ]]; then
     EXISTING_PY=$("$VENV_DIR/bin/python" -c 'import sys; print(".".join(map(str, sys.version_info[:2])))' 2>/dev/null || echo "unknown")
-    if [[ "$EXISTING_PY" == "$PY_VERSION"* ]]; then
-        ok "reusing existing .venv (Python $EXISTING_PY)"
+    EXISTING_ARCH=$("$VENV_DIR/bin/python" -c 'import platform; print(platform.machine())' 2>/dev/null || echo "unknown")
+    if [[ "$EXISTING_PY" == "$PY_VERSION"* && ( "$ARCH" != "arm64" || "$EXISTING_ARCH" == "arm64" ) ]]; then
+        ok "reusing existing .venv (Python $EXISTING_PY, $EXISTING_ARCH)"
     else
-        warn "existing .venv uses Python $EXISTING_PY (wanted $PY_VERSION) — recreating"
+        if [[ "$EXISTING_PY" != "$PY_VERSION"* ]]; then
+            warn "existing .venv uses Python $EXISTING_PY (wanted $PY_VERSION) — recreating"
+        else
+            warn "existing .venv is $EXISTING_ARCH on an arm64 host (MLX needs arm64) — recreating"
+        fi
         rm -rf "$VENV_DIR"
-        uv venv --seed --python "$PY_VERSION" "$VENV_DIR"
+        uv venv --seed --python "$PY_VERSION" --python-preference only-managed "$VENV_DIR"
     fi
 else
-    uv venv --seed --python "$PY_VERSION" "$VENV_DIR"
+    uv venv --seed --python "$PY_VERSION" --python-preference only-managed "$VENV_DIR"
 fi
 
 # ── install runtime deps ────────────────────────────────────────────────────

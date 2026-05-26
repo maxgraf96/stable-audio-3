@@ -168,3 +168,6 @@ wandb/*
 .DS_Store
 *.safetensors
 .claude
+
+# Variation harness output directory (sa3_variations.py / sa3_studio.py)
+/runs/

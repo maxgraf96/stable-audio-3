@@ -456,5 +456,199 @@ std::vector<float> read_wav_pcm16(
     return out;
 }
 
+// ── Variation orchestration ──────────────────────────────────────────
+// Ports of sa3_variations.py helpers — restricted to kind="melodic" since
+// that's the only kind the plugin's "preserve sound" / "free variation"
+// presets are tuned for.
+
+static std::optional<std::pair<float, float>> clamp_range(
+    float start, float end, float duration)
+{
+    start = std::max(0.0f, std::min(start, duration));
+    end   = std::max(0.0f, std::min(end,   duration));
+    if (end - start < 0.08f) return std::nullopt;
+    return std::make_pair(start, end);
+}
+
+static std::optional<float> bar_len_seconds(
+    std::optional<float> bpm, int beats_per_bar)
+{
+    if (!bpm.has_value() || *bpm <= 0.0f) return std::nullopt;
+    return 60.0f / *bpm * static_cast<float>(beats_per_bar);
+}
+
+// prompt_for_kind(kind="melodic", ...) from sa3_variations.py.
+static std::string melodic_prompt(
+    const std::string& user_prompt,
+    std::optional<float> bpm,
+    const std::string& key,
+    const std::string& steer)
+{
+    std::string out =
+        "TrackType: Instrument, musical loop, same instrument tone, "
+        "same performance style, same recording chain";
+    if (bpm.has_value() && *bpm > 0.0f) {
+        // Match Python "{bpm:g}" — strips trailing zeros.
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), ", %g BPM", *bpm);
+        out += buf;
+    }
+    if (!key.empty()) {
+        out += ", in " + key;
+    }
+    if (!user_prompt.empty()) {
+        out += ", " + user_prompt;
+    }
+    if (!steer.empty()) {
+        out += ", " + steer;
+    }
+    return out;
+}
+
+// negative_prompt_for_kind(kind="melodic") from sa3_variations.py.
+static std::string melodic_negative_prompt()
+{
+    return "poor quality, distorted, clipping, noisy, vocals, speech, silence, "
+           "abrupt cutoff, completely different instrument, different timbre, "
+           "different tone, different genre, unrelated melody, sudden style change";
+}
+
+std::vector<CandidateSpec> build_free_preset(
+    float    /*duration_seconds*/,
+    uint64_t seed_base,
+    float    noise_a2a)
+{
+    std::vector<CandidateSpec> out;
+    out.reserve(5);
+    for (int i = 0; i < 5; ++i) {
+        CandidateSpec s;
+        s.index           = i;
+        s.mode            = "a2a";
+        s.seed            = seed_base + static_cast<uint64_t>(i) * 1009ull;
+        s.prompt          = "";
+        s.negative_prompt = "";
+        s.steer           = "free variation (unconditional)";
+        s.noise           = noise_a2a;
+        s.cfg             = 1.0f;
+        s.apg             = 1.0f;
+        s.inpaint_range_seconds.reset();
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+std::vector<CandidateSpec> build_app_preset(
+    float                duration_seconds,
+    uint64_t             seed_base,
+    const std::string&   user_prompt,
+    std::optional<float> bpm,
+    const std::string&   key,
+    int                  beats_per_bar,
+    float                noise_a2a,
+    float                cfg_a2a,
+    float                cfg_inpaint,
+    float                apg)
+{
+    auto bar = bar_len_seconds(bpm, beats_per_bar);
+    std::optional<std::pair<float, float>> middle_bar;
+    std::optional<std::pair<float, float>> first_2_bars;
+    if (bar.has_value() && duration_seconds >= *bar * 4.0f) {
+        // Bar-aware masks: 1 bar centered, and the first 2 bars.
+        middle_bar = clamp_range(
+            duration_seconds * 0.5f - *bar * 0.5f,
+            duration_seconds * 0.5f + *bar * 0.5f,
+            duration_seconds);
+        first_2_bars = clamp_range(0.0f, *bar * 2.0f, duration_seconds);
+    } else {
+        // Short loop or unknown BPM — fall back to fractional masks so the
+        // preset still produces 5 candidates.
+        middle_bar = clamp_range(
+            duration_seconds * 0.35f,
+            duration_seconds * 0.65f,
+            duration_seconds);
+        first_2_bars = clamp_range(0.0f, duration_seconds * 0.5f, duration_seconds);
+    }
+
+    struct Slot {
+        std::string                            mode;
+        std::optional<std::pair<float, float>> mask;
+        float                                  noise;
+        std::string                            steer;
+    };
+    const std::vector<Slot> slots = {
+        {"a2a",                  std::nullopt, noise_a2a,
+            "extra passing notes and ornaments"},
+        {"a2a",                  std::nullopt, noise_a2a,
+            "alternate phrasing, same harmonic feel"},
+        {"a2a",                  std::nullopt, noise_a2a,
+            "small melodic variation with different note choices"},
+        {"inpaint_middle_bar",   middle_bar,   0.85f,
+            "subtly different chord progression, same key"},
+        {"inpaint_first_2_bars", first_2_bars, 0.85f,
+            "small reharmonization while preserving the melodic contour"},
+    };
+
+    const std::string neg = melodic_negative_prompt();
+    std::vector<CandidateSpec> out;
+    out.reserve(slots.size());
+    for (int i = 0; i < static_cast<int>(slots.size()); ++i) {
+        const auto& sl = slots[i];
+        CandidateSpec s;
+        s.index                 = i;
+        s.mode                  = sl.mode;
+        s.seed                  = seed_base + static_cast<uint64_t>(i) * 1009ull;
+        s.prompt                = melodic_prompt(user_prompt, bpm, key, sl.steer);
+        s.negative_prompt       = neg;
+        s.steer                 = sl.steer;
+        s.noise                 = sl.noise;
+        s.cfg                   = (sl.mode == "a2a") ? cfg_a2a : cfg_inpaint;
+        s.apg                   = apg;
+        s.inpaint_range_seconds = sl.mask;
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+std::vector<VariationOutput> run_variations(
+    const Pipeline&                   pipe,
+    const InitAudio&                  source_audio,
+    const std::vector<CandidateSpec>& specs,
+    float                             duration_seconds,
+    int                               steps)
+{
+    std::vector<VariationOutput> out;
+    out.reserve(specs.size());
+    for (const auto& spec : specs) {
+        mx::array audio = pipe.generate(
+            spec.prompt,
+            duration_seconds,
+            steps,
+            spec.seed,
+            spec.cfg,
+            spec.apg,
+            spec.negative_prompt,
+            spec.noise,
+            source_audio,
+            spec.inpaint_range_seconds);
+        // (channels=2, samples) fp32, copy into a planar std::vector<float>
+        // so callers don't need MLX in their headers.
+        audio = samel::to_row_contiguous(mx::astype(audio, mx::float32));
+        mx::eval(audio);
+        if (audio.ndim() != 2) {
+            throw std::runtime_error("run_variations: expected (channels, samples) output");
+        }
+        const int channels = audio.shape()[0];
+        const int samples  = audio.shape()[1];
+        const float* src = audio.data<float>();
+        VariationOutput v;
+        v.spec     = spec;
+        v.channels = channels;
+        v.samples  = samples;
+        v.audio.assign(src, src + static_cast<size_t>(channels) * samples);
+        out.push_back(std::move(v));
+    }
+    return out;
+}
+
 }  // namespace orch
 }  // namespace sa3

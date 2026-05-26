@@ -30,16 +30,17 @@ function getNativeFunction(name) {
   });
 }
 
-const getStatus    = getNativeFunction("getStatus");
-const getUiState   = getNativeFunction("getUiState");
-const setUiState   = getNativeFunction("setUiState");
-const uploadSource = getNativeFunction("uploadSource");
-const generate     = getNativeFunction("generate");
-const play         = getNativeFunction("play");
-const pause        = getNativeFunction("pause");
-const stop         = getNativeFunction("stop");
-const seek         = getNativeFunction("seek");
-const getPlayState = getNativeFunction("getPlayState");
+const getStatus      = getNativeFunction("getStatus");
+const getUiState     = getNativeFunction("getUiState");
+const setUiState     = getNativeFunction("setUiState");
+const uploadSource   = getNativeFunction("uploadSource");
+const generate       = getNativeFunction("generate");
+const play           = getNativeFunction("play");
+const pause          = getNativeFunction("pause");
+const stop           = getNativeFunction("stop");
+const seek           = getNativeFunction("seek");
+const getPlayState   = getNativeFunction("getPlayState");
+const setOneShotMode = getNativeFunction("setOneShotMode");
 
 // ── Constants ────────────────────────────────────────────────────────
 const PRESETS = [
@@ -85,10 +86,14 @@ const noiseInput     = $("noise");
 const noiseValueEl   = $("noise-value");
 
 const generateBtn    = $("generate");
+const genLabelEl     = generateBtn.querySelector(".gen-label");
+const genProgressEl  = $("gen-progress");
 const resultsEl      = $("results");
 const resMetaEl      = $("res-meta");
 const slotsEl        = $("slots");
 const appOnlyRows    = document.querySelectorAll(".app-only");
+const modeToggleEl   = $("mode-toggle");
+const kbdHintEl      = $("kbd-hint");
 
 // ── State ────────────────────────────────────────────────────────────
 const state = {
@@ -107,7 +112,27 @@ const state = {
   playingIdx:    -2,          // -2 idle, -1 source, 0..4 slot
   playing:       false,
   progress:      0,
+  // Loop vs one-shot playback. Auto-detected on file upload; user can flip
+  // via the mode toggle. When true: cycling variations restarts from 0;
+  // engine stops at end of buffer instead of looping.
+  oneShot:       false,
 };
+
+// Heuristic: filename keywords first (strong signal), then duration (short
+// samples are usually one-shots). User can always override the toggle.
+const ONE_SHOT_KEYWORDS = [
+  "oneshot", "one-shot", "one_shot",
+  "kick", "snare", "hat", "hihat", "clap", "perc", "tom",
+  "hit", "shot", "stab", "stinger",
+];
+const LOOP_KEYWORDS = ["loop", "bar"];
+
+function detectOneShot(fileName, durationSec) {
+  const n = (fileName || "").toLowerCase();
+  if (LOOP_KEYWORDS.some((kw) => n.includes(kw)))     return false;
+  if (ONE_SHOT_KEYWORDS.some((kw) => n.includes(kw))) return true;
+  return Number.isFinite(durationSec) && durationSec > 0 && durationSec < 1.5;
+}
 
 // ── Time formatting ──────────────────────────────────────────────────
 function fmtTime(s) {
@@ -296,9 +321,24 @@ async function loadFile(file) {
   if (bpm !== null && bpmInput.value === "") { bpmInput.value = String(bpm); saveUiSoon(); }
   if (key !== null && keyInput.value === "") { keyInput.value = key;         saveUiSoon(); }
 
+  // Auto-detect playback mode for the new source. Always applies on file
+  // change — manual override is per-file (a stored preference would lie
+  // for the next sample). The user can flip it after via the toggle.
+  applyOneShot(detectOneShot(file.name, state.fileSeconds));
+
   renderSource();
   updateButton();
 }
+
+function applyOneShot(oneShot) {
+  state.oneShot = !!oneShot;
+  modeToggleEl.textContent = state.oneShot ? "One-shot" : "Loop";
+  modeToggleEl.classList.toggle("one-shot", state.oneShot);
+  setOneShotMode(state.oneShot);
+  saveUiSoon();
+}
+
+modeToggleEl.addEventListener("click", () => applyOneShot(!state.oneShot));
 
 // ── Render: source ───────────────────────────────────────────────────
 let srcWfHandle = null;
@@ -347,9 +387,12 @@ function clearVariations() {
 
 function renderResults() {
   if (state.variations.length === 0 && state.expected === 0) {
-    resultsEl.hidden = true; return;
+    resultsEl.hidden = true;
+    if (kbdHintEl) kbdHintEl.hidden = true;
+    return;
   }
   resultsEl.hidden = false;
+  if (kbdHintEl) kbdHintEl.hidden = false;
   const noiseDisplay = Number(noiseInput.value).toFixed(2);
   const count = Math.max(state.expected, state.variations.length);
   resMetaEl.textContent = `${count} · σ ${noiseDisplay}`;
@@ -374,8 +417,8 @@ function renderResults() {
       </div>
       <span class="dur"></span>
       <button type="button" class="row-play" aria-label="Play variation ${i + 1}">
-        <svg class="play-ico"  width="9" height="9" viewBox="0 0 9 9"><polygon points="2,1 8,4.5 2,8" fill="currentColor"/></svg>
-        <svg class="pause-ico" width="9" height="9" viewBox="0 0 9 9"><rect x="1.5" y="1" width="2" height="7" fill="currentColor"/><rect x="5.5" y="1" width="2" height="7" fill="currentColor"/></svg>
+        <svg class="play-ico"  width="10" height="10" viewBox="0 0 10 10"><polygon points="2.5,2 8.5,5 2.5,8" fill="currentColor"/></svg>
+        <svg class="pause-ico" width="10" height="10" viewBox="0 0 10 10"><rect x="2" y="2" width="2" height="6" fill="currentColor"/><rect x="6" y="2" width="2" height="6" fill="currentColor"/></svg>
       </button>
     `;
     slotsEl.appendChild(slot);
@@ -485,13 +528,19 @@ function updateButton() {
   const can = state.pipelineReady && state.hasSource && !state.busy;
   generateBtn.disabled = !can;
   generateBtn.classList.toggle("busy", state.busy);
+  const m = /(\d+)\/(\d+)/.exec(statusText.textContent || "");
   if (state.busy) {
-    const m = /(\d+)\/(\d+)/.exec(statusText.textContent || "");
-    generateBtn.textContent = m
+    genLabelEl.textContent = m
       ? `Generating  ${m[1]} / ${m[2]}`
       : "Generating…";
+    if (m) {
+      const pct = (Number(m[1]) / Number(m[2])) * 100;
+      genProgressEl.style.width = pct + "%";
+    }
   } else {
-    generateBtn.textContent = "Generate 5 variations";
+    genLabelEl.textContent = "Generate 5 variations";
+    // Keep width where it landed — opacity fade hides it, so a snap
+    // back to 0 would be visible as the bar shrinks behind the fade.
   }
 }
 
@@ -616,25 +665,58 @@ function updatePlayStateUI() {
 
 srcPlayBtn.addEventListener("click", () => togglePlay(-1));
 
-// Arrow up / down cycle through ready variations.  play(idx) on the engine
-// preserves the playback fraction across switches, so this gives A/B-style
-// scrubbing through the 5 candidates without losing your place.
+// Keyboard shortcuts:
+//   Space     — toggle play/pause on whatever's active. If nothing is, start
+//               the source (or the first ready variation if no source).
+//   ←         — seek the active item back to the start. Doesn't change play
+//               state — paused stays paused, playing keeps playing from 0.
+//   ↑ / ↓     — cycle through ready variations. play(idx) preserves the
+//               playback fraction, so this gives A/B-style scrubbing through
+//               the 5 candidates without losing your place.
+function firstReadyVariation() {
+  for (let i = 0; i < state.variations.length; i++) {
+    const v = state.variations[i];
+    if (v && v.peaks && v.peaks.length > 0) return i;
+  }
+  return -1;
+}
+
 document.addEventListener("keydown", (e) => {
   // Stay out of the way while the user is typing in BPM / Key / Prompt.
   const tag = (e.target && e.target.tagName || "").toLowerCase();
   if (tag === "input" || tag === "textarea" || tag === "select") return;
-  if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
 
+  // ── Space: toggle play/pause ─────────────────────────────────────
+  if (e.key === " " || e.code === "Space") {
+    e.preventDefault();
+    if (state.playingIdx === -2) {
+      // Nothing active → pick something sensible.
+      let target = state.hasSource ? -1 : firstReadyVariation();
+      if (target === -2 || target === -1 && !state.hasSource) return;
+      play(target).then(() => getPlayState()).then(applyPlayState);
+      return;
+    }
+    togglePlay(state.playingIdx);
+    return;
+  }
+
+  // ── Left: rewind active item to start ────────────────────────────
+  if (e.key === "ArrowLeft") {
+    if (state.playingIdx === -2) return;
+    e.preventDefault();
+    seek(0).then(() => getPlayState()).then(applyPlayState);
+    return;
+  }
+
+  // ── Up / Down: cycle ready variations ────────────────────────────
+  if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
   const ready = state.variations
     .map((v, i) => ({ v, i }))
     .filter(({ v }) => v && v.peaks && v.peaks.length > 0);
   if (ready.length === 0) return;
-
   e.preventDefault();
-
   let pos = ready.findIndex(({ i }) => i === state.playingIdx);
   if (pos === -1) {
-    // Nothing-or-source playing → jump to the first (Down) or last (Up).
     pos = e.key === "ArrowUp" ? ready.length - 1 : 0;
   } else {
     const delta = e.key === "ArrowUp" ? -1 : 1;
@@ -684,12 +766,14 @@ userPrompt.addEventListener("input", saveUiSoon);
 
 // ── State persistence ────────────────────────────────────────────────
 function snapshotUi() {
+  // Noise σ is intentionally not persisted — each new session starts at
+  // the HTML default (0.45) so the user re-decides per session.
   return {
     preset:     state.preset,
-    noise:      Number(noiseInput.value),
     bpm:        bpmInput.value,
     key:        keyInput.value,
     userPrompt: userPrompt.value,
+    oneShot:    state.oneShot,
   };
 }
 
@@ -709,14 +793,17 @@ async function rehydrateUi() {
     if (json) {
       const s = JSON.parse(json);
       if (s.preset === "free" || s.preset === "app") state.preset = s.preset;
-      if (Number.isFinite(s.noise))           noiseInput.value = s.noise;
       if (typeof s.bpm === "string")          bpmInput.value   = s.bpm;
       if (typeof s.key === "string")          keyInput.value   = s.key;
       if (typeof s.userPrompt === "string")   userPrompt.value = s.userPrompt;
+      if (typeof s.oneShot === "boolean")     state.oneShot    = s.oneShot;
     }
   } catch (e) {}
   noiseValueEl.textContent = Number(noiseInput.value).toFixed(2);
   renderPreset();
+  // Push the restored mode into native and reflect in the toggle label —
+  // even if no file is loaded yet (the engine remembers it for next upload).
+  applyOneShot(state.oneShot);
   state.rehydrated = true;
 }
 
@@ -725,6 +812,14 @@ generateBtn.addEventListener("click", async () => {
   if (!state.hasSource) return;
   await stop();
   clearError();
+
+  // Snap the progress bar back to 0 *with no transition* so the fresh
+  // run doesn't visibly retract from the previous run's 100%.
+  genProgressEl.style.transition = "none";
+  genProgressEl.style.width      = "0%";
+  // Force a reflow so the transition reset takes effect before we restore it.
+  void genProgressEl.offsetWidth;
+  genProgressEl.style.transition = "";
 
   state.expected   = 5;
   state.variations = Array.from({ length: 5 }, () => ({

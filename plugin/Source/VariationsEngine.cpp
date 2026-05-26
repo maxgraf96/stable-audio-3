@@ -22,6 +22,19 @@ constexpr const char* kDecoderPath =
 
 constexpr int kSampleRate = sa3::orch::SAMPLE_RATE;   // 44100
 
+// ~5.8 ms at 44.1 k / ~5.3 ms at 48 k — long enough to kill the click at
+// start/stop, short enough to feel instant. Doubles as a warm-up runway
+// for LagrangeInterpolator (which interpolates against zeroed history for
+// the first ~4 samples after reset, so an audible transient is masked).
+constexpr int kFadeSamples = 256;
+
+// ~3 ms at 44.1 k — equal-time linear crossfade when cycling between
+// variations while playing. Two variations of the same source have
+// near-identical envelopes but different phase/note choices, so an
+// instant buffer swap produces a small click; this masks it without
+// being audibly slow.
+constexpr int kCrossfadeSamples = 128;
+
 juce::var peaksToVar(const std::vector<float>& peaks) {
     juce::Array<juce::var> arr;
     arr.ensureStorageAllocated(static_cast<int>(peaks.size()));
@@ -231,41 +244,99 @@ void VariationsEngine::play(int idx)
             target = &variation_bufs_[static_cast<size_t>(idx)];
     }
     if (target == nullptr) {
-        active_idx_ = -2; active_playing_ = false; return;
+        active_idx_ = -2; active_playing_ = false;
+        fade_in_remaining_ = 0; fade_out_remaining_ = 0;
+        return;
     }
 
     if (active_idx_ != idx) {
-        // Switching buffers — preserve the playback fraction (0..1) so A/B
-        // comparison between variations feels continuous. If we had no
-        // active buffer (-2) the fraction stays 0.
-        double fraction = 0.0;
-        const juce::AudioBuffer<float>* prev = nullptr;
-        if (active_idx_ == -1)                                                          prev = &source_buf_;
-        else if (active_idx_ >= 0 && active_idx_ < static_cast<int>(variation_bufs_.size()))
-            prev = &variation_bufs_[static_cast<size_t>(active_idx_)];
-        if (prev != nullptr && prev->getNumSamples() > 0) {
-            fraction = static_cast<double>(active_position_) /
-                       static_cast<double>(prev->getNumSamples());
-            fraction = std::max(0.0, std::min(1.0, fraction));
+        // Snapshot the outgoing source position for the crossfade — but only
+        // if we were actually producing audio. A cold start (active_idx_ ==
+        // -2) has nothing to fade out from; a mid-fade-out also doesn't
+        // crossfade because the user explicitly paused.
+        const bool can_crossfade = active_playing_ && active_idx_ != -2
+                                && fade_out_remaining_ == 0;
+        if (can_crossfade) {
+            prev_idx_            = active_idx_;
+            prev_position_       = active_position_;
+            prev_sub_pos_        = 0.0;          // start fractional read fresh
+            crossfade_remaining_ = kCrossfadeSamples;
         }
-        active_idx_      = idx;
-        active_position_ = static_cast<int64_t>(
-            fraction * static_cast<double>(target->getNumSamples()));
-        if (active_position_ >= target->getNumSamples()) active_position_ = 0;
+
+        if (one_shot_mode_) {
+            // One-shot: cycling between variations restarts from the top
+            // — typical "drum hit / kick" comparison flow.
+            active_idx_      = idx;
+            active_position_ = 0;
+        } else {
+            // Loop: preserve the playback fraction (0..1) so A/B
+            // comparison between variations feels continuous.
+            double fraction = 0.0;
+            const juce::AudioBuffer<float>* prev = nullptr;
+            if (active_idx_ == -1)                                                          prev = &source_buf_;
+            else if (active_idx_ >= 0 && active_idx_ < static_cast<int>(variation_bufs_.size()))
+                prev = &variation_bufs_[static_cast<size_t>(active_idx_)];
+            if (prev != nullptr && prev->getNumSamples() > 0) {
+                fraction = static_cast<double>(active_position_) /
+                           static_cast<double>(prev->getNumSamples());
+                fraction = std::max(0.0, std::min(1.0, fraction));
+            }
+            active_idx_      = idx;
+            active_position_ = static_cast<int64_t>(
+                fraction * static_cast<double>(target->getNumSamples()));
+            if (active_position_ >= target->getNumSamples()) active_position_ = 0;
+        }
+        // Fresh interpolator state for the new buffer — the old buffer's
+        // history lives on in interp_*_old_ for the crossfade window.
+        interp_l_.reset();
+        interp_r_.reset();
     }
+
+    const bool was_silent = !active_playing_;
     active_playing_ = true;
+    if (was_silent) {
+        // Cold start — full fade-in, also masks the interpolator warm-up.
+        fade_in_remaining_ = kFadeSamples;
+        interp_l_.reset();
+        interp_r_.reset();
+    } else if (fade_out_remaining_ > 0) {
+        // Play interrupted an in-flight fade-out — pick up the gain ramp
+        // upward from wherever the fade-out left it, so we don't pop back
+        // to full gain.
+        fade_in_remaining_ = kFadeSamples - fade_out_remaining_;
+    }
+    fade_out_remaining_ = 0;
 }
 
 void VariationsEngine::pausePlayback()
 {
     std::lock_guard<std::mutex> lk(play_mutex_);
-    active_playing_ = false;
+    if (! active_playing_) return;
+    if (fade_out_remaining_ > 0) return;            // already fading out
+    if (fade_in_remaining_ > 0) {
+        // Pause mid-fade-in — invert the ramp to come back down from the
+        // gain we'd reached, not from full.
+        fade_out_remaining_ = kFadeSamples - fade_in_remaining_;
+        fade_in_remaining_  = 0;
+    } else {
+        fade_out_remaining_ = kFadeSamples;
+    }
+    // active_playing_ stays true until the fade completes (in
+    // getNextAudioBlock); UI poll briefly shows "playing" while it fades.
 }
 
 void VariationsEngine::resumePlayback()
 {
     std::lock_guard<std::mutex> lk(play_mutex_);
-    if (active_idx_ != -2) active_playing_ = true;
+    if (active_idx_ == -2) return;
+    const bool was_silent = !active_playing_;
+    active_playing_ = true;
+    if (was_silent) {
+        fade_in_remaining_ = kFadeSamples;
+        interp_l_.reset();
+        interp_r_.reset();
+    }
+    fade_out_remaining_ = 0;
 }
 
 void VariationsEngine::stopPlayback()
@@ -274,6 +345,13 @@ void VariationsEngine::stopPlayback()
     active_idx_      = -2;
     active_position_ = 0;
     active_playing_  = false;
+    fade_in_remaining_  = 0;
+    fade_out_remaining_ = 0;
+    crossfade_remaining_ = 0;
+    prev_idx_           = -2;
+    prev_sub_pos_       = 0.0;
+    interp_l_.reset();
+    interp_r_.reset();
 }
 
 void VariationsEngine::seek(double fraction)
@@ -287,6 +365,10 @@ void VariationsEngine::seek(double fraction)
     if (len > 0) {
         active_position_ = static_cast<int64_t>(fraction * static_cast<double>(len));
     }
+    // Reset interpolators on seek — otherwise the old fractional position
+    // would cause a brief click at the jump point.
+    interp_l_.reset();
+    interp_r_.reset();
 }
 
 PlayState VariationsEngine::getPlayState() const
@@ -295,6 +377,7 @@ PlayState VariationsEngine::getPlayState() const
     PlayState s;
     s.idx      = active_idx_;
     s.playing  = active_playing_;
+    s.oneShot  = one_shot_mode_;
     int64_t len = 0;
     if (active_idx_ == -1)                                 len = source_buf_.getNumSamples();
     else if (active_idx_ >= 0 && active_idx_ < static_cast<int>(variation_bufs_.size()))
@@ -306,18 +389,50 @@ PlayState VariationsEngine::getPlayState() const
     return s;
 }
 
-// ── AudioSource (audio thread) ───────────────────────────────────────
-
-void VariationsEngine::prepareToPlay(int /*samplesPerBlockExpected*/,
-                                     double /*sampleRate*/)
+void VariationsEngine::setOneShotMode(bool oneShot)
 {
-    // Buffers are stored at 44.1 kHz; if the host runs at a different SR
-    // playback will pitch-shift. We'll add a resampler stage in a follow-up
-    // when plugin-mode lands. For now the standalone defaults to 44.1k on
-    // Mac so this is a non-issue.
+    std::lock_guard<std::mutex> lk(play_mutex_);
+    one_shot_mode_ = oneShot;
 }
 
-void VariationsEngine::releaseResources() {}
+bool VariationsEngine::isOneShotMode() const
+{
+    std::lock_guard<std::mutex> lk(play_mutex_);
+    return one_shot_mode_;
+}
+
+// ── AudioSource (audio thread) ───────────────────────────────────────
+
+void VariationsEngine::prepareToPlay(int samplesPerBlockExpected,
+                                     double sampleRate)
+{
+    std::lock_guard<std::mutex> lk(play_mutex_);
+    host_sample_rate_ = sampleRate > 0.0 ? sampleRate : 44100.0;
+    // Lagrange consumes up to ceil(numOut * sourceSR/destSR) input samples
+    // per block; +8 for safety margin and the 4-sample interpolator window.
+    const double ratio = static_cast<double>(kSampleRate) / host_sample_rate_;
+    const int    maxIn = static_cast<int>(
+        std::ceil(samplesPerBlockExpected * ratio)) + 8;
+    temp_in_l_.assign(static_cast<size_t>(maxIn), 0.0f);
+    temp_in_r_.assign(static_cast<size_t>(maxIn), 0.0f);
+    scratch_l_.assign(static_cast<size_t>(samplesPerBlockExpected), 0.0f);
+    scratch_r_.assign(static_cast<size_t>(samplesPerBlockExpected), 0.0f);
+    interp_l_.reset();
+    interp_r_.reset();
+    crossfade_remaining_ = 0;
+    prev_idx_            = -2;
+    prev_sub_pos_        = 0.0;
+}
+
+void VariationsEngine::releaseResources()
+{
+    std::lock_guard<std::mutex> lk(play_mutex_);
+    interp_l_.reset();
+    interp_r_.reset();
+    crossfade_remaining_ = 0;
+    prev_idx_            = -2;
+    prev_sub_pos_        = 0.0;
+}
 
 void VariationsEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& info)
 {
@@ -336,27 +451,151 @@ void VariationsEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& inf
     }
     if (src == nullptr || src->getNumSamples() <= 0) return;
 
-    const int srcLen   = src->getNumSamples();
-    const int srcChans = src->getNumChannels();
-    const int outChans = info.buffer->getNumChannels();
-    const int wanted   = info.numSamples;
+    const int    srcLen   = src->getNumSamples();
+    const int    srcChans = src->getNumChannels();
+    const int    outChans = info.buffer->getNumChannels();
+    const int    wanted   = info.numSamples;
+    const double ratio    = static_cast<double>(kSampleRate) / host_sample_rate_;
 
-    // Loop forever (until pause/stop). Handle the case where a single
-    // output block straddles the buffer end — wrap inline so there's no
-    // half-sample gap on the loop point.
-    int written = 0;
-    while (written < wanted) {
-        const int remaining = static_cast<int>(srcLen - active_position_);
-        const int n         = std::min(wanted - written, remaining);
-        for (int ch = 0; ch < outChans; ++ch) {
-            const int srcCh = std::min(ch, srcChans - 1);
-            info.buffer->copyFrom(ch, info.startSample + written,
-                                  *src, srcCh,
-                                  static_cast<int>(active_position_), n);
+    // Lagrange consumes at most ceil(wanted * ratio) input samples — pad
+    // by 4 for the interpolator's internal lookahead so we never read
+    // past the end of our temp buffer.
+    const int numIn = static_cast<int>(std::ceil(wanted * ratio)) + 4;
+    if (numIn > static_cast<int>(temp_in_l_.size())) return;   // prepareToPlay underspec'd
+
+    // Fill the temp buffers from the source. In loop mode: wrap so the
+    // interpolator sees a continuous stream across the loop boundary.
+    // In one-shot mode: any read past the end of the buffer is silence,
+    // so the sample plays through once and then trails into nothing.
+    int64_t srcPos = active_position_;
+    const float* L = src->getReadPointer(0);
+    const float* R = (srcChans > 1) ? src->getReadPointer(1) : L;
+    for (int i = 0; i < numIn; ++i) {
+        if (srcPos >= srcLen) {
+            if (one_shot_mode_) {
+                temp_in_l_[static_cast<size_t>(i)] = 0.0f;
+                temp_in_r_[static_cast<size_t>(i)] = 0.0f;
+                ++srcPos;
+                continue;
+            }
+            srcPos = 0;   // loop wrap
         }
-        written += n;
-        active_position_ += n;
-        if (active_position_ >= srcLen) active_position_ = 0;
+        temp_in_l_[static_cast<size_t>(i)] = L[srcPos];
+        temp_in_r_[static_cast<size_t>(i)] = R[srcPos];
+        ++srcPos;
+    }
+
+    // Resample (or memcpy at ratio == 1.0, which Lagrange handles itself).
+    float* outL = info.buffer->getWritePointer(0, info.startSample);
+    float* outR = (outChans > 1) ? info.buffer->getWritePointer(1, info.startSample)
+                                 : outL;
+    const int used = interp_l_.process(ratio, temp_in_l_.data(), outL, wanted);
+    if (outR != outL) {
+        interp_r_.process(ratio, temp_in_r_.data(), outR, wanted);
+    }
+
+    // ── Crossfade: mix outgoing buffer over the first N samples of out ──
+    // The previous variation reads through a simple linear interpolator
+    // (juce::LagrangeInterpolator is non-copyable so we can't snapshot its
+    // warm state — but a 3 ms tail through linear interp is inaudible).
+    if (crossfade_remaining_ > 0 && prev_idx_ != -2) {
+        const juce::AudioBuffer<float>* psrc = nullptr;
+        if (prev_idx_ == -1)
+            psrc = &source_buf_;
+        else if (prev_idx_ >= 0 && prev_idx_ < static_cast<int>(variation_bufs_.size()))
+            psrc = &variation_bufs_[static_cast<size_t>(prev_idx_)];
+        if (psrc != nullptr && psrc->getNumSamples() > 0) {
+            const int pSrcLen   = psrc->getNumSamples();
+            const int pSrcChans = psrc->getNumChannels();
+            const float* pL = psrc->getReadPointer(0);
+            const float* pR = (pSrcChans > 1) ? psrc->getReadPointer(1) : pL;
+
+            // Read up to `n` destination samples from the previous buffer at
+            // host SR, advancing prev_position_ + prev_sub_pos_ by `ratio`
+            // per output sample. Linear interp between adjacent source
+            // samples. Wraps at end of buffer (loop mode for the outgoing
+            // tail — one-shot mode's natural end is too far away to matter
+            // over 128 samples).
+            const int n = std::min(wanted, crossfade_remaining_);
+            int64_t pPos = prev_position_;
+            double  pSub = prev_sub_pos_;
+            for (int i = 0; i < n; ++i) {
+                if (pPos >= pSrcLen) pPos -= pSrcLen;
+                const int64_t pNext = (pPos + 1 < pSrcLen) ? (pPos + 1) : 0;
+                const float fSub = static_cast<float>(pSub);
+                const float oldL = pL[pPos] * (1.0f - fSub) + pL[pNext] * fSub;
+                const float oldR = pR[pPos] * (1.0f - fSub) + pR[pNext] * fSub;
+
+                const float t = static_cast<float>(kCrossfadeSamples - crossfade_remaining_) /
+                                static_cast<float>(kCrossfadeSamples);
+                outL[i] = outL[i] * t + oldL * (1.0f - t);
+                if (outR != outL)
+                    outR[i] = outR[i] * t + oldR * (1.0f - t);
+                --crossfade_remaining_;
+
+                pSub += ratio;
+                while (pSub >= 1.0) { pSub -= 1.0; ++pPos; }
+            }
+            prev_position_ = pPos % pSrcLen;
+            prev_sub_pos_  = pSub;
+            if (crossfade_remaining_ == 0) {
+                prev_idx_     = -2;
+                prev_sub_pos_ = 0.0;
+            }
+        } else {
+            // Outgoing buffer got dropped/cleared — bail.
+            crossfade_remaining_ = 0;
+            prev_idx_            = -2;
+            prev_sub_pos_        = 0.0;
+        }
+    }
+
+    // Advance source position by samples actually consumed (the interpolator
+    // returns this exactly; using ratio*wanted would accumulate float error).
+    active_position_ += used;
+    if (one_shot_mode_) {
+        // One-shot reached or passed the end → stop. The interpolator may
+        // have a few samples of tail it's already mixed into this block
+        // (those are at zero gain because temp_in_*_ went to silence past
+        // end), so we don't need a fade-out; just latch playing=false.
+        if (active_position_ >= srcLen) {
+            active_position_ = 0;
+            active_playing_  = false;
+            interp_l_.reset();
+            interp_r_.reset();
+        }
+    } else {
+        active_position_ %= srcLen;
+    }
+
+    // Fade-in ramp (0 → 1 over kFadeSamples).
+    if (fade_in_remaining_ > 0) {
+        const int n = std::min(wanted, fade_in_remaining_);
+        for (int i = 0; i < n; ++i) {
+            const float g = static_cast<float>(kFadeSamples - fade_in_remaining_) /
+                            static_cast<float>(kFadeSamples);
+            outL[i] *= g;
+            if (outR != outL) outR[i] *= g;
+            --fade_in_remaining_;
+        }
+    }
+    // Fade-out ramp (1 → 0 over kFadeSamples). When it completes, latch
+    // active_playing_ false so subsequent blocks early-return silence.
+    if (fade_out_remaining_ > 0) {
+        const int n = std::min(wanted, fade_out_remaining_);
+        for (int i = 0; i < n; ++i) {
+            const float g = static_cast<float>(fade_out_remaining_) /
+                            static_cast<float>(kFadeSamples);
+            outL[i] *= g;
+            if (outR != outL) outR[i] *= g;
+            --fade_out_remaining_;
+        }
+        // Silence the remainder of the block past the fade endpoint.
+        for (int i = n; i < wanted; ++i) {
+            outL[i] = 0.0f;
+            if (outR != outL) outR[i] = 0.0f;
+        }
+        if (fade_out_remaining_ == 0) active_playing_ = false;
     }
 }
 

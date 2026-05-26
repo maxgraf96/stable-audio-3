@@ -121,6 +121,30 @@ body {
 }
 .srcname b { color: var(--fg); font-weight: 500; margin-right: 8px; }
 .srcdur { color: var(--muted); }
+
+/* Playback-mode toggle (Loop ↔ One-shot) — sits next to the filename so it
+   reads as a property of the source. Subtle by default; warm-taupe when
+   set to one-shot. */
+.mode-toggle {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  letter-spacing: 0.01em;
+  margin-left: 10px;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-decoration-color: var(--hair);
+  text-underline-offset: 3px;
+  transition: color .15s, text-decoration-color .15s;
+}
+.mode-toggle:hover { color: var(--fg); text-decoration-color: var(--fg); }
+.mode-toggle.one-shot {
+  color: var(--accent);
+  text-decoration-color: var(--accent-dim);
+}
 .srcwave { width: 100%; color: var(--fg); }
 .srcrow {
   display: flex; align-items: center; gap: 12px; width: 100%;
@@ -144,7 +168,14 @@ body {
 .playbtn .play-ico,
 .playbtn .pause-ico,
 .row-play .play-ico,
-.row-play .pause-ico { grid-area: 1 / 1; }
+.row-play .pause-ico {
+  grid-area: 1 / 1;
+  /* Inline <svg> picks up a baseline gap from the button's line-height
+     which can offset it by a sub-pixel inside the grid cell. Block-level
+     drops the baseline math entirely so place-items: center actually
+     centers the icon. */
+  display: block;
+}
 .playbtn  .pause-ico,
 .row-play .pause-ico { display: none; }
 .playbtn.playing  .play-ico,
@@ -237,6 +268,8 @@ input[type="range"]::-webkit-slider-thumb {
    uppercase, but in context it reads as shouting). Slight letter-spacing
    still gives the typographic hairline feel. */
 .gen {
+  position: relative;
+  overflow: hidden;            /* clip the progress bar to button bounds */
   margin-top: 6px;
   background: transparent; color: var(--fg);
   border: 1px solid var(--fg); padding: 10px 16px;
@@ -244,6 +277,20 @@ input[type="range"]::-webkit-slider-thumb {
   cursor: pointer;
   transition: background .15s, color .15s, border-color .15s;
 }
+.gen .gen-label { position: relative; z-index: 1; }
+.gen-progress {
+  position: absolute;
+  left: 0; bottom: 0;
+  height: 2px;
+  width: 0;
+  background: var(--accent);
+  opacity: 0;
+  /* Width eases between step counts (~0.5s feels natural for ~2 s/step);
+     opacity fades in/out when busy state toggles. */
+  transition: width 0.5s ease-out, opacity 0.2s ease-out;
+  pointer-events: none;
+}
+.gen.busy .gen-progress { opacity: 0.6; }
 .gen:hover:not(:disabled) { background: var(--fg); color: var(--bg); }
 .gen:disabled {
   color: var(--faint); border-color: var(--hair); cursor: default;
@@ -312,12 +359,24 @@ input[type="range"]::-webkit-slider-thumb {
   border-color: var(--accent); color: var(--accent);
 }
 
-/* Keyboard hint — sits in the bottom-right of the results section. */
+/* ── Footer (always pinned to the bottom) ─────────────────────────── */
+/* margin-top: auto pushes the footer to the bottom of the .hl flex column
+   regardless of how much content is above. The mode toggle is always
+   visible; the kbd-hint slot only shows when variations exist (JS-driven). */
+.footer {
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--hair);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+/* Keyboard hint — sits in the bottom-right of the footer. */
 .kbd-hint {
-  margin-top: 12px;
   color: var(--faint);
   font-size: 10.5px;
-  text-align: right;
   letter-spacing: 0.01em;
 }
 .kbd-hint kbd {

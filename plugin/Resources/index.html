@@ -47,8 +47,8 @@
         <div class="srcrow">
           <button type="button" class="playbtn" id="src-play"
                   aria-label="Play source">
-            <svg class="play-ico"  width="9" height="9" viewBox="0 0 9 9"><polygon points="2,1 8,4.5 2,8" fill="currentColor"/></svg>
-            <svg class="pause-ico" width="9" height="9" viewBox="0 0 9 9"><rect x="1.5" y="1" width="2" height="7" fill="currentColor"/><rect x="5.5" y="1" width="2" height="7" fill="currentColor"/></svg>
+            <svg class="play-ico"  width="10" height="10" viewBox="0 0 10 10"><polygon points="2.5,2 8.5,5 2.5,8" fill="currentColor"/></svg>
+            <svg class="pause-ico" width="10" height="10" viewBox="0 0 10 10"><rect x="2" y="2" width="2" height="6" fill="currentColor"/><rect x="6" y="2" width="2" height="6" fill="currentColor"/></svg>
           </button>
           <span class="srctime" id="src-time-cur">0:00</span>
           <div style="flex: 1"></div>
@@ -90,7 +90,10 @@
         <span class="val" id="noise-value">0.45</span>
       </div>
 
-      <button type="button" class="gen" id="generate" disabled>Generate 5 variations</button>
+      <button type="button" class="gen" id="generate" disabled>
+        <span class="gen-label">Generate 5 variations</span>
+        <span class="gen-progress" id="gen-progress"></span>
+      </button>
     </section>
 
     <!-- Results: 5 slots. Hidden until first generate. -->
@@ -100,8 +103,17 @@
         <span class="meta" id="res-meta">5 · σ 0.45</span>
       </div>
       <div id="slots"></div>
-      <div class="kbd-hint">Use <kbd>↑</kbd> <kbd>↓</kbd> to cycle</div>
     </section>
+
+    <!-- Persistent footer. Mode toggle is always visible (it's a global
+         setting); kbd-hint only when variations exist. -->
+    <footer class="footer">
+      <button type="button" class="mode-toggle" id="mode-toggle"
+              title="Click to switch between loop and one-shot playback">Loop</button>
+      <span class="kbd-hint" id="kbd-hint" hidden>
+        <kbd>Space</kbd> play · <kbd>↑</kbd> <kbd>↓</kbd> cycle · <kbd>←</kbd> restart
+      </span>
+    </footer>
   </div>
 
   <script src="app.js"></script>

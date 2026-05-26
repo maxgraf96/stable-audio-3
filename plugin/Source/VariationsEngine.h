@@ -64,6 +64,7 @@ struct PlayState {
     bool   playing   = false;     // false ⇒ paused or stopped
     double progress  = 0.0;       // 0..1 into the active buffer
     double duration  = 0.0;       // seconds, 0 if no active buffer
+    bool   oneShot   = false;     // playback mode (loop = false, one-shot = true)
 };
 
 class VariationsEngine : private juce::Thread,
@@ -116,6 +117,15 @@ public:
     void  stopPlayback();
     void  seek(double fraction);      // 0..1 into active buffer
     PlayState getPlayState() const;
+
+    // One-shot vs loop mode. Affects two behaviours:
+    //   - getNextAudioBlock: one-shot stops at end of buffer instead of
+    //     wrapping (active_playing_ flips to false on natural end).
+    //   - play(idx) on a different idx: one-shot resets position to 0
+    //     instead of preserving the fraction (so cycling variations of a
+    //     drum hit always plays from the attack).
+    void setOneShotMode(bool oneShot);
+    bool isOneShotMode() const;
 
     // ── AudioSource (called on the audio thread) ─────────────────────
     void prepareToPlay(int samplesPerBlockExpected, double sampleRate) override;
@@ -172,6 +182,28 @@ private:
     mutable std::mutex                       peaks_mutex_;
     std::vector<float>                       source_peaks_;
     std::vector<std::vector<float>>          variation_peaks_;
+
+    // Resampling + click suppression (audio-thread state, protected by
+    // play_mutex_).
+    double                                   host_sample_rate_ = 44100.0;
+    juce::LagrangeInterpolator               interp_l_, interp_r_;
+    std::vector<float>                       temp_in_l_, temp_in_r_;
+    int                                      fade_in_remaining_  = 0;
+    int                                      fade_out_remaining_ = 0;
+    bool                                     one_shot_mode_      = false;
+
+    // Crossfade state for variation switching while playing. When a play()
+    // call swaps buffers mid-stream we keep the outgoing buffer's source
+    // position + a fractional sub-sample around for ~3 ms and mix
+    // old*(1-t) + new*t into the output, then drop the old side.
+    // The old stream uses linear interpolation (the crossfade tail is too
+    // brief for cubic to matter, and juce::LagrangeInterpolator state can't
+    // be copied so we can't preserve its warm history).
+    std::vector<float>                       scratch_l_, scratch_r_;
+    int                                      prev_idx_           = -2;
+    int64_t                                  prev_position_      = 0;
+    double                                   prev_sub_pos_       = 0.0;
+    int                                      crossfade_remaining_ = 0;
 
     // Status string (uses peaks_mutex_).
     juce::String                             status_{"Not loaded"};

@@ -272,7 +272,16 @@ juce::WebBrowserComponent::Options buildOptions(SA3AudioProcessor& processor)
                 obj->setProperty("playing",  p.playing);
                 obj->setProperty("progress", p.progress);
                 obj->setProperty("duration", p.duration);
+                obj->setProperty("oneShot",  p.oneShot);
                 complete(juce::var(obj.get()));
+            })
+        .withNativeFunction(
+            "setOneShotMode",
+            [&processor](const juce::Array<juce::var>& args,
+                         juce::WebBrowserComponent::NativeFunctionCompletion complete) {
+                const bool v = ! args.isEmpty() && static_cast<bool>(args[0]);
+                processor.getVariationsEngine().setOneShotMode(v);
+                complete(juce::var());
             });
 }
 

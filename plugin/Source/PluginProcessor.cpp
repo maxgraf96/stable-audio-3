@@ -2,8 +2,10 @@
 #include "PluginEditor.h"
 
 SA3AudioProcessor::SA3AudioProcessor()
+    // No input bus — we're a sample-generator, not an effect. This also
+    // suppresses JUCE's standalone "Audio input is muted to avoid feedback
+    // loop" banner, which fires only when an input bus is declared.
     : AudioProcessor(BusesProperties()
-          .withInput("Input",  juce::AudioChannelSet::stereo(), true)
           .withOutput("Output", juce::AudioChannelSet::stereo(), true))
 {
 }
@@ -23,11 +25,12 @@ void SA3AudioProcessor::releaseResources()
 
 bool SA3AudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
 {
+    // No input bus to mirror — only the main output bus needs to be mono
+    // or stereo. The DAW (and the standalone) will only ever query this
+    // for the output.
     const auto& main = layouts.getMainOutputChannelSet();
-    if (main != juce::AudioChannelSet::stereo() && main != juce::AudioChannelSet::mono())
-        return false;
-    // Mirror input on the main bus.
-    return main == layouts.getMainInputChannelSet();
+    return main == juce::AudioChannelSet::stereo()
+        || main == juce::AudioChannelSet::mono();
 }
 
 void SA3AudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& /*midi*/)

@@ -40,15 +40,23 @@ juce_add_plugin(SA3
     PLUGIN_MANUFACTURER_CODE  "Maxg"
     PLUGIN_CODE               "Sa3p"
     FORMATS                   AU VST3 Standalone
-    IS_SYNTH                  FALSE
+    # We're a generator (sample-variations source), not an effect — no
+    # audio input. IS_SYNTH=TRUE picks the right AU type
+    # (kAudioUnitType_MusicDevice) and VST3 category (Instrument|Synth) so
+    # hosts file the plugin under instruments rather than effects, and the
+    # standalone wrapper stops complaining about feedback loops.
+    IS_SYNTH                  TRUE
     NEEDS_MIDI_INPUT          FALSE
     NEEDS_MIDI_OUTPUT         FALSE
     IS_MIDI_EFFECT            FALSE
+    # FALSE — the editor itself shouldn't accept focus; the WebView (its
+    # only child) is the keyboard target. With TRUE the editor would
+    # compete with the WebView for focus and JS keydown handlers would
+    # never fire.
     EDITOR_WANTS_KEYBOARD_FOCUS FALSE
-    COPY_PLUGIN_AFTER_BUILD   FALSE
-    # Standalone app convenience: open in standalone with stereo I/O.
-    AU_MAIN_TYPE              kAudioUnitType_Effect
-    VST3_CATEGORIES           "Fx"
+    # Auto-install AU + VST3 into ~/Library/Audio/Plug-Ins/{Components,VST3}
+    # after each build — fast iteration loop when testing in a DAW.
+    COPY_PLUGIN_AFTER_BUILD   TRUE
 )
 
 juce_generate_juce_header(SA3)

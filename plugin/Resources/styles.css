@@ -342,7 +342,7 @@ input[type="range"]::-webkit-slider-thumb {
    centre, not the centre of (waveform + steer). */
 .slot {
   display: grid;
-  grid-template-columns: 22px 1fr 52px 24px;
+  grid-template-columns: 22px 1fr 52px 24px 16px;
   grid-template-rows: auto auto;
   align-items: center;
   column-gap: 12px;
@@ -358,7 +358,46 @@ input[type="range"]::-webkit-slider-thumb {
 .slot > .row-play  { grid-row: 1; }
 .slot > .steer     { grid-row: 2; grid-column: 2; }
 .slot > .row-copy  { grid-row: 2; grid-column: 4; }
+.slot > .row-grip  { grid-row: 1 / span 2; grid-column: 5; }
 .slot:last-child { border-bottom: none; }
+
+/* Drag-out feedback: row mousedown on the grip adds .dragging.
+   A thin accent rail on the left + faint accent tint matches the source-
+   drag highlight pattern, so the visual metaphor reads "this row is the
+   thing leaving the plugin". Class is removed on mouseup / fallback. */
+.slot {
+  background: transparent;
+  border-left: 2px solid transparent;
+  padding-left: 0;
+  transition: background-color .12s ease, border-color .12s ease;
+}
+.slot.dragging {
+  background: var(--accent-tint);
+  border-left-color: var(--accent);
+}
+
+/* Drag-out grip — mousedown emits a JUCE event whose C++ listener calls
+   performExternalDragDropOfFiles inside the same run-loop tick, starting
+   a real macOS NSDraggingSession. user-select/-webkit-user-drag off so
+   the WebView's native text-selection/HTML5-drag pipelines stay out of
+   the way. */
+.row-grip {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 100%;
+  color: var(--faint);
+  opacity: 0;
+  transition: opacity .15s, color .15s;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-user-drag: none;
+}
+.slot:hover .row-grip { opacity: 0.7; color: var(--fg); }
+.row-grip:hover { color: var(--fg); }
+.row-grip:active { cursor: grabbing; }
+.slot.empty .row-grip { display: none; }
 
 .slot .idx {
   font-size: 10px; color: var(--faint);

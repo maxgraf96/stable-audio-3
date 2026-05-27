@@ -2,10 +2,15 @@
 #include "PluginEditor.h"
 
 SA3AudioProcessor::SA3AudioProcessor()
-    // No input bus — we're a sample-generator, not an effect. This also
-    // suppresses JUCE's standalone "Audio input is muted to avoid feedback
-    // loop" banner, which fires only when an input bus is declared.
+    // Declared stereo input bus, disabled by default. We never read it —
+    // this plugin is a sample generator — but Ableton Live 12's VST3 host
+    // refuses to instantiate the plugin if `setBusArrangements` can't
+    // negotiate an input arrangement, and a default-disabled bus still
+    // satisfies that handshake. The standalone's "Audio input is muted to
+    // avoid feedback loop" banner stays suppressed because it only checks
+    // *enabled* input buses.
     : AudioProcessor(BusesProperties()
+          .withInput ("Input",  juce::AudioChannelSet::stereo(), false)
           .withOutput("Output", juce::AudioChannelSet::stereo(), true))
 {
 }

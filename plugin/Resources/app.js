@@ -43,6 +43,35 @@ const getPlayState = getNativeFunction("getPlayState");
 const setOneShotMode           = getNativeFunction("setOneShotMode");
 const copyVariationToClipboard = getNativeFunction("copyVariationToClipboard");
 
+// Fire a JUCE event (vs a native-function call). emitEvent is
+// fire-and-forget and dispatches the listener on the C++ message thread
+// inside the same run-loop tick as the calling JS — which is what makes
+// it usable for drag-out: AppKit still has the originating mouseDown in
+// queue when JUCE calls performExternalDragDropOfFiles.
+function emitJuceEvent(name, data) {
+    if (window.__JUCE__ && window.__JUCE__.backend &&
+        typeof window.__JUCE__.backend.emitEvent === "function") {
+        window.__JUCE__.backend.emitEvent(name, data);
+    }
+}
+
+// dd-mm-yy-hh-mm-ss in the user's local time. Stamped once per
+// generation so all 5 variations share it and DAW imports stay
+// referentially stable across re-generations.
+function makeGenerationStamp() {
+    const d = new Date();
+    const p = n => String(n).padStart(2, "0");
+    return `${p(d.getDate())}-${p(d.getMonth() + 1)}-${String(d.getFullYear()).slice(-2)}`
+         + `-${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+}
+
+// Strip extension from the source file name; fall back to "SA3" if no
+// source has been uploaded yet.
+function variationBaseName() {
+    const n = (state.fileName || "SA3").replace(/\.[^.]+$/, "");
+    return n || "SA3";
+}
+
 // ── Constants ────────────────────────────────────────────────────────
 const PRESETS = [
     { value: "free", label: "Free variation", sub: "unconditional" },
@@ -448,6 +477,16 @@ function renderResults() {
         <svg class="check-ico" width="11" height="11" viewBox="0 0 11 11" hidden><polyline points="2,6 4.5,8.5 9,3.5" stroke="currentColor" stroke-width="1.1" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </button>
       <span class="copy-toast" aria-hidden="true">Copied to clipboard</span>
+      <div class="row-grip" aria-label="Drag variation ${i + 1} to your DAW" title="Drag to your DAW">
+        <svg width="10" height="14" viewBox="0 0 10 14" aria-hidden="true">
+          <circle cx="3" cy="3"  r="1.1" fill="currentColor"/>
+          <circle cx="7" cy="3"  r="1.1" fill="currentColor"/>
+          <circle cx="3" cy="7"  r="1.1" fill="currentColor"/>
+          <circle cx="7" cy="7"  r="1.1" fill="currentColor"/>
+          <circle cx="3" cy="11" r="1.1" fill="currentColor"/>
+          <circle cx="7" cy="11" r="1.1" fill="currentColor"/>
+        </svg>
+      </div>
     `;
         slotsEl.appendChild(slot);
 
@@ -488,9 +527,9 @@ function renderResults() {
         copyBtn.addEventListener("click", async (e) => {
             e.stopPropagation();
             if (!ready) return;
-            const baseName = (state.fileName || "SA3").replace(/\.[^.]+$/, "");
             try {
-                const ok = await copyVariationToClipboard(i, baseName);
+                const ok = await copyVariationToClipboard(
+                    i, variationBaseName(), state.generationStamp || "");
                 if (ok) flashCopiedFeedback(copyBtn, copyToast);
             } catch (_) { /* swallow */ }
         });
@@ -513,6 +552,38 @@ function renderResults() {
         // an OS-level file drag — wavnav's pattern, mirrored here, is to
         // have JUCE handle the mouseDrag from a real NSView.
         slot.style.cursor = ready ? "pointer" : "default";
+
+        // Drag-out: mousedown on the grip emits a JUCE event that fires
+        // synchronously on the C++ message thread, which calls
+        // performExternalDragDropOfFiles before AppKit's mouseDown ages
+        // out — the only WKWebView-compatible way to start a real OS
+        // file drag from inside the WebView. (Cf. JUCE forum #64813.)
+        const grip = slot.querySelector(".row-grip");
+        if (grip) {
+            grip.addEventListener("mousedown", (e) => {
+                if (!ready) return;
+                e.preventDefault();   // suppress text-select cursor
+                e.stopPropagation();  // don't trigger the slot's play click
+                // Tell the user visually which row they're about to drag
+                // out. Removed on global mouseup (so even a same-spot
+                // release clears it).
+                slot.classList.add("dragging");
+                outboundDragInFlight = true;
+                clearTimeout(outboundDragTimer);
+                outboundDragTimer = setTimeout(() => {
+                    outboundDragInFlight = false;
+                    // NSDraggingSession sometimes swallows mouseUp on the
+                    // initiator, so this is the belt-and-braces cleanup.
+                    document.querySelectorAll(".slot.dragging")
+                        .forEach(s => s.classList.remove("dragging"));
+                }, 3000);
+                emitJuceEvent("dragVariation", {
+                    idx:      i,
+                    baseName: variationBaseName(),
+                    stamp:    state.generationStamp || "",
+                });
+            });
+        }
 
         slotHandles[i] = { wfMount, slotEl: slot, playBtn, copyBtn };
     }
@@ -802,16 +873,21 @@ sourceEl.addEventListener("click", () => {
 // transitions fire pairs that cancel out, only true window enter/exit
 // drives the counter to 1 or back to 0.
 let dragDepth = 0;
-document.addEventListener("dragenter", (e) => {
+// Setting dropEffect="copy" on every drag tick is what signals "we'll
+// take this" back through WKWebView to the macOS drag service. Without
+// it, the underlying NSView returns NSDragOperationNone and the host
+// (Ableton, Logic) interprets the drop as falling through the plugin
+// window to whatever's behind — usually a session-view track slot.
+function acceptDrag(e) {
     e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+}
+document.addEventListener("dragenter", (e) => {
+    acceptDrag(e);
     dragDepth++;
     if (dragDepth === 1) sourceEl.classList.add("drag");
 });
-document.addEventListener("dragover", (e) => {
-    // Must preventDefault on dragover (and dragenter) to opt into the drop
-    // event firing instead of the browser's default "show as link" reject.
-    e.preventDefault();
-});
+document.addEventListener("dragover", acceptDrag);
 document.addEventListener("dragleave", (e) => {
     e.preventDefault();
     dragDepth = Math.max(0, dragDepth - 1);
@@ -821,9 +897,32 @@ document.addEventListener("drop", (e) => {
     e.preventDefault();
     dragDepth = 0;
     sourceEl.classList.remove("drag");
+    // Suppress drops that came from our own outbound drag — otherwise a
+    // click-drag-release on the grip lands the variation right back into
+    // the plugin and gets treated as a fresh source upload.
+    if (outboundDragInFlight) {
+        outboundDragInFlight = false;
+        clearTimeout(outboundDragTimer);
+        return;
+    }
     const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
     if (file) loadFile(file);
 });
+
+// Tracks whether we just initiated an outbound drag via the grip. Set in
+// the grip's mousedown handler; cleared in the drop handler above (or
+// after a fallback timeout if no drop happens).
+let outboundDragInFlight = false;
+let outboundDragTimer    = null;
+
+// Pointer is back up — clear the row highlight no matter where the drag
+// ended (over the plugin, the DAW, or off-screen). The OS NSDraggingSession
+// suppresses the JS mouseup for the *initiator*, so we listen on window
+// with `capture:true` to catch it before the suppression kicks in.
+window.addEventListener("mouseup", () => {
+    document.querySelectorAll(".slot.dragging")
+        .forEach(s => s.classList.remove("dragging"));
+}, true);
 
 // ── Noise slider ─────────────────────────────────────────────────────
 function updateNoiseHint() {
@@ -941,15 +1040,24 @@ generateBtn.addEventListener("click", async () => {
             duration: Number(s.duration) || 0,
         }));
         state.expected = state.variations.length;
+        // Stamp the whole generation. Every variation dragged or copied
+        // from this batch gets `<file>_var<N>_<stamp>.wav`, so DAW clips
+        // that reference it can't collide with previous generations or
+        // other plugin instances overwriting a shared temp filename.
+        state.generationStamp = makeGenerationStamp();
         renderResults();
     } catch (err) {
         showError("Bridge error: " + err);
         clearVariations();
     } finally {
-        // Always clear the JS-side guard — even on error/exception. The
-        // engine's own busy flag is cleared by the worker thread; the poll
-        // will pick that up independently to update state.busy.
+        // The engine's busy flag has already flipped back to false by the
+        // time `generate()` resolves (it clears before completion fires).
+        // We mirror that here so the button re-enables immediately —
+        // otherwise a fast follow-up click can land in the ~100 ms window
+        // before the next status poll updates `state.busy`, get silently
+        // gated by the reentry guard, and look like a dead button.
         state.inFlight = false;
+        state.busy     = false;
         updateButton();
     }
 });

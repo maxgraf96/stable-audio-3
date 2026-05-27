@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 #include "sa3_orchestrator.h"
@@ -11,14 +12,39 @@ namespace sa3plugin {
 
 namespace {
 
-constexpr const char* kT5GemmaPath =
-    "/Users/max/Code/stable-audio-3/optimized/mlx/models/mlx/t5gemma_f16.safetensors";
-constexpr const char* kDitPath =
-    "/Users/max/Code/stable-audio-3/optimized/mlx/models/mlx/dit_medium_f16.safetensors";
-constexpr const char* kEncoderPath =
-    "/Users/max/Code/stable-audio-3/optimized/mlx/models/mlx/same_l_encoder_f32.safetensors";
-constexpr const char* kDecoderPath =
-    "/Users/max/Code/stable-audio-3/optimized/mlx/models/mlx/same_l_decoder_f32.safetensors";
+constexpr const char* kT5GemmaFile = "t5gemma_f16.safetensors";
+constexpr const char* kDitFile     = "dit_medium_f16.safetensors";
+constexpr const char* kEncoderFile = "same_l_encoder_f32.safetensors";
+constexpr const char* kDecoderFile = "same_l_decoder_f32.safetensors";
+
+// Dev fallback when the plugin runs from a build tree without bundled
+// models. Production bundles ship the safetensors under
+// Contents/Resources/models/ and never touch this path.
+constexpr const char* kDevModelsDir =
+    "/Users/max/Code/stable-audio-3/optimized/mlx/models/mlx";
+
+// Where the four safetensors files live for the currently-running plugin.
+// Resolution order:
+//   1. $SA3_MODELS_DIR — dev override so we don't have to copy >1 GB of
+//      weights into every bundle on each build.
+//   2. <plugin>/Contents/Resources/models — production layout, written by
+//      the CMake post-build step. juce::currentExecutableFile returns the
+//      plugin's own binary even when loaded inside a DAW.
+//   3. kDevModelsDir — last-resort source-tree path.
+juce::File resolveModelsDir()
+{
+    if (const char* env = std::getenv("SA3_MODELS_DIR"); env && *env) {
+        juce::File f(juce::String::fromUTF8(env));
+        if (f.isDirectory()) return f;
+    }
+    auto exe = juce::File::getSpecialLocation(juce::File::currentExecutableFile);
+    auto bundled = exe.getParentDirectory()        // Contents/MacOS
+                      .getParentDirectory()         // Contents
+                      .getChildFile("Resources")
+                      .getChildFile("models");
+    if (bundled.isDirectory()) return bundled;
+    return juce::File(kDevModelsDir);
+}
 
 constexpr int kSampleRate = sa3::orch::SAMPLE_RATE;   // 44100
 
@@ -231,7 +257,8 @@ int VariationsEngine::getVariationCount() const
 }
 
 juce::File VariationsEngine::writeVariationToTempFile(int idx,
-                                                      const juce::String& baseName)
+                                                      const juce::String& baseName,
+                                                      const juce::String& stamp)
 {
     // Copy the buffer out under the lock — encoding + disk I/O happen
     // unlocked so the audio thread isn't blocked.
@@ -254,8 +281,19 @@ juce::File VariationsEngine::writeVariationToTempFile(int idx,
     safe = safe.trim();
     if (safe.isEmpty()) safe = "SA3";
 
+    // Sanitize stamp using the same charset, then append after the var
+    // number so the filename is `<base>_var<N>_<stamp>.wav`. Each
+    // generation feeds a fresh stamp from JS, so dropping a variation
+    // into a DAW project never collides with an earlier generation's
+    // file (or another plugin instance's) — DAW clips that reference it
+    // stay valid.
+    juce::String safeStamp = stamp.retainCharacters(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_");
+    juce::String fileName = safe + "_var" + juce::String(idx + 1);
+    if (safeStamp.isNotEmpty()) fileName += "_" + safeStamp;
+    fileName += ".wav";
     const auto out = juce::File::getSpecialLocation(juce::File::tempDirectory)
-                       .getChildFile(safe + "_var" + juce::String(idx + 1) + ".wav");
+                       .getChildFile(fileName);
     out.deleteFile();   // replaceWithData would do this too but JUCE's writer needs a fresh stream
 
     // Stream-based WAV write via juce::WavAudioFormat. The format writer
@@ -723,9 +761,19 @@ void VariationsEngine::run()
 void VariationsEngine::doLoad()
 {
     try {
+        const auto models = resolveModelsDir();
+        const auto t5  = models.getChildFile(kT5GemmaFile).getFullPathName();
+        const auto dit = models.getChildFile(kDitFile).getFullPathName();
+        const auto enc = models.getChildFile(kEncoderFile).getFullPathName();
+        const auto dec = models.getChildFile(kDecoderFile).getFullPathName();
+        for (const auto& p : { t5, dit, enc, dec }) {
+            if (! juce::File(p).existsAsFile())
+                throw std::runtime_error(
+                    ("missing model file: " + p).toStdString());
+        }
         auto p = std::make_unique<sa3::orch::Pipeline>(
-            sa3::orch::load_pipeline(kT5GemmaPath, kDitPath,
-                                     kEncoderPath, kDecoderPath,
+            sa3::orch::load_pipeline(t5.toStdString(), dit.toStdString(),
+                                     enc.toStdString(), dec.toStdString(),
                                      mlx::core::float16));
         pipeline_ = std::move(p);
         load_phase_.store(LoadPhase::Loaded, std::memory_order_release);

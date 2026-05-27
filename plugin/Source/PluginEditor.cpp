@@ -7,6 +7,10 @@
 #include "BinaryData.h"
 #include "VariationsEngine.h"
 
+#if JUCE_MAC
+#include "MacClipboard.h"
+#endif
+
 namespace {
 
 // JUCE 8 registers a custom URL scheme handler for `juce://` on WKWebView —
@@ -121,7 +125,12 @@ int parseVariationIndex(const juce::String& name) {
     return inner.getIntValue();
 }
 
-juce::WebBrowserComponent::Options buildOptions(SA3AudioProcessor& processor)
+using DragRequestCb = std::function<void(int idx,
+                                         const juce::String& baseName,
+                                         const juce::String& stamp)>;
+
+juce::WebBrowserComponent::Options buildOptions(SA3AudioProcessor& processor,
+                                                DragRequestCb      dragRequestCb)
 {
     auto resourceProvider = [&processor](const juce::String& url)
             -> std::optional<juce::WebBrowserComponent::Resource>
@@ -309,11 +318,29 @@ juce::WebBrowserComponent::Options buildOptions(SA3AudioProcessor& processor)
                 processor.getVariationsEngine().setOneShotMode(v);
                 complete(juce::var());
             })
+        // dragVariation event — fired from JS `mousedown` on a row's
+        // grip. The listener runs synchronously on the message thread
+        // (same run-loop tick as the WKWebView mousedown), so AppKit
+        // still sees an active mouse-down event when we call
+        // performExternalDragDropOfFiles and starts a real NSDraggingSession
+        // rooted on the WebView's own NSView. This is the canonical
+        // WKWebView-compatible drag-out path; sibling NSView overlays
+        // don't work because WKWebView is out-of-process IOSurface-backed
+        // and owns hit-testing for its whole rect. (JUCE forum #64813.)
+        .withEventListener(
+            "dragVariation",
+            [dragRequestCb](juce::var v) {
+                const int          idx      = static_cast<int>(v.getProperty("idx", -1));
+                const juce::String baseName = v.getProperty("baseName", "SA3").toString();
+                const juce::String stamp    = v.getProperty("stamp",    "").toString();
+                if (idx >= 0 && dragRequestCb) dragRequestCb(idx, baseName, stamp);
+            })
         // copyVariationToClipboard(idx, baseName) — write the variation
         // to a temp WAV, then put a POSIX file reference on the system
-        // clipboard via AppleScript. Ableton, Finder, etc. accept this
-        // as a file ⌘V paste — sidesteps WKWebView's drag-out
-        // restrictions entirely.  (Pattern lifted from wavnav.)
+        // clipboard via NSPasteboard. Works in Finder + Logic where ⌘V
+        // honours the OS clipboard; Live's ⌘V uses an internal cache
+        // that doesn't refresh on plugin-originated writes, so the
+        // drag-out overlay is the recommended path inside Live.
         .withNativeFunction(
             "copyVariationToClipboard",
             [&processor](const juce::Array<juce::var>& args,
@@ -322,20 +349,15 @@ juce::WebBrowserComponent::Options buildOptions(SA3AudioProcessor& processor)
                 const int          idx      = static_cast<int>(args[0]);
                 const juce::String baseName = args.size() > 1
                     ? args[1].toString() : juce::String("SA3");
+                const juce::String stamp    = args.size() > 2
+                    ? args[2].toString() : juce::String();
                 const auto file = processor.getVariationsEngine()
-                                      .writeVariationToTempFile(idx, baseName);
+                                      .writeVariationToTempFile(idx, baseName, stamp);
                 if (! file.existsAsFile()) { complete(juce::var(false)); return; }
                #if JUCE_MAC
-                // The path is wrapped in double quotes; macOS filenames
-                // very rarely contain double quotes themselves.
-                const juce::String quoted =
-                    "\"" + file.getFullPathName() + "\"";
-                const juce::String cmd =
-                    "osascript -e 'on run args' "
-                    "-e 'set the clipboard to POSIX file (first item of args)' "
-                    "-e end $@ " + quoted;
-                const int rc = std::system(cmd.toRawUTF8());
-                complete(juce::var(rc == 0));
+                const bool ok = sa3plugin::copyFileToClipboard(
+                    file.getFullPathName().toRawUTF8());
+                complete(juce::var(ok));
                #else
                 // Other platforms — fall back to copying the path as text.
                 juce::SystemClipboard::copyTextToClipboard(file.getFullPathName());
@@ -348,12 +370,25 @@ juce::WebBrowserComponent::Options buildOptions(SA3AudioProcessor& processor)
 
 SA3AudioProcessorEditor::SA3AudioProcessorEditor(SA3AudioProcessor& p)
     : AudioProcessorEditor(&p),
-      webView(buildOptions(p))
+      processor(p),
+      webView(buildOptions(p,
+              [this](int idx, const juce::String& baseName,
+                     const juce::String& stamp) {
+                  const auto file = processor.getVariationsEngine()
+                                        .writeVariationToTempFile(idx, baseName, stamp);
+                  if (! file.existsAsFile()) return;
+                  // canMoveFiles=false: Live (and Logic) silently no-op
+                  // the drop if we declare we'd move the file.
+                  juce::DragAndDropContainer::performExternalDragDropOfFiles(
+                      { file.getFullPathName() }, /*canMoveFiles=*/false,
+                      &webView);
+              }))
 {
-    // Tight default size — all 5 audition pads + controls fit without a
-    // scrollbar (.hl uses overflow:hidden, so anything that doesn't fit
-    // gets clipped rather than introducing scroll).
-    setSize(500, 720);
+    // 820 leaves enough vertical room for the source row + sigma slider
+    // + generate button + 5 variation rows + the bottom keybinding hint
+    // bar at the default DAW DPI. 720 clipped the footer once the
+    // variations rendered.
+    setSize(500, 820);
     addAndMakeVisible(webView);
     webView.goToURL(kIndexURL);
 }

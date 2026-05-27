@@ -1,20 +1,23 @@
-// SA3 plugin editor — Phase 2.3b: WebView shell.
+// SA3 plugin editor.
 //
 // Hosts a juce::WebBrowserComponent that loads our baked HTML/CSS/JS from
-// BinaryData via a resource provider. JS calls back into native code through
-// JUCE 8's WebBrowserComponent::Options::withNativeFunction bridge — the only
-// function exposed at this phase is `getStatus()` (returns the PipelineLoader
-// state string). All other interactions (file drop, generate, audition) land
-// in 2.3c.
+// BinaryData via a resource provider. JS calls back into native code via
+// JUCE 8's WebBrowserComponent::Options::withNativeFunction bridge and
+// fires fire-and-forget messages via emitEvent + withEventListener.
+//
+// Drag-out: JS's `mousedown` on a row's grip emits a JUCE event; the
+// listener immediately calls performExternalDragDropOfFiles with &webView
+// as the source. This is the only WKWebView-compatible path — sibling
+// NSView overlays don't intercept events because WKWebView is rendered
+// out-of-process and owns hit-testing for its whole rect. Reference:
+// JUCE forum thread 64813.
 #pragma once
-
-#include <array>
-#include <memory>
 
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
 
-class SA3AudioProcessorEditor : public juce::AudioProcessorEditor
+class SA3AudioProcessorEditor : public juce::AudioProcessorEditor,
+                                public juce::DragAndDropContainer
 {
 public:
     explicit SA3AudioProcessorEditor(SA3AudioProcessor&);
@@ -24,9 +27,8 @@ public:
     void resized() override;
 
 private:
-    // The processor reference is captured inside the WebView's native-function
-    // lambda (see PluginEditor.cpp), so we don't need a separate member.
-    juce::WebBrowserComponent webView;
+    SA3AudioProcessor&         processor;
+    juce::WebBrowserComponent  webView;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(SA3AudioProcessorEditor)
 };

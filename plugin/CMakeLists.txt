@@ -40,12 +40,14 @@ juce_add_plugin(SA3
     PLUGIN_MANUFACTURER_CODE  "Maxg"
     PLUGIN_CODE               "Sa3p"
     FORMATS                   AU VST3 Standalone
-    # We're a generator (sample-variations source), not an effect — no
-    # audio input. IS_SYNTH=TRUE picks the right AU type
-    # (kAudioUnitType_MusicDevice) and VST3 category (Instrument|Synth) so
-    # hosts file the plugin under instruments rather than effects, and the
-    # standalone wrapper stops complaining about feedback loops.
-    IS_SYNTH                  TRUE
+    # IS_SYNTH=FALSE: VST3 category stays Fx|Generator. Setting it to TRUE
+    # tags the plugin as Instrument|Synth in VST3, which Ableton Live then
+    # refuses to instantiate unless we also declare a MIDI input bus — and
+    # we genuinely don't want MIDI on what is an audio-track generator.
+    # The "Audio input is muted to avoid feedback loop" banner in the
+    # standalone is suppressed independently by leaving the input bus out
+    # of BusesProperties() in PluginProcessor.cpp.
+    IS_SYNTH                  FALSE
     NEEDS_MIDI_INPUT          FALSE
     NEEDS_MIDI_OUTPUT         FALSE
     IS_MIDI_EFFECT            FALSE
@@ -66,6 +68,9 @@ target_sources(SA3 PRIVATE
     Source/PluginEditor.cpp
     Source/VariationsEngine.cpp
 )
+if(APPLE)
+    target_sources(SA3 PRIVATE Source/MacClipboard.mm)
+endif()
 
 target_compile_definitions(SA3 PUBLIC
     # WebView UI (HTML/CSS/JS via WebBrowserComponent + native bridge); CURL
@@ -110,15 +115,73 @@ target_link_libraries(SA3 PRIVATE
     juce::juce_recommended_warning_flags
 )
 
-# libmlx.dylib lives inside the project venv. Embed an rpath into the
-# plugin bundles so they can find it at runtime without DYLD_LIBRARY_PATH.
-# When we ship the plugin, libmlx.dylib will be vendored into the bundle's
-# Contents/Frameworks/ and the rpath swapped to @loader_path/../Frameworks.
+# libmlx.dylib lives inside the project venv; bake that path in as the
+# link-time rpath so the build-tree binary can be run directly during
+# development. For distribution, vendor_bundle.sh (POST_BUILD below)
+# copies libmlx + libjaccl + mlx.metallib + libsentencepiece into the
+# bundle's Contents/Frameworks/, strips this dev rpath, and adds
+# @loader_path/../Frameworks so the bundle is self-contained and loads
+# inside a hardened-runtime DAW.
 get_filename_component(MLX_LIB_DIR "${MLX_VENV_CMAKE}/../../../lib" ABSOLUTE)
 foreach(fmt SA3_AU SA3_VST3 SA3_Standalone)
     if(TARGET ${fmt})
         set_target_properties(${fmt} PROPERTIES
             INSTALL_RPATH "${MLX_LIB_DIR}"
             BUILD_RPATH   "${MLX_LIB_DIR}")
+    endif()
+endforeach()
+
+# ── Post-build: vendor dylibs (and optionally models) into each bundle ──
+# Default ON for SA3_VENDOR_MODELS — APFS clones (`cp -c` inside
+# vendor_bundle.sh) make this near-free in time + disk space. Flip to OFF
+# if you want lean bundles that resolve models via $SA3_MODELS_DIR.
+option(SA3_VENDOR_MODELS "Clone MLX safetensors into each plugin bundle" ON)
+
+set(SENTENCEPIECE_LIB_DIR "${SENTENCEPIECE_PREFIX}/lib")
+if(SA3_VENDOR_MODELS)
+    set(SA3_MODELS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../optimized/mlx/models/mlx")
+else()
+    set(SA3_MODELS_SRC "")
+endif()
+
+set(VENDOR_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vendor_bundle.sh")
+set(_artefacts "${CMAKE_BINARY_DIR}/SA3_artefacts/$<CONFIG>")
+
+# JUCE's COPY_PLUGIN_AFTER_BUILD step runs before our POST_BUILD command
+# (it was registered first by juce_add_plugin), so the bundle installed to
+# ~/Library is still un-vendored when we get here. We vendor the build-tree
+# bundle, then vendor the installed copy too so both load in DAWs without
+# a second rebuild.
+set(_user_plugins "$ENV{HOME}/Library/Audio/Plug-Ins")
+set(_fmt_targets SA3_AU SA3_VST3 SA3_Standalone)
+set(_fmt_kinds   AU      VST3     Standalone)
+set(_fmt_bundles "SA3 Variations.component" "SA3 Variations.vst3" "SA3 Variations.app")
+set(_fmt_install_dirs
+    "${_user_plugins}/Components"
+    "${_user_plugins}/VST3"
+    "")  # Standalone has no auto-install location.
+foreach(fmt_target fmt_kind fmt_bundle fmt_install IN ZIP_LISTS
+        _fmt_targets _fmt_kinds _fmt_bundles _fmt_install_dirs)
+    if(TARGET ${fmt_target})
+        add_custom_command(TARGET ${fmt_target} POST_BUILD
+            COMMAND "${VENDOR_SCRIPT}"
+                    "${_artefacts}/${fmt_kind}/${fmt_bundle}"
+                    "${MLX_LIB_DIR}"
+                    "${SENTENCEPIECE_LIB_DIR}"
+                    "${SA3_MODELS_SRC}"
+                    "${MLX_LIB_DIR}"
+            COMMENT "Vendoring ${fmt_kind} bundle (dylibs + models + re-sign)"
+            VERBATIM)
+        if(fmt_install)
+            add_custom_command(TARGET ${fmt_target} POST_BUILD
+                COMMAND "${VENDOR_SCRIPT}"
+                        "${fmt_install}/${fmt_bundle}"
+                        "${MLX_LIB_DIR}"
+                        "${SENTENCEPIECE_LIB_DIR}"
+                        "${SA3_MODELS_SRC}"
+                        "${MLX_LIB_DIR}"
+                COMMENT "Vendoring installed ${fmt_kind} (~/Library copy)"
+                VERBATIM)
+        endif()
     endif()
 endforeach()

@@ -111,10 +111,14 @@ public:
     int                getVariationCount() const;
 
     // Write the given variation to a 16-bit PCM stereo WAV at the user
-    // temp directory and return its path. The filename is built from
-    // `baseName` (sanitized) + idx, so concurrent drags don't collide.
-    // Returns an empty File if idx is out of range or the buffer is unset.
-    juce::File writeVariationToTempFile(int idx, const juce::String& baseName);
+    // temp directory and return its path. The filename is
+    // `<safe(baseName)>_var<idx+1>[ _<stamp>].wav` — `stamp` lets the
+    // caller (JS, per generation) inject a unique suffix so files dragged
+    // into a DAW project don't collide with prior generations or other
+    // plugin instances. Returns an empty File on bad idx / unset buffer.
+    juce::File writeVariationToTempFile(int idx,
+                                        const juce::String& baseName,
+                                        const juce::String& stamp = {});
 
     // Encode the given variation to a 16-bit PCM stereo WAV in memory and
     // return the bytes. Used by the WebView resource provider so it can

@@ -336,26 +336,40 @@ input[type="range"]::-webkit-slider-thumb {
   font-variant-numeric: tabular-nums;
 }
 
+/* Two-row grid: row 1 has waveform + idx/dur/play centred on it; row 2
+   has the steer text and the hover-only copy button. Splitting steer onto
+   its own row means idx/dur/play align to the waveform's actual vertical
+   centre, not the centre of (waveform + steer). */
 .slot {
   display: grid;
   grid-template-columns: 22px 1fr 52px 24px;
-  align-items: center; gap: 12px;
-  padding: 9px 0; border-bottom: 1px solid var(--hair);
+  grid-template-rows: auto auto;
+  align-items: center;
+  column-gap: 12px;
+  row-gap: 3px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--hair);
+  user-select: none;
+  -webkit-user-select: none;
 }
+.slot > .idx,
+.slot > .wf,
+.slot > .dur,
+.slot > .row-play  { grid-row: 1; }
+.slot > .steer     { grid-row: 2; grid-column: 2; }
+.slot > .row-copy  { grid-row: 2; grid-column: 4; }
 .slot:last-child { border-bottom: none; }
+
 .slot .idx {
   font-size: 10px; color: var(--faint);
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.08em;
 }
 .slot.empty { opacity: 0.35; }
-.slot.active .idx { color: var(--accent); }
+.slot.active .idx,
+.slot.active .wf,
+.slot.active .steer { color: var(--accent); }
 
-.wf-wrap {
-  display: flex; flex-direction: column; gap: 3px; min-width: 0;
-  color: var(--fg);
-}
-.slot.active .wf-wrap { color: var(--accent); }
 .steer {
   font-size: 11px; color: var(--faint);
   letter-spacing: 0.01em;
@@ -376,6 +390,56 @@ input[type="range"]::-webkit-slider-thumb {
 .row-play:disabled { color: var(--faint); cursor: default; }
 .slot.active .row-play {
   border-color: var(--accent); color: var(--accent);
+}
+
+/* Copy-to-clipboard — hover-only, faint by default, no border. Sits
+   directly under the play button so the two read as a vertical pair. */
+.row-copy {
+  width: 22px; height: 22px; border-radius: 50%;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--faint); padding: 0; cursor: pointer;
+  display: grid; place-items: center; justify-self: end;
+  opacity: 0;
+  transition: opacity .15s, color .15s, border-color .15s;
+}
+.row-copy > svg { grid-area: 1 / 1; }
+.slot:hover .row-copy { opacity: 0.6; }
+.row-copy:hover:not(:disabled) { opacity: 1; color: var(--fg); border-color: var(--hair); }
+.row-copy:disabled { cursor: default; }
+/* .copied must out-specify `.row-copy:hover:not(:disabled)`, otherwise the
+   accent flash only shows once the cursor leaves the button. */
+.row-copy.copied,
+.row-copy.copied:hover:not(:disabled) {
+  opacity: 1;
+  color: var(--accent);
+  border-color: var(--accent-dim);
+}
+
+/* Tiny "Copied" toast that pops in next to the copy button after a
+   successful clipboard write. Positioned absolutely against the slot so
+   it doesn't push other rows around. */
+.slot { position: relative; }
+.copy-toast {
+  position: absolute;
+  right: 32px;
+  bottom: 9px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  background: var(--bg);
+  border: 1px solid var(--accent-dim);
+  border-radius: 10px;
+  padding: 2px 7px;
+  opacity: 0;
+  transform: translateX(4px);
+  transition: opacity .15s ease, transform .15s ease;
+  pointer-events: none;
+  white-space: nowrap;
+}
+.copy-toast.show {
+  opacity: 1;
+  transform: translateX(0);
 }
 
 /* ── Footer (always pinned to the bottom) ─────────────────────────── */

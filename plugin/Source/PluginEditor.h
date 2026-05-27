@@ -8,6 +8,9 @@
 // in 2.3c.
 #pragma once
 
+#include <array>
+#include <memory>
+
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
 

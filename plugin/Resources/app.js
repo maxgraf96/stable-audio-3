@@ -40,7 +40,8 @@ const pause = getNativeFunction("pause");
 const stop = getNativeFunction("stop");
 const seek = getNativeFunction("seek");
 const getPlayState = getNativeFunction("getPlayState");
-const setOneShotMode = getNativeFunction("setOneShotMode");
+const setOneShotMode           = getNativeFunction("setOneShotMode");
+const copyVariationToClipboard = getNativeFunction("copyVariationToClipboard");
 
 // ── Constants ────────────────────────────────────────────────────────
 const PRESETS = [
@@ -391,6 +392,24 @@ function clearVariations() {
     resultsEl.hidden = true;
 }
 
+// Brief icon swap + accent flash on the copy button when the variation
+// successfully landed on the clipboard.
+function flashCopiedFeedback(btn, toast) {
+    if (!btn) return;
+    btn.classList.add("copied");
+    const ic = btn.querySelector(".copy-ico");
+    const ck = btn.querySelector(".check-ico");
+    if (ic) ic.hidden = true;
+    if (ck) ck.hidden = false;
+    if (toast) toast.classList.add("show");
+    setTimeout(() => {
+        btn.classList.remove("copied");
+        if (ic) ic.hidden = false;
+        if (ck) ck.hidden = true;
+        if (toast) toast.classList.remove("show");
+    }, 1200);
+}
+
 function renderResults() {
     if (state.variations.length === 0 && state.expected === 0) {
         resultsEl.hidden = true;
@@ -417,15 +436,18 @@ function renderResults() {
             + (active ? " active" : "");
         slot.innerHTML = `
       <span class="idx">${String(i + 1).padStart(2, "0")}</span>
-      <div class="wf-wrap">
-        <div class="wf"></div>
-        <span class="steer"></span>
-      </div>
+      <div class="wf"></div>
       <span class="dur"></span>
       <button type="button" class="row-play" aria-label="Play variation ${i + 1}">
         <svg class="play-ico"  width="10" height="10" viewBox="0 0 10 10"><polygon points="2.5,2 8.5,5 2.5,8" fill="currentColor"/></svg>
         <svg class="pause-ico" width="10" height="10" viewBox="0 0 10 10"><rect x="2" y="2" width="2" height="6" fill="currentColor"/><rect x="6" y="2" width="2" height="6" fill="currentColor"/></svg>
       </button>
+      <span class="steer"></span>
+      <button type="button" class="row-copy" aria-label="Copy variation ${i + 1} to clipboard (paste with ⌘V)">
+        <svg class="copy-ico"  width="11" height="11" viewBox="0 0 11 11"><rect x="2.2" y="2.6" width="6" height="7.2" rx="0.8" stroke="currentColor" stroke-width="0.7" fill="none"/><rect x="3.5" y="1.4" width="3.4" height="1.5" rx="0.4" fill="currentColor"/></svg>
+        <svg class="check-ico" width="11" height="11" viewBox="0 0 11 11" hidden><polyline points="2,6 4.5,8.5 9,3.5" stroke="currentColor" stroke-width="1.1" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <span class="copy-toast" aria-hidden="true">Copied to clipboard</span>
     `;
         slotsEl.appendChild(slot);
 
@@ -433,6 +455,8 @@ function renderResults() {
         const steerEl = slot.querySelector(".steer");
         const durEl = slot.querySelector(".dur");
         const playBtn = slot.querySelector(".row-play");
+        const copyBtn = slot.querySelector(".row-copy");
+        const copyToast = slot.querySelector(".copy-toast");
 
         steerEl.textContent = v ? (v.steer || "") : "";
         durEl.textContent = (v && v.duration) ? `${v.duration.toFixed(2)}s` : "——";
@@ -456,6 +480,21 @@ function renderResults() {
             togglePlay(i);
         });
 
+        // Copy to clipboard — writes the variation to a temp WAV and
+        // puts it on the system clipboard as a POSIX file via osascript.
+        // ⌘V into Ableton / Finder lands the file. Pasted from wavnav's
+        // approach since OS drag-out via WKWebView doesn't work.
+        if (!ready) copyBtn.disabled = true;
+        copyBtn.addEventListener("click", async (e) => {
+            e.stopPropagation();
+            if (!ready) return;
+            const baseName = (state.fileName || "SA3").replace(/\.[^.]+$/, "");
+            try {
+                const ok = await copyVariationToClipboard(i, baseName);
+                if (ok) flashCopiedFeedback(copyBtn, copyToast);
+            } catch (_) { /* swallow */ }
+        });
+
         // Clicking anywhere else on the row switches to (and plays) that
         // variation — UX shortcut. Skip clicks on the waveform (own seek
         // handler) and the play button (handled above).
@@ -467,9 +506,15 @@ function renderResults() {
             // so this is a "switch to this variation and start" not a toggle.
             play(i).then(() => getPlayState()).then(applyPlayState);
         });
+
+        // Drag-out is handled by native JUCE overlay components positioned
+        // on top of the slot's idx column (see reportSlotBoundsToNative
+        // below). HTML5 dragstart from a WKWebView can't reliably start
+        // an OS-level file drag — wavnav's pattern, mirrored here, is to
+        // have JUCE handle the mouseDrag from a real NSView.
         slot.style.cursor = ready ? "pointer" : "default";
 
-        slotHandles[i] = { wfMount, slotEl: slot, playBtn };
+        slotHandles[i] = { wfMount, slotEl: slot, playBtn, copyBtn };
     }
     updatePlayStateUI();
 }

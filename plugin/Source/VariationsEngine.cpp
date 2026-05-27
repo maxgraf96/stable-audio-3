@@ -230,6 +230,91 @@ int VariationsEngine::getVariationCount() const
     return static_cast<int>(variation_peaks_.size());
 }
 
+juce::File VariationsEngine::writeVariationToTempFile(int idx,
+                                                      const juce::String& baseName)
+{
+    // Copy the buffer out under the lock — encoding + disk I/O happen
+    // unlocked so the audio thread isn't blocked.
+    juce::AudioBuffer<float> buf;
+    {
+        std::lock_guard<std::mutex> lk(play_mutex_);
+        if (idx < 0 || idx >= static_cast<int>(variation_bufs_.size())) return {};
+        const auto& src = variation_bufs_[static_cast<size_t>(idx)];
+        if (src.getNumSamples() <= 0) return {};
+        buf = src;   // AudioBuffer copy ctor
+    }
+
+    // Sanitize the filename: strip extension, restrict to a safe charset,
+    // fall back to "SA3" if empty after stripping.
+    juce::String safe = baseName;
+    const int dot = safe.lastIndexOfChar('.');
+    if (dot > 0) safe = safe.substring(0, dot);
+    safe = safe.retainCharacters(
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_ ");
+    safe = safe.trim();
+    if (safe.isEmpty()) safe = "SA3";
+
+    const auto out = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                       .getChildFile(safe + "_var" + juce::String(idx + 1) + ".wav");
+    out.deleteFile();   // replaceWithData would do this too but JUCE's writer needs a fresh stream
+
+    // Stream-based WAV write via juce::WavAudioFormat. The format writer
+    // takes ownership of the output stream once created — we release the
+    // unique_ptr after the createWriterFor call succeeds.
+    auto stream = out.createOutputStream();
+    if (stream == nullptr) return {};
+
+    juce::WavAudioFormat fmt;
+    std::unique_ptr<juce::AudioFormatWriter> writer(
+        fmt.createWriterFor(stream.get(),
+                            static_cast<double>(kSampleRate),
+                            /*numChannels=*/2,
+                            /*bitsPerSample=*/16,
+                            /*metadataValues=*/{},
+                            /*qualityOptionIndex=*/0));
+    if (writer == nullptr) return {};
+    stream.release();   // writer now owns the stream
+    writer->writeFromAudioSampleBuffer(buf, 0, buf.getNumSamples());
+    writer.reset();     // flush + close
+    return out;
+}
+
+std::vector<std::byte> VariationsEngine::getVariationWavBytes(int idx)
+{
+    juce::AudioBuffer<float> buf;
+    {
+        std::lock_guard<std::mutex> lk(play_mutex_);
+        if (idx < 0 || idx >= static_cast<int>(variation_bufs_.size())) return {};
+        const auto& src = variation_bufs_[static_cast<size_t>(idx)];
+        if (src.getNumSamples() <= 0) return {};
+        buf = src;
+    }
+
+    // Encode into a MemoryBlock-backed stream. The writer takes ownership
+    // of the stream pointer once createWriterFor succeeds; its destructor
+    // flushes + closes the stream, after which the MemoryBlock holds the
+    // final WAV bytes.
+    juce::MemoryBlock mb;
+    {
+        auto stream = std::make_unique<juce::MemoryOutputStream>(mb, false);
+        juce::WavAudioFormat fmt;
+        std::unique_ptr<juce::AudioFormatWriter> writer(
+            fmt.createWriterFor(stream.get(),
+                                static_cast<double>(kSampleRate),
+                                /*numChannels=*/2,
+                                /*bitsPerSample=*/16,
+                                /*metadataValues=*/{},
+                                /*qualityOptionIndex=*/0));
+        if (writer == nullptr) return {};
+        stream.release();   // writer owns
+        writer->writeFromAudioSampleBuffer(buf, 0, buf.getNumSamples());
+    }   // writer destructor flushes & closes — mb is complete now
+
+    std::vector<std::byte> out(mb.getSize());
+    std::memcpy(out.data(), mb.getData(), mb.getSize());
+    return out;
+}
+
 // ── Playback control ─────────────────────────────────────────────────
 
 void VariationsEngine::play(int idx)

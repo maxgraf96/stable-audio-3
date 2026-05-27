@@ -109,12 +109,38 @@ sa3plugin::GenerateRequest parseGenerateRequest(const juce::var& v) {
     return req;
 }
 
+// Match `/variations/<N>.wav` (after normalisePath) → N. Returns -1 on
+// anything that isn't a variation request.
+int parseVariationIndex(const juce::String& name) {
+    static const juce::String kPrefix = "variations/";
+    static const juce::String kSuffix = ".wav";
+    if (! name.startsWith(kPrefix) || ! name.endsWith(kSuffix)) return -1;
+    juce::String inner = name.substring(kPrefix.length(),
+                                        name.length() - kSuffix.length());
+    if (inner.isEmpty() || ! inner.containsOnly("0123456789")) return -1;
+    return inner.getIntValue();
+}
+
 juce::WebBrowserComponent::Options buildOptions(SA3AudioProcessor& processor)
 {
-    auto resourceProvider = [](const juce::String& url)
+    auto resourceProvider = [&processor](const juce::String& url)
             -> std::optional<juce::WebBrowserComponent::Resource>
         {
-            return serveStaticResource(normalisePath(url));
+            const juce::String name = normalisePath(url);
+            // Variation WAVs encoded on demand from the engine's
+            // in-memory AudioBuffer. Used by the HTML5 drag-out path —
+            // WebKit fetches this URL when materializing the file
+            // promise on drop.
+            const int varIdx = parseVariationIndex(name);
+            if (varIdx >= 0) {
+                auto bytes = processor.getVariationsEngine().getVariationWavBytes(varIdx);
+                if (! bytes.empty()) {
+                    return juce::WebBrowserComponent::Resource{
+                        std::move(bytes), "audio/wav"};
+                }
+                return std::nullopt;
+            }
+            return serveStaticResource(name);
         };
 
     return juce::WebBrowserComponent::Options{}
@@ -282,6 +308,39 @@ juce::WebBrowserComponent::Options buildOptions(SA3AudioProcessor& processor)
                 const bool v = ! args.isEmpty() && static_cast<bool>(args[0]);
                 processor.getVariationsEngine().setOneShotMode(v);
                 complete(juce::var());
+            })
+        // copyVariationToClipboard(idx, baseName) — write the variation
+        // to a temp WAV, then put a POSIX file reference on the system
+        // clipboard via AppleScript. Ableton, Finder, etc. accept this
+        // as a file ⌘V paste — sidesteps WKWebView's drag-out
+        // restrictions entirely.  (Pattern lifted from wavnav.)
+        .withNativeFunction(
+            "copyVariationToClipboard",
+            [&processor](const juce::Array<juce::var>& args,
+                         juce::WebBrowserComponent::NativeFunctionCompletion complete) {
+                if (args.isEmpty()) { complete(juce::var(false)); return; }
+                const int          idx      = static_cast<int>(args[0]);
+                const juce::String baseName = args.size() > 1
+                    ? args[1].toString() : juce::String("SA3");
+                const auto file = processor.getVariationsEngine()
+                                      .writeVariationToTempFile(idx, baseName);
+                if (! file.existsAsFile()) { complete(juce::var(false)); return; }
+               #if JUCE_MAC
+                // The path is wrapped in double quotes; macOS filenames
+                // very rarely contain double quotes themselves.
+                const juce::String quoted =
+                    "\"" + file.getFullPathName() + "\"";
+                const juce::String cmd =
+                    "osascript -e 'on run args' "
+                    "-e 'set the clipboard to POSIX file (first item of args)' "
+                    "-e end $@ " + quoted;
+                const int rc = std::system(cmd.toRawUTF8());
+                complete(juce::var(rc == 0));
+               #else
+                // Other platforms — fall back to copying the path as text.
+                juce::SystemClipboard::copyTextToClipboard(file.getFullPathName());
+                complete(juce::var(true));
+               #endif
             });
 }
 

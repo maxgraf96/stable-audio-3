@@ -110,6 +110,18 @@ public:
     std::vector<float> getVariationPeaks(int idx) const;
     int                getVariationCount() const;
 
+    // Write the given variation to a 16-bit PCM stereo WAV at the user
+    // temp directory and return its path. The filename is built from
+    // `baseName` (sanitized) + idx, so concurrent drags don't collide.
+    // Returns an empty File if idx is out of range or the buffer is unset.
+    juce::File writeVariationToTempFile(int idx, const juce::String& baseName);
+
+    // Encode the given variation to a 16-bit PCM stereo WAV in memory and
+    // return the bytes. Used by the WebView resource provider so it can
+    // serve the variation at juce://sa3.local/variations/N.wav for the
+    // HTML5 dragstart → NSFilePromise path. Returns empty on bad idx.
+    std::vector<std::byte> getVariationWavBytes(int idx);
+
     // ── Playback control (cheap, message-thread-safe) ────────────────
     void  play(int idx);              // -1 source, 0..4 slot, -2 stop
     void  pausePlayback();

@@ -72,19 +72,22 @@ Reads `plugin/build/SA3_artefacts/Release/` and emits two files in `plugin/build
 
 ## Hosting the safetensors on HuggingFace
 
-One-time setup:
+The four model files are hosted at <https://huggingface.co/maxgraf/sa3-variations-models> — `install_models.sh` is hardcoded to point at that repo (`DEFAULT_REPO`).
 
-1. Create a new HuggingFace model repo (e.g. `maxgraf96/sa3-variations-models`).
-2. Upload the four files at the top level of the repo (web UI or `huggingface-cli upload`):
-   ```
-   t5gemma_f16.safetensors
-   dit_medium_f16.safetensors
-   same_l_encoder_f32.safetensors
-   same_l_decoder_f32.safetensors
-   ```
-3. If the repo slug isn't `maxgraf96/sa3-variations-models`, edit `DEFAULT_REPO` at the top of `plugin/scripts/install_models.sh` (and re-run `prepare_release_assets.sh` so the bundled copy reflects the change).
+For new versions, just re-upload over the existing files via the HF web UI or:
 
-Subsequent releases reuse the same HF repo — bump `DEFAULT_REV` only if you pin to a specific revision, otherwise `main` keeps pointing at the latest upload.
+```bash
+huggingface-cli upload maxgraf/sa3-variations-models \
+    optimized/mlx/models/mlx/t5gemma_f16.safetensors           t5gemma_f16.safetensors
+huggingface-cli upload maxgraf/sa3-variations-models \
+    optimized/mlx/models/mlx/dit_medium_f16.safetensors        dit_medium_f16.safetensors
+huggingface-cli upload maxgraf/sa3-variations-models \
+    optimized/mlx/models/mlx/same_l_encoder_f32.safetensors    same_l_encoder_f32.safetensors
+huggingface-cli upload maxgraf/sa3-variations-models \
+    optimized/mlx/models/mlx/same_l_decoder_f32.safetensors    same_l_decoder_f32.safetensors
+```
+
+`install_models.sh` resolves at runtime from the `main` revision, so users always get the latest upload. To pin a release to a specific snapshot, pass a commit SHA as the second arg to the script, or set `DEFAULT_REV` in the script before running `prepare_release_assets.sh`.
 
 ## Uploading to GitHub Releases
 

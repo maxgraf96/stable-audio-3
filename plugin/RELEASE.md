@@ -57,43 +57,52 @@ otool -L "<binary inside bundle>" # nothing outside /System or /usr/lib or @rpat
 otool -l "<binary>" | grep -A2 LC_BUILD_VERSION    # minos 13.5, not 15.x
 ```
 
-## Packaging for distribution
-
-One helper script does it all:
+## Packaging the plugin bundles
 
 ```bash
 plugin/scripts/prepare_release_assets.sh
 ```
 
-It expects an existing release build in `plugin/build/SA3_artefacts/Release/` (see *Build the release artefacts* above) and lays out everything you need to upload in `plugin/build/release_assets/`:
+Reads `plugin/build/SA3_artefacts/Release/` and emits two files in `plugin/build/release_assets/`:
 
 | File | Purpose |
 |------|---------|
 | `SA3-Variations-plugins.zip` | the three bundles + a `README.txt` |
-| `t5gemma_f16.safetensors` | encoder weights |
-| `same_l_encoder_f32.safetensors` | SAME-L encoder |
-| `same_l_decoder_f32.safetensors` | SAME-L decoder |
-| `dit_medium_f16.safetensors.part-aa` | DiT weights, half 1 |
-| `dit_medium_f16.safetensors.part-ab` | DiT weights, half 2 |
-| `install_models.sh` | user-side download + reassemble |
+| `install_models.sh` | end-user download script (pulls from HuggingFace) |
 
-`dit_medium_f16.safetensors` is ~2.7 GB which exceeds GitHub's per-release-asset cap (2 GB), so we `split -b 1500m` it into two parts. The install script `cat`s them back together client-side.
+## Hosting the safetensors on HuggingFace
+
+One-time setup:
+
+1. Create a new HuggingFace model repo (e.g. `maxgraf96/sa3-variations-models`).
+2. Upload the four files at the top level of the repo (web UI or `huggingface-cli upload`):
+   ```
+   t5gemma_f16.safetensors
+   dit_medium_f16.safetensors
+   same_l_encoder_f32.safetensors
+   same_l_decoder_f32.safetensors
+   ```
+3. If the repo slug isn't `maxgraf96/sa3-variations-models`, edit `DEFAULT_REPO` at the top of `plugin/scripts/install_models.sh` (and re-run `prepare_release_assets.sh` so the bundled copy reflects the change).
+
+Subsequent releases reuse the same HF repo — bump `DEFAULT_REV` only if you pin to a specific revision, otherwise `main` keeps pointing at the latest upload.
 
 ## Uploading to GitHub Releases
 
 1. Tag the commit and push: `git tag v0.1.0 && git push --tags`
 2. Create a release on GitHub for that tag.
-3. Drag every file out of `plugin/build/release_assets/` into the release's assets uploader.
+3. Drag both files from `plugin/build/release_assets/` into the release's asset uploader.
 4. Publish.
-
-`install_models.sh` defaults to tag `v0.1.0` and to the `maxgraf96/stable-audio-3` repo slug — bump `DEFAULT_TAG` in the script when you cut a new release, or pass the new tag as the first arg, or override entirely via `SA3_RELEASE_BASE=<url> ./install_models.sh`.
 
 ## End-user install steps
 
 1. Open the release page on GitHub. Download:
    - `SA3-Variations-plugins.zip`
    - `install_models.sh`
-2. Run `./install_models.sh` in Terminal — it downloads all the safetensors into `~/Library/Application Support/SA3 Variations/models/` (~6.4 GB, idempotent so you can re-run if interrupted).
+2. In Terminal:
+   ```
+   chmod +x install_models.sh && ./install_models.sh
+   ```
+   Pulls all four safetensors (~6.4 GB) from HuggingFace into `~/Library/Application Support/SA3 Variations/models/`. Idempotent — re-run to resume after interruption.
 3. Unzip the plugins archive and drag:
    - `SA3 Variations.app` → `/Applications/`
    - `SA3 Variations.vst3` → `~/Library/Audio/Plug-Ins/VST3/`

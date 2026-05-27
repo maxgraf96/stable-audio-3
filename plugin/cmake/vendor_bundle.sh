@@ -8,12 +8,21 @@
 # script is idempotent — re-running on a bundle that's already vendored is a
 # fast no-op.
 #
-# Usage: vendor_bundle.sh <bundle> <mlx_lib_dir> <sp_lib_dir> <models_dir> [<dev_rpath>]
+# Usage:
+#   vendor_bundle.sh <bundle> <mlx_lib_dir> <sp_lib_dir> <models_dir> \
+#                    [<dev_rpath>] [<codesign_identity>]
 #
-# `models_dir` may be empty ("") to skip vendoring the safetensors — useful
-# when the model files live elsewhere (env var SA3_MODELS_DIR or the in-source
-# dev path). The dylibs are always vendored because the binary won't load in
-# a hardened-runtime host (Ableton, Logic, etc.) otherwise.
+# `models_dir` may be empty ("") to skip vendoring the safetensors — the
+# default at release time, when the model files live in
+#   ~/Library/Application Support/SA3 Variations/models/
+# (managed by the end-user) instead of being embedded per-bundle.
+#
+# `codesign_identity` is the argument passed to `codesign --sign`. Default
+# "-" produces an ad-hoc signature (fine for local dev). For a release,
+# pass a Developer ID Application identity like
+#   "Developer ID Application: Your Name (TEAMID)"
+# Notarisation is intentionally out of scope here — Gatekeeper will still
+# warn, but users get the right-click → Open flow.
 set -euo pipefail
 
 bundle="$1"
@@ -21,6 +30,7 @@ mlx_lib_dir="$2"
 sp_lib_dir="$3"
 models_dir="${4:-}"
 dev_rpath="${5:-}"
+codesign_identity="${6:--}"
 
 if [[ ! -d "$bundle" ]]; then
     echo "vendor_bundle: bundle not found: $bundle" >&2
@@ -95,6 +105,14 @@ if [[ -n "$models_dir" && -d "$models_dir" ]]; then
             echo "vendor_bundle: warn — model missing: $models_dir/$f" >&2
         fi
     done
+else
+    # Vendoring is off but a previous build may have left ~6 GB of stale
+    # safetensors in Contents/Resources/models. Strip them so the bundle
+    # we ship matches the lean default layout (models live in
+    # ~/Library/Application Support/SA3 Variations/models/ at runtime).
+    if [[ -d "$models_dst" ]]; then
+        rm -rf "$models_dst"
+    fi
 fi
 
 # ── Re-sign everything ad-hoc ─────────────────────────────────────────
@@ -108,7 +126,7 @@ fi
 # unless every nested Mach-O-style payload (dylibs *and* metallib) carries
 # its own signature first.
 for f in "$frameworks"/*.dylib "$frameworks"/*.metallib; do
-    [[ -f "$f" ]] && codesign --force --sign - "$f"
+    [[ -f "$f" ]] && codesign --force --sign "$codesign_identity" "$f"
 done
-codesign --force --sign - "$bundle"
-echo "vendor_bundle: ok — $bundle"
+codesign --force --sign "$codesign_identity" "$bundle"
+echo "vendor_bundle: ok — $bundle  (identity: $codesign_identity)"

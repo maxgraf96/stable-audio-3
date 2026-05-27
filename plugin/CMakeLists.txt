@@ -11,16 +11,21 @@
 # Sanity-test:
 #   plugin/build/SA3_artefacts/Release/Standalone/SA3.app/Contents/MacOS/SA3
 cmake_minimum_required(VERSION 3.22)
+
+# macOS deployment target MUST be set before project() — project() bakes
+# the target into the compiler's -mmacosx-version-min flag and CMake's
+# internal state. Setting it later (as we used to) silently no-op'd and
+# binaries demanded macOS 15. 13.5 is MLX's documented minimum and covers
+# macOS 13 (Ventura) onward — three OS generations of users.
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "13.5" CACHE STRING "")
+endif()
+
 project(SA3Plugin VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-
-# macOS deployment target — Apple Silicon DAWs typically need 11+.
-if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "")
-endif()
 
 # ── JUCE ─────────────────────────────────────────────────────────────
 include(FetchContent)
@@ -132,10 +137,23 @@ foreach(fmt SA3_AU SA3_VST3 SA3_Standalone)
 endforeach()
 
 # ── Post-build: vendor dylibs (and optionally models) into each bundle ──
-# Default ON for SA3_VENDOR_MODELS — APFS clones (`cp -c` inside
-# vendor_bundle.sh) make this near-free in time + disk space. Flip to OFF
-# if you want lean bundles that resolve models via $SA3_MODELS_DIR.
-option(SA3_VENDOR_MODELS "Clone MLX safetensors into each plugin bundle" ON)
+# SA3_VENDOR_MODELS=OFF by default: production layout ships ~10 MB plugin
+# bundles plus a separate ~6 GB models download that end-users drop into
+#   ~/Library/Application Support/SA3 Variations/models/
+# (resolveModelsDir() in VariationsEngine.cpp picks them up there). Flip
+# ON to produce fully self-contained bundles for local dev — `cp -c`
+# uses APFS clones so the on-disk overhead is zero until distribution
+# packaging expands them.
+option(SA3_VENDOR_MODELS "Clone MLX safetensors into each plugin bundle" OFF)
+
+# Codesign identity passed to vendor_bundle.sh. Default "-" = ad-hoc,
+# fine for local dev. For a release, configure with:
+#   -DSA3_CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+# Gatekeeper still won't pass (we're not notarising), but users get the
+# right-click → Open flow instead of the harsher "from an unidentified
+# developer" warning.
+set(SA3_CODESIGN_IDENTITY "-" CACHE STRING
+    "Codesign identity for bundle re-signing (\"-\" for ad-hoc)")
 
 set(SENTENCEPIECE_LIB_DIR "${SENTENCEPIECE_PREFIX}/lib")
 if(SA3_VENDOR_MODELS)
@@ -170,6 +188,7 @@ foreach(fmt_target fmt_kind fmt_bundle fmt_install IN ZIP_LISTS
                     "${SENTENCEPIECE_LIB_DIR}"
                     "${SA3_MODELS_SRC}"
                     "${MLX_LIB_DIR}"
+                    "${SA3_CODESIGN_IDENTITY}"
             COMMENT "Vendoring ${fmt_kind} bundle (dylibs + models + re-sign)"
             VERBATIM)
         if(fmt_install)
@@ -180,6 +199,7 @@ foreach(fmt_target fmt_kind fmt_bundle fmt_install IN ZIP_LISTS
                         "${SENTENCEPIECE_LIB_DIR}"
                         "${SA3_MODELS_SRC}"
                         "${MLX_LIB_DIR}"
+                        "${SA3_CODESIGN_IDENTITY}"
                 COMMENT "Vendoring installed ${fmt_kind} (~/Library copy)"
                 VERBATIM)
         endif()

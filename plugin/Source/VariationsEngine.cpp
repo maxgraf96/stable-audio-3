@@ -17,20 +17,16 @@ constexpr const char* kDitFile     = "dit_medium_f16.safetensors";
 constexpr const char* kEncoderFile = "same_l_encoder_f32.safetensors";
 constexpr const char* kDecoderFile = "same_l_decoder_f32.safetensors";
 
-// Dev fallback when the plugin runs from a build tree without bundled
-// models. Production bundles ship the safetensors under
-// Contents/Resources/models/ and never touch this path.
-constexpr const char* kDevModelsDir =
-    "/Users/max/Code/stable-audio-3/optimized/mlx/models/mlx";
-
 // Where the four safetensors files live for the currently-running plugin.
 // Resolution order:
-//   1. $SA3_MODELS_DIR — dev override so we don't have to copy >1 GB of
-//      weights into every bundle on each build.
-//   2. <plugin>/Contents/Resources/models — production layout, written by
-//      the CMake post-build step. juce::currentExecutableFile returns the
-//      plugin's own binary even when loaded inside a DAW.
-//   3. kDevModelsDir — last-resort source-tree path.
+//   1. $SA3_MODELS_DIR — dev override; lets us run the build-tree binary
+//      against a freshly downloaded model snapshot without rebuilding.
+//   2. <bundle>/Contents/Resources/models — self-contained bundle layout
+//      (CMake's SA3_VENDOR_MODELS=ON path; off by default because each
+//      bundle would otherwise weigh ~7 GB).
+//   3. ~/Library/Application Support/SA3 Variations/models — production
+//      default. End-users download the models once and drop them here;
+//      all three plugin formats share the single copy.
 juce::File resolveModelsDir()
 {
     if (const char* env = std::getenv("SA3_MODELS_DIR"); env && *env) {
@@ -43,7 +39,13 @@ juce::File resolveModelsDir()
                       .getChildFile("Resources")
                       .getChildFile("models");
     if (bundled.isDirectory()) return bundled;
-    return juce::File(kDevModelsDir);
+    // juce::userApplicationDataDirectory on macOS is `~/Library`, *not*
+    // `~/Library/Application Support` — Apple bundles that into the path
+    // and JUCE doesn't expose it as its own special location.
+    return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+        .getChildFile("Application Support")
+        .getChildFile("SA3 Variations")
+        .getChildFile("models");
 }
 
 constexpr int kSampleRate = sa3::orch::SAMPLE_RATE;   // 44100

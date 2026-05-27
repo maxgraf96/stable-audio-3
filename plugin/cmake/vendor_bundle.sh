@@ -10,7 +10,7 @@
 #
 # Usage:
 #   vendor_bundle.sh <bundle> <mlx_lib_dir> <sp_lib_dir> <models_dir> \
-#                    [<dev_rpath>] [<codesign_identity>]
+#                    [<dev_rpath>] [<codesign_identity>] [<entitlements_plist>]
 #
 # `models_dir` may be empty ("") to skip vendoring the safetensors — the
 # default at release time, when the model files live in
@@ -21,8 +21,12 @@
 # "-" produces an ad-hoc signature (fine for local dev). For a release,
 # pass a Developer ID Application identity like
 #   "Developer ID Application: Your Name (TEAMID)"
-# Notarisation is intentionally out of scope here — Gatekeeper will still
-# warn, but users get the right-click → Open flow.
+#
+# `entitlements_plist` is only used when identity != "-". When set, the
+# outermost bundle signature gets `--options=runtime --timestamp
+# --entitlements <plist>` so the resulting build is notarisation-eligible.
+# Nested Mach-O dylibs get `--options=runtime --timestamp` but no
+# entitlements (they inherit at load time from the loading binary).
 set -euo pipefail
 
 bundle="$1"
@@ -31,6 +35,7 @@ sp_lib_dir="$3"
 models_dir="${4:-}"
 dev_rpath="${5:-}"
 codesign_identity="${6:--}"
+entitlements_plist="${7:-}"
 
 if [[ ! -d "$bundle" ]]; then
     echo "vendor_bundle: bundle not found: $bundle" >&2
@@ -125,8 +130,33 @@ fi
 # subcomponent of the bundle and refuses to seal the outer .vst3/.component
 # unless every nested Mach-O-style payload (dylibs *and* metallib) carries
 # its own signature first.
-for f in "$frameworks"/*.dylib "$frameworks"/*.metallib; do
-    [[ -f "$f" ]] && codesign --force --sign "$codesign_identity" "$f"
+# Common codesign args. For ad-hoc identity ("-") we keep things minimal
+# (no hardened runtime, no timestamp — local dev). For a real Developer
+# ID identity, hardened-runtime + a secure timestamp are required for the
+# bundle to be notarisation-eligible later.
+common_sign_args=(--force --sign "$codesign_identity")
+runtime_sign_args=("${common_sign_args[@]}")
+if [[ "$codesign_identity" != "-" ]]; then
+    runtime_sign_args+=(--options=runtime --timestamp)
+fi
+
+# Inner dylibs: hardened-runtime + timestamp, no entitlements.
+for f in "$frameworks"/*.dylib; do
+    [[ -f "$f" ]] && codesign "${runtime_sign_args[@]}" "$f"
 done
-codesign --force --sign "$codesign_identity" "$bundle"
+# Metal shader library: just sign it. Not a Mach-O CPU binary, so no
+# runtime flag; codesign refuses --options=runtime for it.
+for f in "$frameworks"/*.metallib; do
+    [[ -f "$f" ]] && codesign "${common_sign_args[@]}" "$f"
+done
+
+# Outermost bundle: hardened runtime + timestamp + (when supplied) the
+# entitlements plist. Without entitlements the standalone runs but MLX
+# crashes inside hardened runtime, so always pair entitlements with a
+# Developer ID identity for release builds.
+bundle_sign_args=("${runtime_sign_args[@]}")
+if [[ "$codesign_identity" != "-" && -n "$entitlements_plist" && -f "$entitlements_plist" ]]; then
+    bundle_sign_args+=(--entitlements "$entitlements_plist")
+fi
+codesign "${bundle_sign_args[@]}" "$bundle"
 echo "vendor_bundle: ok — $bundle  (identity: $codesign_identity)"

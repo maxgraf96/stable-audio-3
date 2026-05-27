@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for SA3 Variations.
+
+  com.apple.security.cs.allow-jit
+      MLX compiles Metal compute shader pipelines on first use; that
+      counts as JIT under the hardened runtime even though the kernels
+      themselves are precompiled in mlx.metallib.
+
+  com.apple.security.cs.allow-unsigned-executable-memory
+      MLX maps writable+executable pages for its on-the-fly graph
+      runtime. Notarisation refuses the bundle without this.
+
+  com.apple.security.cs.disable-library-validation
+      libmlx.dylib loads mlx.metallib via dlopen-style discovery; that
+      lookup goes through the same path as a third-party plugin from
+      Library Validation's perspective. Bundles signed with Developer
+      ID but loading their own resigned-by-us dylibs need this off,
+      otherwise the load fails inside hardened-runtime hosts (Live,
+      Logic).
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>

@@ -147,13 +147,16 @@ endforeach()
 option(SA3_VENDOR_MODELS "Clone MLX safetensors into each plugin bundle" OFF)
 
 # Codesign identity passed to vendor_bundle.sh. Default "-" = ad-hoc,
-# fine for local dev. For a release, configure with:
+# fine for local dev. For a notarisable release, configure with:
 #   -DSA3_CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
-# Gatekeeper still won't pass (we're not notarising), but users get the
-# right-click → Open flow instead of the harsher "from an unidentified
-# developer" warning.
+# When the identity is non-ad-hoc, vendor_bundle.sh also applies
+# --options=runtime --timestamp and (on the outermost bundle) the
+# entitlements file below — that's what makes the build notarisation-
+# eligible. See plugin/RELEASE.md for the full notarisation workflow.
 set(SA3_CODESIGN_IDENTITY "-" CACHE STRING
     "Codesign identity for bundle re-signing (\"-\" for ad-hoc)")
+set(SA3_ENTITLEMENTS "${CMAKE_CURRENT_SOURCE_DIR}/entitlements.plist" CACHE FILEPATH
+    "Entitlements plist applied to the outermost bundle signature")
 
 set(SENTENCEPIECE_LIB_DIR "${SENTENCEPIECE_PREFIX}/lib")
 if(SA3_VENDOR_MODELS)
@@ -189,6 +192,7 @@ foreach(fmt_target fmt_kind fmt_bundle fmt_install IN ZIP_LISTS
                     "${SA3_MODELS_SRC}"
                     "${MLX_LIB_DIR}"
                     "${SA3_CODESIGN_IDENTITY}"
+                    "${SA3_ENTITLEMENTS}"
             COMMENT "Vendoring ${fmt_kind} bundle (dylibs + models + re-sign)"
             VERBATIM)
         if(fmt_install)

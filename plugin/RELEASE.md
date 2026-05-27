@@ -1,6 +1,6 @@
 # SA3 Variations — Release Notes
 
-How to produce signed release builds of the standalone + VST3 + AU and what end-users need on their machines. Notarisation is **out of scope**: this is a demo release; Gatekeeper will show a first-launch warning that users dismiss via right-click → **Open**.
+How to produce signed, notarised release builds of the standalone + VST3 + AU and what end-users need on their machines. Notarisation is optional — skip it and you'll ship signed-but-unstapled bundles that show a first-launch Gatekeeper warning. With notarisation on, the warning disappears entirely.
 
 ## Builder prerequisites (your machine only)
 
@@ -11,7 +11,27 @@ How to produce signed release builds of the standalone + VST3 + AU and what end-
   ```
   security find-identity -v -p codesigning | grep "Developer ID Application"
   ```
-  Take note of the full identity string, e.g. `Developer ID Application: Max Graf (XXXXXXXXXX)`.
+- An **app-specific password** generated at <https://appleid.apple.com> → *Sign-In and Security* → *App-Specific Passwords*.
+
+### Setting up credentials
+
+The release scripts read everything from `plugin/.env`. Copy the template and fill in:
+
+```bash
+cp plugin/.env.example plugin/.env
+$EDITOR plugin/.env
+```
+
+Required keys (`.env.example` has details on what each one is + where to get it):
+
+| Key | Example |
+|-----|---------|
+| `APPLE_ID` | `you@example.com` |
+| `APPLE_TEAM_ID` | `ABCDE12345` |
+| `APPLE_APP_PASSWORD` | `xxxx-xxxx-xxxx-xxxx` |
+| `SA3_CODESIGN_IDENTITY` | `Developer ID Application: Your Name (ABCDE12345)` |
+
+`plugin/.env` is gitignored, so it never leaves your machine.
 
 ## End-user prerequisites
 
@@ -29,20 +49,14 @@ How to produce signed release builds of the standalone + VST3 + AU and what end-
 ## Build the release artefacts
 
 ```bash
-cd plugin
-rm -rf build && mkdir build && cd build
-
-cmake .. \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DSA3_CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
-
-cmake --build . --target SA3_Standalone SA3_VST3 SA3_AU -j
+plugin/scripts/build_release.sh             # incremental
+plugin/scripts/build_release.sh --clean     # nuke build/ first
 ```
 
-The post-build vendor step:
+The script sources `plugin/.env`, runs `cmake` with `SA3_CODESIGN_IDENTITY`, and builds all three formats. The post-build vendor step:
 1. Copies `libmlx.dylib`, `libjaccl.dylib`, `mlx.metallib`, `libsentencepiece.0.dylib` into each bundle's `Contents/Frameworks/`.
 2. Strips the dev-tree rpath and adds `@loader_path/../Frameworks`.
-3. Re-signs every nested Mach-O and the bundle itself with `SA3_CODESIGN_IDENTITY`.
+3. Re-signs every nested Mach-O and the bundle itself with `SA3_CODESIGN_IDENTITY`. When that's a real Developer ID, the bundle gets `--options=runtime --timestamp` and the outermost signature picks up `plugin/entitlements.plist` — that's the configuration the notary service requires.
 
 Artefacts land at:
 - `build/SA3_artefacts/Release/Standalone/SA3 Variations.app`
@@ -60,14 +74,21 @@ otool -l "<binary>" | grep -A2 LC_BUILD_VERSION    # minos 13.5, not 15.x
 ## Packaging the plugin bundles
 
 ```bash
-plugin/scripts/prepare_release_assets.sh
+plugin/scripts/prepare_release_assets.sh                 # notarise + package
+plugin/scripts/prepare_release_assets.sh --no-notarize   # signed but unstapled
 ```
+
+The script reads the same `plugin/.env` and:
+1. For each bundle, runs `notarize.sh` (zip → `notarytool submit --wait` → `stapler staple`). Each submit blocks on Apple's service for ~1–10 min, so the whole run takes 5–30 min for the three formats.
+2. Bundles the (now stapled) artefacts into the release zip.
+
+Notarisation is auto-skipped if the `.env` values are still template placeholders, so the script also works for contributors who only have an ad-hoc local build.
 
 Reads `plugin/build/SA3_artefacts/Release/` and emits two files in `plugin/build/release_assets/`:
 
 | File | Purpose |
 |------|---------|
-| `SA3-Variations-plugins.zip` | the three bundles + a `README.txt` |
+| `SA3-Variations-plugins.zip` | the three (stapled, if notarised) bundles + a `README.txt` |
 | `install_models.sh` | end-user download script (pulls from HuggingFace) |
 
 ## Hosting the safetensors on HuggingFace
@@ -110,9 +131,7 @@ huggingface-cli upload maxgraf/sa3-variations-models \
    - `SA3 Variations.app` → `/Applications/`
    - `SA3 Variations.vst3` → `~/Library/Audio/Plug-Ins/VST3/`
    - `SA3 Variations.component` → `~/Library/Audio/Plug-Ins/Components/`
-4. **First launch** of the standalone (or first scan of the AU/VST3 in a DAW) shows a Gatekeeper warning because we don't notarise. Bypass:
-   - **Right-click** → **Open** → confirm. macOS remembers per bundle.
-   - DAWs typically run plugin scans non-interactively; if a host refuses to load on first scan, launch the standalone once to whitelist the signing identity, then rescan.
+4. If the release was notarised, the bundles launch with no warning the first time. If not, **first launch** shows a Gatekeeper warning — bypass via **right-click** → **Open** → confirm; macOS remembers per bundle.
 
 ## Where models are looked up at runtime
 
@@ -123,6 +142,5 @@ Resolution order (see `resolveModelsDir()` in `plugin/Source/VariationsEngine.cp
 
 ## Known limitations
 
-- **No notarisation**: every fresh download triggers a Gatekeeper warning. Acceptable for a demo; rolling notarisation in later is a one-line addition to vendor_bundle.sh (`xcrun notarytool submit`).
 - **arm64 only**: MLX is Apple Silicon-only. Intel Macs cannot run this.
 - **macOS 13.5+** only — driven by MLX's own minimum.

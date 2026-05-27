@@ -9,6 +9,10 @@
 #              -DSA3_CODESIGN_IDENTITY="Developer ID Application: …" && \
 #     cmake --build . --target SA3_Standalone SA3_VST3 SA3_AU -j
 #
+# Notarization runs automatically if plugin/.env contains valid
+# APPLE_ID / APPLE_TEAM_ID / APPLE_APP_PASSWORD entries. Skip notarization
+# by passing --no-notarize (or simply leaving .env unfilled).
+#
 # Outputs:
 #   plugin/build/release_assets/SA3-Variations-plugins.zip   (~450 MB)
 #   plugin/build/release_assets/install_models.sh
@@ -16,9 +20,28 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."   # plugin/
 
+# Pull APPLE_* and SA3_* credentials out of plugin/.env if present.
+if [[ -f .env ]]; then
+    set -a; source .env; set +a
+fi
+
 BUILD=build
 ART="$BUILD/SA3_artefacts/Release"
 OUT="$BUILD/release_assets"
+
+# Decide whether to notarize. We skip if .env values are still
+# placeholders OR if --no-notarize was passed on the command line.
+notarize=1
+for arg in "$@"; do
+    [[ "$arg" == "--no-notarize" ]] && notarize=0
+done
+for v in APPLE_ID APPLE_TEAM_ID APPLE_APP_PASSWORD; do
+    if [[ -z "${!v:-}" ]] || [[ "${!v}" == "FILL_ME_IN"* ]] \
+                          || [[ "${!v}" == "xxxx-"* ]]      \
+                          || [[ "${!v}" == "XXXXXXXXXX" ]]; then
+        notarize=0
+    fi
+done
 
 if [[ ! -d "$ART/Standalone/SA3 Variations.app" ]]; then
     echo "error: build artefacts missing at $ART — run cmake --build first" >&2
@@ -26,6 +49,21 @@ if [[ ! -d "$ART/Standalone/SA3 Variations.app" ]]; then
 fi
 
 rm -rf "$OUT" && mkdir -p "$OUT"
+
+# Notarize each bundle in-place before zipping into the release archive.
+# Each notarytool submit blocks on Apple's service (~1-10 min). Serialised
+# here for readable output; parallel would shave a few minutes off.
+if [[ "$notarize" == "1" ]]; then
+    for b in "$ART/Standalone/SA3 Variations.app" \
+             "$ART/VST3/SA3 Variations.vst3" \
+             "$ART/AU/SA3 Variations.component"; do
+        echo
+        echo "############ Notarizing $b ############"
+        scripts/notarize.sh "$b"
+    done
+else
+    echo "(skipping notarization — .env credentials not set or --no-notarize passed)"
+fi
 
 echo "==> Plugins archive"
 TMP=$(mktemp -d)

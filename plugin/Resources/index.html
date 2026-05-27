@@ -30,6 +30,12 @@
               aria-label="Dismiss">×</button>
     </div>
 
+    <!-- Single persistent file picker. WKWebView won't fire `change` on a
+         dynamically-created-and-clicked input unless it's actually in the
+         DOM, so we keep one node around hidden. -->
+    <input type="file" id="file-picker" hidden
+           accept="audio/wav,audio/aiff,audio/flac,audio/ogg,.wav,.aiff,.aif,.flac,.ogg" />
+
     <!-- Source: shared between empty/loaded states. The whole div is the
          drop target; .empty centres the prompt, .loaded shows the source
          waveform + play head + duration. -->
@@ -89,6 +95,7 @@
         <input type="range" id="noise" min="0.10" max="0.90" step="0.01" value="0.45" />
         <span class="val" id="noise-value">0.45</span>
       </div>
+      <div class="noise-hint" id="noise-hint"></div>
 
       <button type="button" class="gen" id="generate" disabled>
         <span class="gen-label">Generate 5 variations</span>

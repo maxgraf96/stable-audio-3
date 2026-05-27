@@ -65,7 +65,7 @@ else
     echo "(skipping notarization — .env credentials not set or --no-notarize passed)"
 fi
 
-echo "==> Plugins archive"
+echo "==> Plugins DMG"
 TMP=$(mktemp -d)
 cp -R "$ART/Standalone/SA3 Variations.app"     "$TMP/"
 cp -R "$ART/VST3/SA3 Variations.vst3"          "$TMP/"
@@ -86,19 +86,32 @@ SA3 Variations — install
    It downloads ~6.4 GB of model weights from HuggingFace into:
      ~/Library/Application Support/SA3 Variations/models/
 
-3. First launch shows a Gatekeeper warning because this build isn't
-   notarised. Right-click the .app / .vst3 / .component → Open → confirm.
-   macOS remembers the choice per bundle.
-
 Requires Apple Silicon Mac on macOS 13.5+.
 EOF
-(cd "$TMP" && zip -r -y "$OLDPWD/$OUT/SA3-Variations-plugins.zip" \
-    "SA3 Variations.app" \
-    "SA3 Variations.vst3" \
-    "SA3 Variations.component" \
-    "README.txt")
+# Ship as DMG, not ZIP. The ZIP format cannot reliably carry the macOS
+# extended attributes where mlx.metallib's code signature is stored
+# (Format=generic, not Mach-O → no embedded sig, signature in xattrs).
+# Any unzip tool other than `ditto -x` strips those xattrs and the
+# bundle becomes Gatekeeper-rejected on the user's machine. A DMG is a
+# filesystem image, so xattrs survive verbatim regardless of how the
+# user mounts it.
+DMG="$OUT/SA3-Variations-plugins.dmg"
+rm -f "$DMG"
+hdiutil create \
+    -srcfolder "$TMP" \
+    -volname   "SA3 Variations" \
+    -format    UDZO \
+    -fs        HFS+ \
+    -quiet \
+    "$DMG"
 rm -rf "$TMP"
-ls -lh "$OUT/SA3-Variations-plugins.zip"
+# Optional: sign the DMG itself with the same Developer ID. Gatekeeper
+# checks both the DMG signature and the bundles inside on mount.
+if [[ -n "${SA3_CODESIGN_IDENTITY:-}" && "$SA3_CODESIGN_IDENTITY" != "-" \
+   && "$SA3_CODESIGN_IDENTITY" != "Developer ID Application: Your Name "* ]]; then
+    codesign --force --sign "$SA3_CODESIGN_IDENTITY" --timestamp "$DMG"
+fi
+ls -lh "$DMG"
 
 echo
 echo "==> install_models.sh"

@@ -88,8 +88,10 @@ Reads `plugin/build/SA3_artefacts/Release/` and emits two files in `plugin/build
 
 | File | Purpose |
 |------|---------|
-| `SA3-Variations-plugins.zip` | the three (stapled, if notarised) bundles + a `README.txt` |
+| `SA3-Variations-plugins.dmg` | the three (stapled, if notarised) bundles + a `README.txt` |
 | `install_models.sh` | end-user download script (pulls from HuggingFace) |
+
+We ship a DMG rather than a ZIP because `mlx.metallib` is not a Mach-O — its code signature is stored in extended attributes (`com.apple.cs.CodeSignature` etc.), and the ZIP format silently strips those. A DMG is a filesystem image, so xattrs survive the round-trip regardless of how the end-user mounts it.
 
 ## Hosting the safetensors on HuggingFace
 
@@ -120,18 +122,18 @@ huggingface-cli upload maxgraf/sa3-variations-models \
 ## End-user install steps
 
 1. Open the release page on GitHub. Download:
-   - `SA3-Variations-plugins.zip`
+   - `SA3-Variations-plugins.dmg`
    - `install_models.sh`
 2. In Terminal:
    ```
    chmod +x install_models.sh && ./install_models.sh
    ```
    Pulls all four safetensors (~6.4 GB) from HuggingFace into `~/Library/Application Support/SA3 Variations/models/`. Idempotent — re-run to resume after interruption.
-3. Unzip the plugins archive and drag:
+3. Double-click the DMG to mount it, then drag:
    - `SA3 Variations.app` → `/Applications/`
    - `SA3 Variations.vst3` → `~/Library/Audio/Plug-Ins/VST3/`
    - `SA3 Variations.component` → `~/Library/Audio/Plug-Ins/Components/`
-4. If the release was notarised, the bundles launch with no warning the first time. If not, **first launch** shows a Gatekeeper warning — bypass via **right-click** → **Open** → confirm; macOS remembers per bundle.
+4. If the release was notarised, the bundles launch with no warning. If not, **first launch** shows a Gatekeeper warning — bypass via **right-click** → **Open** → confirm; macOS remembers per bundle.
 
 ## Where models are looked up at runtime
 

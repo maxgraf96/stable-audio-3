@@ -37,6 +37,26 @@ if [[ ! -d "$bundle" ]]; then
     exit 1
 fi
 
+# Sanity-check: the inner binary must carry the hardened-runtime flag.
+# Apple's notary has occasionally accepted bundles without it, but
+# Gatekeeper rejects them at launch time inside hardened-runtime hosts
+# (Ableton, Logic) — the exact symptom that bit us. Fail fast so we
+# never upload a half-signed build.
+#
+# We capture into a variable and pattern-match rather than piping
+# codesign | grep -q, because grep -q exits early, codesign then catches
+# SIGPIPE (exit 141), and with `pipefail` the pipeline reports failure
+# even though the pattern was matched. Capturing avoids the pipe entirely.
+inner_bin=$(find "$bundle/Contents/MacOS" -maxdepth 1 -type f | head -1)
+if [[ -n "$inner_bin" ]]; then
+    cs_out=$(codesign -dvvv "$inner_bin" 2>&1 || true)
+    if [[ "$cs_out" != *"flags=0x10000(runtime)"* ]]; then
+        echo "error: hardened runtime NOT set on $inner_bin" >&2
+        echo "       rebuild after vendor_bundle.sh applies --options=runtime" >&2
+        exit 1
+    fi
+fi
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 zip_path="$tmp/$(basename "$bundle").zip"

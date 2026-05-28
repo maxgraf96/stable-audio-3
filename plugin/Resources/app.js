@@ -997,7 +997,14 @@ generateBtn.addEventListener("click", async () => {
     updateButton();                               // disables immediately
 
     try {
-        await stop();
+        // Keep the original sample playing through generation so the user
+        // can listen while they wait. Only stop if a *variation* is
+        // playing (its buffer is about to be regenerated). playingIdx:
+        // -1 = source, 0..4 = variation. The engine independently leaves
+        // source playback untouched during doGenerate.
+        if (state.playingIdx >= 0) {
+            await stop();
+        }
         clearError();
 
         // Snap the progress bar back to 0 *with no transition* so the fresh

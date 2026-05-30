@@ -145,6 +145,42 @@ def sample_flow_pingpong(model_fn, x: mx.array, sigmas: mx.array, seed: int = 0,
     return x
 
 
+def sample_flow_euler(model_fn, x: mx.array, sigmas: mx.array, seed: int = 0,
+                      paste_back: tuple | None = None, on_step=None) -> mx.array:
+    """Deterministic Euler sampler for rectified-flow / rf_denoiser models.
+
+    Per step i (i = 0 .. num_steps-1):
+        v = model_fn(x, t_curr)
+        x = x + (t_next - t_curr) * v          # t_next < t_curr, so x moves toward x0
+
+    No per-step noise injection (contrast sample_flow_pingpong, which fully
+    denoises then re-noises with fresh noise each step). Given a fixed init `x`,
+    the trajectory is fully deterministic — this is the clean ODE step a
+    streaming ring buffer carries per slot. At the final step (t_next=0) this
+    reduces to x = x - t_curr*v = denoised, matching pingpong's last step.
+
+    `seed` is accepted only for signature parity with sample_flow_pingpong
+    (Euler draws no noise, so it is unused).
+    """
+    num_steps = sigmas.shape[0] - 1
+    for i in range(num_steps):
+        t_curr = sigmas[i]
+        t_next = sigmas[i + 1]
+        t_tensor = t_curr * mx.ones((x.shape[0],), dtype=x.dtype)
+        v = model_fn(x, t_tensor)
+        x = x + (t_next - t_curr).astype(x.dtype) * v
+        mx.eval(x)
+        if on_step is not None:
+            on_step(i + 1, num_steps)
+
+    if paste_back is not None:
+        init_latents, mask = paste_back
+        m = mask.astype(x.dtype)
+        x = init_latents.astype(x.dtype) * m + x * (1.0 - m)
+        mx.eval(x)
+    return x
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Patched pretransform decode: [B, 512, T*16] → [B, 2, T*4096]
 # ─────────────────────────────────────────────────────────────────────────

@@ -30,10 +30,18 @@ add_library(dit STATIC dit.cpp)
 target_link_libraries(dit PUBLIC mlx)
 target_include_directories(dit PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+add_library(dit_sm STATIC dit_sm.cpp)
+target_link_libraries(dit_sm PUBLIC mlx)
+target_include_directories(dit_sm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+add_library(sames STATIC sames_common.cpp sames_encoder.cpp sames_decoder.cpp)
+target_link_libraries(sames PUBLIC mlx)
+target_include_directories(sames PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
 # End-to-end orchestrator: ties T5Gemma + conditioner + DiT + SAME-L decoder
 # into a single Pipeline and exposes a CLI.  Depends on every other static lib.
 add_library(sa3_orchestrator STATIC sa3_orchestrator.cpp)
-target_link_libraries(sa3_orchestrator PUBLIC t5gemma dit samel sa3_pipeline)
+target_link_libraries(sa3_orchestrator PUBLIC t5gemma dit dit_sm samel sames sa3_pipeline)
 target_include_directories(sa3_orchestrator PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # SentencePiece — used for the T5Gemma::encode wrapper that tokenizes strings
@@ -76,13 +84,25 @@ target_link_libraries(test_t5gemma_encode PRIVATE t5gemma samel)
 add_executable(test_dit test_dit.cpp)
 target_link_libraries(test_dit PRIVATE dit samel)
 
+add_executable(test_dit_sm test_dit_sm.cpp)
+target_link_libraries(test_dit_sm PRIVATE dit_sm samel)
+
+add_executable(test_sames_decoder test_sames_decoder.cpp)
+target_link_libraries(test_sames_decoder PRIVATE sames samel)
+
+add_executable(test_sames_encoder test_sames_encoder.cpp)
+target_link_libraries(test_sames_encoder PRIVATE sames samel)
+
 add_executable(sa3_cli sa3_cli.cpp)
 target_link_libraries(sa3_cli PRIVATE sa3_orchestrator)
+
+add_executable(test_sm_e2e test_sm_e2e.cpp)
+target_link_libraries(test_sm_e2e PRIVATE sa3_orchestrator)
 
 # The MLX dylib lives in the venv; embed its directory as an rpath so the
 # binaries find libmlx.dylib without DYLD_LIBRARY_PATH gymnastics.
 get_filename_component(MLX_LIB_DIR "${MLX_VENV_CMAKE}/../../../lib" ABSOLUTE)
-foreach(tgt spike test_sa3_pipeline test_samel_encoder test_samel_decoder test_t5gemma test_t5gemma_encode test_dit sa3_cli)
+foreach(tgt spike test_sa3_pipeline test_samel_encoder test_samel_decoder test_t5gemma test_t5gemma_encode test_dit test_dit_sm test_sames_decoder test_sames_encoder sa3_cli test_sm_e2e)
     set_target_properties(${tgt} PROPERTIES
         INSTALL_RPATH "${MLX_LIB_DIR}"
         BUILD_RPATH   "${MLX_LIB_DIR}")

@@ -15,9 +15,12 @@
 #include <utility>
 
 #include "dit.h"
+#include "dit_sm.h"
 #include "sa3_pipeline.h"
 #include "samel_decoder.h"
 #include "samel_encoder.h"
+#include "sames_decoder.h"
+#include "sames_encoder.h"
 #include "t5gemma.h"
 
 namespace sa3 {
@@ -27,6 +30,10 @@ namespace mx = mlx::core;
 
 constexpr int SAMPLE_RATE        = 44100;
 constexpr int SAMPLES_PER_LATENT = 4096;   // PatchedPretransform 256 × SAME 16× expansion
+
+// Model family: medium DiT + SAME-L codec, or sm-music DiT + SAME-S codec.
+// Both share T5Gemma, the conditioner, the pingpong sampler, and CFG/APG math.
+enum class Family { Medium, SmMusic };
 
 // Source audio for a2a / inpaint generation. Layout matches MLX/Python:
 // planar channels-first, normalized fp32 in [-1, 1] at SAMPLE_RATE.
@@ -39,9 +46,15 @@ struct InitAudio {
 struct Pipeline {
     t5g::T5Gemma        t5;            // text encoder (fp16) + SentencePiece
     LoadedConditioner   conditioner;   // padding_embedding + seconds_embedder (baked into the DiT safetensors)
-    dit::DiT            dit;           // velocity-prediction model (fp16 by default)
-    samel::SAMELEncoder encoder;       // audio → SAME-L latents (fp32, used for init_audio)
-    samel::SAMELDecoder decoder;       // SAME-L latents → audio (fp32)
+    Family              family;        // which model set below is populated
+    // Medium family (DiT-medium + SAME-L). Populated when family == Medium.
+    std::optional<dit::DiT>            dit_medium;
+    std::optional<samel::SAMELEncoder> samel_encoder;   // audio → latents (fp32, init_audio only)
+    std::optional<samel::SAMELDecoder> samel_decoder;   // latents → audio (fp32)
+    // SmMusic family (DiT-sm-music + SAME-S). Populated when family == SmMusic.
+    std::optional<dit_sm::DiT>           dit_small;
+    std::optional<sames::SAMESEncoder>   sames_encoder;
+    std::optional<sames::SAMESDecoder>   sames_decoder;
     mx::Dtype           dit_dtype;     // dtype the DiT was loaded at — drives noise/sample dtype
 
     // Generate audio.
@@ -69,12 +82,14 @@ struct Pipeline {
 };
 
 // Load the full pipeline from four safetensors paths. The DiT safetensors
-// also contains the conditioner under "cond.*" keys (extracted here).
+// also contains the conditioner under "cond.*" keys (extracted here). `family`
+// selects which DiT + codec are loaded (the encoder/decoder paths must match).
 Pipeline load_pipeline(
     const std::string& t5gemma_path,
     const std::string& dit_path,
-    const std::string& samel_encoder_path,
-    const std::string& samel_decoder_path,
+    const std::string& encoder_path,
+    const std::string& decoder_path,
+    Family    family   = Family::Medium,
     mx::Dtype dit_dtype = mx::float16);
 
 // ── Variation orchestration ──────────────────────────────────────────

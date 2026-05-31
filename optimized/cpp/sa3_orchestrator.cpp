@@ -64,9 +64,11 @@ static mx::array encode_init_audio(
                     mx::Shape{1, a.channels, target_samples},
                     mx::float32);
 
-    // patch + encode at fp32 (SAME-L encoder is loaded as fp32).
+    // patch + encode at fp32 (the codec encoder is loaded as fp32).
     mx::array patches = patch_audio(audio, /*patch_size=*/256);
-    mx::array init_latents = pipe.encoder(patches);
+    mx::array init_latents = (pipe.family == Family::Medium)
+        ? (*pipe.samel_encoder)(patches)
+        : (*pipe.sames_encoder)(patches);
     mx::eval(init_latents);
     return mx::astype(init_latents, pipe.dit_dtype);
 }
@@ -84,10 +86,14 @@ mx::array Pipeline::generate(
     std::optional<InitAudio> init_audio,
     std::optional<std::pair<float, float>> inpaint_range_seconds) const
 {
-    // 1. T_lat from seconds. SAME-L has no even-T_lat constraint.
-    const int T_lat = std::max(1, static_cast<int>(
+    // 1. T_lat from seconds. SAME-S requires even T_lat (internal T*17 aligns to
+    //    34); SAME-L has no such constraint.
+    int T_lat = std::max(1, static_cast<int>(
         std::ceil(seconds * static_cast<float>(SAMPLE_RATE) /
                   static_cast<float>(SAMPLES_PER_LATENT))));
+    if (family == Family::SmMusic && (T_lat % 2 != 0)) {
+        T_lat += 1;
+    }
 
     // 2. T5Gemma encode → cross_attn (1, 257, 768) + global_cond (1, 768).
     auto enc = t5.encode({prompt}, /*max_len=*/256);
@@ -164,11 +170,18 @@ mx::array Pipeline::generate(
     }
 
     // 7. model_fn — wraps DiT call, with optional batched CFG + APG.
-    //    Matches optimized/mlx/scripts/sa3_mlx.py exactly.
-    const auto& dit_local = dit;
+    //    Matches optimized/mlx/scripts/sa3_mlx.py exactly. dit_forward branches
+    //    on family; the call signatures of dit::DiT and dit_sm::DiT are identical.
+    auto dit_forward = [&](const mx::array& xx, const mx::array& tt,
+                           const mx::array& cc, const mx::array& gg,
+                           const std::optional<mx::array>& ll) -> mx::array {
+        return (family == Family::Medium)
+            ? (*dit_medium)(xx, tt, cc, gg, ll)
+            : (*dit_small)(xx, tt, cc, gg, ll);
+    };
     ModelFn model_fn = [&](const mx::array& x, const mx::array& t) -> mx::array {
         if (cfg == 1.0f) {
-            return dit_local(x, t, cross_attn, global_cond, local_add_cond);
+            return dit_forward(x, t, cross_attn, global_cond, local_add_cond);
         }
         // Batched cond + uncond forward in one DiT call. local_add_cond is
         // duplicated along batch dim to match (cf. sa3_mlx.py model_fn).
@@ -180,7 +193,7 @@ mx::array Pipeline::generate(
         mx::array t2     = mx::concatenate({t, t}, 0);
         mx::array cross2 = mx::concatenate({cross_attn, null_cross_attn}, 0);
         mx::array glob2  = mx::concatenate({global_cond, global_cond}, 0);
-        mx::array v_batched = dit_local(x2, t2, cross2, glob2, lac2);
+        mx::array v_batched = dit_forward(x2, t2, cross2, glob2, lac2);
         auto parts = mx::split(v_batched, 2, /*axis=*/0);
         mx::array cond_v   = parts[0];
         mx::array uncond_v = parts[1];
@@ -219,11 +232,13 @@ mx::array Pipeline::generate(
                                               /*seed=*/seed + 1, paste_back);
     mx::eval(latents);
 
-    // 7. Decode at fp32 (SAME-L is loaded as fp32).
+    // 7. Decode at fp32 (the codec decoder is loaded as fp32). Codec-specific
+    //    chunk params: SAME-L (128, 8), SAME-S (8, 2). chunked is safe for any
+    //    size — falls through to single-shot when T_lat ≤ kernel.
     mx::array latents_fp32 = mx::astype(latents, mx::float32);
-    // chunked is safe for any size — falls through to single-shot when T_lat ≤ kernel.
-    mx::array patches = samel::decode_chunked(decoder, latents_fp32,
-                                              /*chunk_size=*/128, /*overlap=*/8);
+    mx::array patches = (family == Family::Medium)
+        ? samel::decode_chunked(*samel_decoder, latents_fp32, /*chunk=*/128, /*overlap=*/8)
+        : sames::decode_chunked(*sames_decoder, latents_fp32, /*chunk=*/8,   /*overlap=*/2);
     mx::eval(patches);
 
     // 8. Unpatch (B, 512, T_lat*16) → (B, 2, T_lat*4096).
@@ -250,37 +265,48 @@ mx::array Pipeline::generate(
 Pipeline load_pipeline(
     const std::string& t5gemma_path,
     const std::string& dit_path,
-    const std::string& samel_encoder_path,
-    const std::string& samel_decoder_path,
+    const std::string& encoder_path,
+    const std::string& decoder_path,
+    Family    family,
     mx::Dtype dit_dtype)
 {
     // T5Gemma (fp16 by Python default; encoder + SentencePiece in one go)
     auto t5_loaded = mx::load_safetensors(t5gemma_path);
     auto t5 = t5g::load_t5gemma(t5_loaded.first, mx::float16);
 
-    // DiT (+ conditioner baked into the same safetensors under "cond.*")
+    // DiT (+ conditioner baked into the same safetensors under "cond.*").
+    // Conditioner is family-agnostic (both DiTs share cond_token_dim=768 etc).
     auto dit_loaded = mx::load_safetensors(dit_path);
     auto& dit_tensors = dit_loaded.first;
     auto conditioner = load_conditioner(dit_tensors, /*prefix=*/"cond.");
-    auto dit = dit::load_dit(dit_tensors, /*T_lat=*/320, dit_dtype);
 
-    // SAME-L encoder (fp32, matches Python sa3_mlx.py defaults — used only
-    // for init_audio paths; text-to-audio runs ignore it).
-    auto enc_loaded = mx::load_safetensors(samel_encoder_path);
-    auto encoder = samel::load_samel_encoder(enc_loaded.first, mx::float32);
+    // Codec encode/decode safetensors (fp32, matches Python sa3_mlx.py defaults —
+    // the encoder is used only for init_audio paths).
+    auto enc_loaded = mx::load_safetensors(encoder_path);
+    auto dec_loaded = mx::load_safetensors(decoder_path);
 
-    // SAME-L decoder (fp32, matches Python sa3_mlx.py defaults)
-    auto dec_loaded = mx::load_safetensors(samel_decoder_path);
-    auto decoder = samel::load_samel_decoder(dec_loaded.first, mx::float32);
-
-    return Pipeline{
-        std::move(t5),
-        std::move(conditioner),
-        std::move(dit),
-        std::move(encoder),
-        std::move(decoder),
-        dit_dtype,
+    Pipeline p{
+        /*t5=*/           std::move(t5),
+        /*conditioner=*/  std::move(conditioner),
+        /*family=*/       family,
+        /*dit_medium=*/   std::nullopt,
+        /*samel_encoder=*/std::nullopt,
+        /*samel_decoder=*/std::nullopt,
+        /*dit_small=*/    std::nullopt,
+        /*sames_encoder=*/std::nullopt,
+        /*sames_decoder=*/std::nullopt,
+        /*dit_dtype=*/    dit_dtype,
     };
+    if (family == Family::Medium) {
+        p.dit_medium    = dit::load_dit(dit_tensors, /*T_lat=*/320, dit_dtype);
+        p.samel_encoder = samel::load_samel_encoder(enc_loaded.first, mx::float32);
+        p.samel_decoder = samel::load_samel_decoder(dec_loaded.first, mx::float32);
+    } else {
+        p.dit_small     = dit_sm::load_dit(dit_tensors, /*T_lat=*/320, dit_dtype);
+        p.sames_encoder = sames::load_sames_encoder(enc_loaded.first, mx::float32);
+        p.sames_decoder = sames::load_sames_decoder(dec_loaded.first, mx::float32);
+    }
+    return p;
 }
 
 // ── save_wav_pcm16 ───────────────────────────────────────────────────

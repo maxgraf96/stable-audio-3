@@ -46,6 +46,7 @@ struct Args {
     std::string decoder_path;
     std::string out_path         = "out.wav";
     std::string dit_dtype        = "fp16";
+    std::string family           = "medium";   // "medium" (SAME-L) | "sm-music" (SAME-S)
     std::string init_audio_path;
     std::string inpaint_range_str;
     // --init-noise-level is an alias for --sigma-max when --init-audio is
@@ -119,6 +120,7 @@ bool parse_args(int argc, char** argv, Args& args) {
         else if (a == "--init-audio")       args.init_audio_path = next();
         else if (a == "--inpaint-range")    args.inpaint_range_str = next();
         else if (a == "--dit-dtype")        args.dit_dtype       = next();
+        else if (a == "--family")           args.family          = next();
         else if (a == "--t5gemma")          args.t5gemma_path    = next();
         else if (a == "--dit")              args.dit_path        = next();
         else if (a == "--encoder")          args.encoder_path    = next();
@@ -193,10 +195,14 @@ int main(int argc, char** argv) {
 
     const mx::Dtype dit_dtype = parse_dtype(args.dit_dtype);
 
+    const sa3::orch::Family fam =
+        (args.family == "sm-music" || args.family == "sm")
+            ? sa3::orch::Family::SmMusic : sa3::orch::Family::Medium;
+
     auto t_load_0 = std::chrono::steady_clock::now();
     auto pipe = sa3::orch::load_pipeline(
         args.t5gemma_path, args.dit_path, args.encoder_path, args.decoder_path,
-        dit_dtype);
+        fam, dit_dtype);
     std::cerr << "[sa3] models loaded in " << elapsed_seconds(t_load_0) << "s\n";
 
     // Optionally read init audio. read_wav_pcm16 returns planar (channels,

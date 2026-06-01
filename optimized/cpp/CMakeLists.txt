@@ -38,6 +38,19 @@ add_library(sames STATIC sames_common.cpp sames_encoder.cpp sames_decoder.cpp)
 target_link_libraries(sames PUBLIC mlx)
 target_include_directories(sames PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Streaming engine (ring buffer + per-step solver primitives). Depends on
+# sa3_pipeline for build_pingpong_schedule. Model-agnostic via DiTForward.
+add_library(stream STATIC stream_ode.cpp stream.cpp)
+target_link_libraries(stream PUBLIC mlx sa3_pipeline)
+target_include_directories(stream PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Real-time runtime: AudioRing (pure C++) + StreamGenerator (owns MLX, drives the
+# stream engine + orchestrator models, fills the ring). The continuous-audio
+# layer that turns the engine into a playable instrument.
+add_library(stream_runtime STATIC audio_ring.cpp stream_generator.cpp)
+target_link_libraries(stream_runtime PUBLIC mlx stream sa3_orchestrator)
+target_include_directories(stream_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
 # End-to-end orchestrator: ties T5Gemma + conditioner + DiT + SAME-L decoder
 # into a single Pipeline and exposes a CLI.  Depends on every other static lib.
 add_library(sa3_orchestrator STATIC sa3_orchestrator.cpp)
@@ -93,6 +106,12 @@ target_link_libraries(test_sames_decoder PRIVATE sames samel)
 add_executable(test_sames_encoder test_sames_encoder.cpp)
 target_link_libraries(test_sames_encoder PRIVATE sames samel)
 
+add_executable(test_stream_parity test_stream_parity.cpp)
+target_link_libraries(test_stream_parity PRIVATE stream dit_sm samel sa3_pipeline)
+
+add_executable(test_stream_runtime test_stream_runtime.cpp)
+target_link_libraries(test_stream_runtime PRIVATE stream_runtime)
+
 add_executable(sa3_cli sa3_cli.cpp)
 target_link_libraries(sa3_cli PRIVATE sa3_orchestrator)
 
@@ -102,7 +121,7 @@ target_link_libraries(test_sm_e2e PRIVATE sa3_orchestrator)
 # The MLX dylib lives in the venv; embed its directory as an rpath so the
 # binaries find libmlx.dylib without DYLD_LIBRARY_PATH gymnastics.
 get_filename_component(MLX_LIB_DIR "${MLX_VENV_CMAKE}/../../../lib" ABSOLUTE)
-foreach(tgt spike test_sa3_pipeline test_samel_encoder test_samel_decoder test_t5gemma test_t5gemma_encode test_dit test_dit_sm test_sames_decoder test_sames_encoder sa3_cli test_sm_e2e)
+foreach(tgt spike test_sa3_pipeline test_samel_encoder test_samel_decoder test_t5gemma test_t5gemma_encode test_dit test_dit_sm test_sames_decoder test_sames_encoder sa3_cli test_sm_e2e test_stream_parity test_stream_runtime)
     set_target_properties(${tgt} PROPERTIES
         INSTALL_RPATH "${MLX_LIB_DIR}"
         BUILD_RPATH   "${MLX_LIB_DIR}")

@@ -18,6 +18,10 @@ namespace rt {
 
 static constexpr int CYCLIC_PAD = 8;   // latent frames of wrap-around context
 
+// Amount -> img2img init sigma (defined after the class methods; forward-declared so
+// setup()/submit_morph() can use it).
+static float sigma_for_amount(float amount, float intensity);
+
 // ── length plan: gen = loop + 2*margin, all even for SAME-S ──────────
 static void plan_lengths(float seconds, float margin_s, int& gen_T,
                          int& margin_T, int& loop_T) {
@@ -87,12 +91,12 @@ void StreamGenerator::set_morph_amount(float v) {
     std::lock_guard<std::mutex> lk(ctrl_mutex_); morph_amount_ = v;
 }
 void StreamGenerator::set_style_intensity(float v) {
-    std::lock_guard<std::mutex> lk(ctrl_mutex_);
-    if (v != style_intensity_) { style_intensity_ = v; need_retarget_ = true; }
+    // Intensity caps Amount=1's sigma; applied to the NEXT submitted window.
+    std::lock_guard<std::mutex> lk(ctrl_mutex_); style_intensity_ = v;
 }
 void StreamGenerator::set_cfg(float v) {
-    std::lock_guard<std::mutex> lk(ctrl_mutex_);
-    if (v != cfg_styled_) { cfg_styled_ = v; need_retarget_ = true; }
+    // CFG applied to the NEXT submitted window.
+    std::lock_guard<std::mutex> lk(ctrl_mutex_); cfg_styled_ = v;
 }
 void StreamGenerator::set_shared_curve(const std::string& name, float value) {
     std::lock_guard<std::mutex> lk(ctrl_mutex_);
@@ -179,27 +183,21 @@ void StreamGenerator::setup() {
     pipe_ = std::make_unique<stream::StreamPipeline>(
         dit_fwd_, gen_T_, cfg_.steps, cfg_.depth, cfg_.dtype);
 
-    // Warm up chunk 0 so the first audio isn't a cold start.
+    // Warm up window 0 so the first audio isn't a cold start.
+    float A, intensity;
+    { std::lock_guard<std::mutex> lk(ctrl_mutex_); A = morph_amount_; intensity = style_intensity_; }
     if (scanning_) {
-        // Playthrough: per-chunk banked-target morph. Encode chunk 0's source, generate
-        // its styled target, pre-fill the buffer with the morph at the current Amount.
+        // Playthrough: window 0 is a clean img2img of source[0:] at sigma(Amount).
         apply_scan_controls();                       // re-encode prompt (if set) + velocity
-        cur_src_ = encode_window_latent(0 - crop_start_);   // chunk 0: interior starts at source 0
-        submit_target(*cur_src_);
+        mx::array src0 = encode_window_latent(0 - crop_start_);   // interior starts at source 0
+        submit_window(src0, sigma_for_amount(A, intensity));
         for (int i = 0; i < cfg_.steps + cfg_.depth + 2; ++i) {
             auto lat = pipe_->tick();
             if (lat.has_value()) { cur_latent_ = *lat; break; }
         }
-        float A; { std::lock_guard<std::mutex> lk(ctrl_mutex_); A = morph_amount_; }
-        if (cur_latent_.has_value()) {
-            mx::array lat = (A <= 1e-4f) ? *cur_src_
-                : *cur_src_ * mx::array(1.0f - A, cur_src_->dtype())
-                  + *cur_latent_ * mx::array(A, cur_latent_->dtype());
-            ring_.write_loop(decode_crop(lat));      // full-window initial fill
-        }
-        // chunk 1's target is built one-ahead by scan_tick's look-ahead (nxt_src_ empty).
+        if (cur_latent_.has_value()) ring_.write_loop(decode_crop(*cur_latent_));  // initial fill
+        // window 1 is built one-ahead by scan_tick's look-ahead (next_pending_ false).
     } else {
-        compute_styled_target();
         submit_morph();
         for (int i = 0; i < cfg_.steps + cfg_.depth + 2; ++i) {
             auto lat = pipe_->tick();
@@ -286,90 +284,43 @@ void StreamGenerator::encode_window(long start) {
     mx::eval(*init_latents_);
 }
 
-// Build the "wet" endpoint: a one-shot, full-strength styled generation of the
-// source (explore + CFG -> strong, clean transfer), banked as a latent. The live
-// loop then morphs the source toward THIS in latent space by Amount. Recomputed
-// whenever the Style or its intensity (Character) changes. No prompt -> no target
-// (Amount has nothing to morph toward -> the loop just reconstructs the source).
-void StreamGenerator::compute_styled_target() {
-    if (!prompt_active_ || !cross_.has_value() || !neg_cross_.has_value()) {
-        styled_target_.reset();
-        return;
-    }
-    float intensity, cfg_strength;
-    {
-        std::lock_guard<std::mutex> lk(ctrl_mutex_);
-        intensity = style_intensity_;
-        cfg_strength = cfg_styled_;
-    }
-    // Character -> how far the styled endpoint departs from the source (its
-    // sigma_max). 0.45 (recognizably the loop, restyled) .. 0.95 (wild).
-    const float style_denoise =
-        0.45f + 0.5f * std::max(0.0f, std::min(1.0f, intensity));
-
-    stream::StreamPipeline tgt(dit_fwd_, gen_T_, cfg_.steps, /*depth=*/1, cfg_.dtype);
-    stream::SlotRequest req{*cross_, *gcond_, cfg_.seed_base, style_denoise, *init_latents_};
-    req.sde_denoise_curve = stream::CurveValue{1.0f};   // explore (stochastic SDE path)
-    req.cfg = cfg_strength;
-    req.apg = cfg_.apg;
-    req.rcfg_mode = "full";
-    req.neg_cross_attn = *neg_cross_;
-    tgt.submit(req);
-    std::optional<mx::array> lat;
-    for (int i = 0; i < cfg_.steps + 2 && !lat.has_value(); ++i) lat = tgt.tick();
-    if (lat.has_value()) { mx::eval(*lat); styled_target_ = *lat; }
-    else styled_target_.reset();
-}
-
 void StreamGenerator::submit_morph() {
-    float amount, vs; bool has_vs; bool evolve;
+    float amount, intensity, vs; bool has_vs; bool evolve;
     {
         std::lock_guard<std::mutex> lk(ctrl_mutex_);
         amount = morph_amount_;
+        intensity = style_intensity_;
         has_vs = velocity_scale_.has_value(); vs = has_vs ? *velocity_scale_ : 1.0f;
         evolve = evolve_;
     }
     if (evolve) seed_ += 1;
     const uint64_t seed = evolve ? seed_ : cfg_.seed_base;
 
-    // Base = source-anchored reconstruction conditioned on the EMPTY prompt, so
-    // Amount=0 is the original loop (the Style feeds styled_target_, not the base).
-    // No sde curve -> the euler-x0 path, so the x0-target morph below is respected
-    // (an sde re-noise step would re-inject the source and discard the blend).
-    const mx::array& base_cross = (prompt_active_ && neg_cross_.has_value())
-        ? *neg_cross_ : *cross_;
-    stream::SlotRequest req{base_cross, *gcond_, seed, cfg_.denoise, *init_latents_};
-    if (has_vs) req.velocity_scale = stream::CurveValue{vs};      // Motion
-    // Amount = morph original->styled: blend the base x0 toward the banked styled
-    // latent in the refinement half. Strength is ALSO a shared curve (see
-    // apply_shared_curves) so a slider move lands on in-flight slots next tick.
-    if (styled_target_.has_value()) {
-        req.x0_target = *styled_target_;
-        req.x0_target_strength = stream::CurveValue{amount};
+    // Short-loop morph = clean img2img of the loop at sigma(Amount): Amount=0 ~ the
+    // original loop, Amount=1 ~ strongly styled toward the prompt. Same coherent path
+    // as the playthrough (no x0-target lerp / no sde source-blend — SA3 can't re-cohere
+    // those). Steady controls -> identical latent -> MSE-skip keeps the loop coherent.
+    stream::SlotRequest req{*cross_, *gcond_, seed, sigma_for_amount(amount, intensity), *init_latents_};
+    if (has_vs) req.velocity_scale = stream::CurveValue{vs};      // Motion (per-step v-scale, coherent)
+    if (prompt_active_ && neg_cross_.has_value()) {
+        req.cfg = cfg_styled_;
+        req.apg = cfg_.apg;
+        req.rcfg_mode = "full";
+        req.neg_cross_attn = *neg_cross_;
     }
     pipe_->submit(req);
 }
 
 void StreamGenerator::apply_shared_curves() {
-    float amount, vs; bool has_vs; bool retarget; std::optional<std::string> np;
+    float vs; bool has_vs; std::optional<std::string> np;
     {
         std::lock_guard<std::mutex> lk(ctrl_mutex_);
-        amount = morph_amount_;
         has_vs = velocity_scale_.has_value(); vs = has_vs ? *velocity_scale_ : 1.0f;
         np = new_prompt_; new_prompt_.reset();
-        retarget = need_retarget_; need_retarget_ = false;
     }
-    // Re-encode the prompt and/or rebuild the styled target BEFORE pushing curves
-    // (both run on this worker thread; the ring keeps playing meanwhile).
-    if (np.has_value()) { encode_prompt(*np); retarget = true; }
-    if (retarget) compute_styled_target();
-
-    // Amount morph strength: 1-tick onset on all in-flight slots (refinement-half
-    // gated). Cleared when there's no target (no Style -> nothing to morph toward).
-    if (styled_target_.has_value())
-        pipe_->set_shared_curve("x0_target_strength", stream::CurveValue{amount});
-    else
-        pipe_->clear_shared_curve("x0_target_strength");
+    // Re-encode the prompt on this worker thread (the ring keeps playing). Amount is
+    // baked into each window's init sigma at submit (per-request), not a shared curve.
+    if (np.has_value()) encode_prompt(*np);
     if (has_vs) pipe_->set_shared_curve("velocity_scale", stream::CurveValue{vs});
     else        pipe_->clear_shared_curve("velocity_scale");
 }
@@ -446,9 +397,10 @@ void StreamGenerator::static_tick() {
     }
 }
 
-// ── forward-streaming playthrough (DEMON-style) ──────────────────────
-// Amount rides the shared sde_denoise_curve (0=source-anchored, 1=explore/styled)
-// -> hits all in-flight slots, ~1-tick latency, no banked target on the hot path.
+// ── forward-streaming playthrough: streaming img2img ─────────────────
+// Each window is a clean img2img generation at sigma(Amount); Amount/Style/Intensity
+// are baked per-window at submit (per-window latency). Motion (velocity) is a 1-tick
+// per-step v-scale and stays a shared curve here.
 void StreamGenerator::apply_scan_controls() {
     bool has_vs; float vs; std::optional<std::string> np;
     {
@@ -456,21 +408,34 @@ void StreamGenerator::apply_scan_controls() {
         has_vs = velocity_scale_.has_value(); vs = has_vs ? *velocity_scale_ : 1.0f;
         np = new_prompt_; new_prompt_.reset();
     }
-    // A Style change re-encodes the prompt; subsequently-built chunk targets pick it
-    // up (held targets refresh as the playhead advances). Amount is NOT a curve here
-    // — it's the decode-time latent lerp toward the styled target.
+    // A Style change re-encodes the prompt; subsequently-built windows pick it up.
     if (np.has_value()) encode_prompt(*np);
     if (has_vs) pipe_->set_shared_curve("velocity_scale", stream::CurveValue{vs});
     else        pipe_->clear_shared_curve("velocity_scale");
 }
 
-void StreamGenerator::submit_target(const mx::array& source) {
-    // Styled TARGET generation for a chunk: full explore (sde=1) + CFG -> strong;
-    // generated ONCE per chunk and HELD as the Amount=1 endpoint of the latent morph.
-    // Deterministic (fixed seed) + held -> the playthrough is STABLE (no per-
-    // completion stochastic silence — that was the dropout bug).
-    stream::SlotRequest req{*cross_, *gcond_, cfg_.seed_base, cfg_.scan_denoise, source};
-    req.sde_denoise_curve = stream::CurveValue{1.0f};   // full explore
+// Amount -> img2img init sigma (sigma_max), the ONLY structure-vs-style knob SA3
+// supports coherently. The init is mixed ONCE (source*(1-sigma)+noise*sigma) and the
+// trajectory is a clean text-conditioned generation; SA3's DiT has no source input to
+// re-anchor to mid-trajectory (unlike ACE-Step/DEMON), so per-frame latent source-
+// blends produce off-manifold garbage (the "frequency sweep") — img2img does not.
+//   Amount=0 -> small sigma ~ source reconstruction (the "original");
+//   Amount=1 -> large sigma ~ strongly regenerated toward the Style prompt.
+// Intensity caps how far Amount=1 departs (sigma ceiling): subtle..wild.
+static float sigma_for_amount(float amount, float intensity) {
+    amount    = std::max(0.0f, std::min(1.0f, amount));
+    intensity = std::max(0.0f, std::min(1.0f, intensity));
+    const float sig_min = 0.08f;
+    const float sig_max = 0.55f + 0.40f * intensity;   // 0.55 (subtle) .. 0.95 (wild)
+    return sig_min + (sig_max - sig_min) * amount;
+}
+
+// Submit ONE clean windowed img2img generation: init-mix the source window to `sigma`,
+// then a text-conditioned euler trajectory to completion (NO sde source-blend, NO
+// x0-target morph). The FINISHED latent is decoded directly — never a mid-trajectory
+// or lerped latent. This is SA3's native, coherent a2a path.
+void StreamGenerator::submit_window(const mx::array& source, float sigma) {
+    stream::SlotRequest req{*cross_, *gcond_, cfg_.seed_base, sigma, source};
     if (prompt_active_ && neg_cross_.has_value()) {
         req.cfg = cfg_styled_;
         req.apg = cfg_.apg;
@@ -504,18 +469,6 @@ std::vector<std::vector<float>> StreamGenerator::decode_window(
     return out;
 }
 
-// Latent morph: lerp(src, tgt, amount) in latent space (Amount=0 -> source, 1 ->
-// styled target), then windowed-decode at the playhead. The lerp is cheap, so
-// Amount is ~1-tick (no regeneration).
-std::vector<std::vector<float>> StreamGenerator::decode_morph(
-        const mx::array& src, const mx::array& tgt, float amount, int off_frames, int win_frames) {
-    const float a = std::max(0.0f, std::min(1.0f, amount));
-    if (a <= 1e-4f)  return decode_window(src, off_frames, win_frames);
-    if (a >= 0.9999f) return decode_window(tgt, off_frames, win_frames);
-    mx::array lat = src * mx::array(1.0f - a, src.dtype()) + tgt * mx::array(a, tgt.dtype());
-    return decode_window(lat, off_frames, win_frames);
-}
-
 void StreamGenerator::scan_tick() {
     apply_scan_controls();
 
@@ -533,20 +486,23 @@ void StreamGenerator::scan_tick() {
     const long xfade_dur = (long)(0.6 * orch::SAMPLE_RATE);
     const long ph = ring_.total_read();
     const long base = last_boundary_pos_;
-    float A; { std::lock_guard<std::mutex> lk(ctrl_mutex_); A = morph_amount_; }
+    float A, intensity;
+    { std::lock_guard<std::mutex> lk(ctrl_mutex_); A = morph_amount_; intensity = style_intensity_; }
 
-    // LOOK-AHEAD: build the next chunk's source + styled target one chunk ahead. Its
-    // generation window starts a leading margin BEFORE its interior (so the intro
-    // fade lands in the margin), hence encode_window_latent(interior_start - margin).
-    if (!nxt_src_.has_value()) {
+    // LOOK-AHEAD: generate the NEXT window's img2img one chunk ahead. Its generation
+    // window starts a leading margin BEFORE its interior (so SA3's intro fade lands in
+    // the margin the playhead never decodes), hence encode_window_latent(start-margin).
+    // Amount is baked into this window's init sigma at submit time (per-window latency).
+    if (!next_pending_) {
         long ns = scan_start_ + hop;
         if (ns + loop_samples_ > (long)src_[0].size()) ns = 0;
         next_scan_ = ns;
         next_base_ = base + hop;
-        nxt_src_ = encode_window_latent(ns - crop_start_);
+        mx::array nsrc = encode_window_latent(ns - crop_start_);
         pipe_->clear();
-        submit_target(*nxt_src_);
+        submit_window(nsrc, sigma_for_amount(A, intensity));
         next_latent_.reset();
+        next_pending_ = true;
         xfade_start_ = -1;
     }
 
@@ -554,31 +510,31 @@ void StreamGenerator::scan_tick() {
     auto lat = pipe_->tick();
     double tick_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t0).count();
-    if (lat.has_value() && !next_latent_.has_value()) next_latent_ = *lat;   // next target sharp
+    if (lat.has_value() && !next_latent_.has_value()) next_latent_ = *lat;   // next window done
 
-    // Crossfade to the next chunk once the playhead enters the overlap AND the next
-    // target is ready (it is, with ~hop of lead time to generate it).
+    // Crossfade to the next window once the playhead enters the overlap AND the next
+    // window has finished generating (it has, with ~hop of lead time).
     const bool blending = ((ph + lead) - base >= hop) && next_latent_.has_value();
     if (blending && xfade_start_ < 0) xfade_start_ = ph;
 
-    // Frame-aligned INTERIOR position; the latent offset adds the leading margin so
-    // the playhead reads the chunk interior, never the intro/outro fade. cur & next
-    // round to the SAME frame and write to the SAME position -> no cancellation.
+    // Frame-aligned INTERIOR position; the latent offset adds the leading margin so the
+    // playhead reads the window interior, never the intro/outro fade. cur & next round
+    // to the SAME frame and write to the SAME position -> no cancellation.
     const long pos_f = std::max(0L, std::min((long)interior_f,
         (long)(((ph + lead) - base + SPL / 2) / SPL)));
     const int  off_cur_f = margin_f + (int)pos_f;
     const long write_pos = base + pos_f * SPL;
 
     double dec_ms = 0.0;
-    if (cur_src_.has_value() && cur_latent_.has_value()) {
+    if (cur_latent_.has_value()) {
         auto t1 = std::chrono::steady_clock::now();
-        // Output = latent morph lerp(source, styled target, Amount) at the playhead.
-        std::vector<std::vector<float>> out = decode_morph(*cur_src_, *cur_latent_, A, off_cur_f, win_f);
-        if (blending && xfade_start_ >= 0 && nxt_src_.has_value() && next_latent_.has_value()) {
-            // EQUAL-POWER crossfade to the next chunk's morph (identical source pos,
-            // also in its interior: off_next = margin + (interior pos - hop)).
+        // Output = the current window's FINISHED img2img latent, windowed at the playhead.
+        std::vector<std::vector<float>> out = decode_window(*cur_latent_, off_cur_f, win_f);
+        if (blending && xfade_start_ >= 0 && next_latent_.has_value()) {
+            // EQUAL-POWER crossfade to the next window (identical source pos, also in
+            // its interior: off_next = margin + (interior pos - hop)).
             const int off_next_f = margin_f + (int)std::max(0L, pos_f - hop_f);
-            auto nx = decode_morph(*nxt_src_, *next_latent_, A, off_next_f, win_f);
+            auto nx = decode_window(*next_latent_, off_next_f, win_f);
             const int ch = (int)out.size();
             for (int c = 0; c < ch; ++c) {
                 const std::vector<float>& ns = nx[std::min(c, (int)nx.size() - 1)];
@@ -596,14 +552,13 @@ void StreamGenerator::scan_tick() {
     }
 
     // Promote next -> cur once the crossfade completes; the look-ahead block then
-    // starts building the chunk AFTER next (nxt_src_ is reset).
+    // starts building the window AFTER next (next_pending_ cleared).
     if (blending && xfade_start_ >= 0 && ph >= xfade_start_ + xfade_dur) {
-        cur_src_ = nxt_src_;
         cur_latent_ = next_latent_;
         last_boundary_pos_ = next_base_;
         scan_start_ = next_scan_;
-        nxt_src_.reset();
         next_latent_.reset();
+        next_pending_ = false;
         xfade_start_ = -1;
     }
 

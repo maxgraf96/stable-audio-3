@@ -50,15 +50,10 @@ struct GenConfig {
     float    seconds      = 8.0f;
     int      steps        = 8;
     int      depth        = 2;
-    float    denoise      = 0.3f;    // STATIC-loop base trajectory: the init mix
-                                     // (source*(1-d)+noise*d) + euler steps that the
-                                     // banked-target morph blends toward the styled
-                                     // endpoint. Low so Amount=0 stays close to the
-                                     // original loop (the target has its own denoise).
-    float    scan_denoise = 0.85f;   // PLAYTHROUGH trajectory: per-frame styling needs
-                                     // room (sigma_max), so this is high; the sde curve
-                                     // (Amount) pulls back to source at Amount=0 and
-                                     // explores/styles at Amount=1. Tunable.
+    float    denoise      = 0.3f;    // (unused) legacy base sigma; Amount->sigma now maps
+                                     // the img2img init directly (see sigma_for_amount).
+    float    scan_denoise = 0.85f;   // (unused) legacy playthrough sigma; superseded by
+                                     // sigma_for_amount(Amount, Intensity).
     std::string prompt;
     uint64_t seed_base    = 1000;
     float    margin_s     = 0.0f;    // interior-windowing margin per side (0 = cyclic decode)
@@ -122,15 +117,12 @@ private:
     mx::array encode_window_latent(long start_sample);   // ...returns the latent (scan: per-chunk source)
     void static_tick();                     // one iteration: looping morph (source <= one window)
     void scan_tick();                       // one iteration: forward-streaming playthrough
-    void apply_scan_controls();             // re-encode prompt + velocity (Amount is the decode lerp)
-    void submit_target(const mx::array& source);  // styled-TARGET generation for a chunk (held, stable)
+    void apply_scan_controls();             // re-encode prompt + velocity (Amount = per-window sigma)
+    // Submit one clean windowed img2img (init-mix source to sigma, then text trajectory).
+    void submit_window(const mx::array& source, float sigma);
     // Windowed decode of a sub-range [off, off+win] (latent frames) -> planar audio.
     std::vector<std::vector<float>> decode_window(const mx::array& lat, int off_frames, int win_frames);
-    // Latent morph lerp(src,tgt,amount) then windowed-decode at the playhead.
-    std::vector<std::vector<float>> decode_morph(const mx::array& src, const mx::array& tgt,
-                                                 float amount, int off_frames, int win_frames);
-    void compute_styled_target();          // (re)build the banked styled latent (wet endpoint)
-    void submit_morph();
+    void submit_morph();                    // short-loop: clean img2img of the loop at sigma(Amount)
     void apply_shared_curves();
     std::vector<std::vector<float>> decode_crop(const mx::array& lat);
 
@@ -145,10 +137,9 @@ private:
 
     // Control state (guarded by ctrl_mutex_).
     mutable std::mutex ctrl_mutex_;
-    float morph_amount_   = 0.5f;           // Amount (0..1): original->styled blend
-    float style_intensity_ = 0.6f;          // Character (0..1): styled-target denoise
-    float cfg_styled_     = 2.0f;           // CFG strength for the styled-target pass
-    bool  need_retarget_  = false;          // recompute styled_target_ next tick
+    float morph_amount_   = 0.5f;           // Amount (0..1): img2img sigma = original->styled
+    float style_intensity_ = 0.6f;          // Intensity (0..1): caps Amount=1's sigma (departure)
+    float cfg_styled_     = 2.0f;           // CFG strength (text guidance) when a prompt is set
     std::optional<float> velocity_scale_;   // nullopt = inactive (Motion)
     std::optional<std::string> new_prompt_;
     bool evolve_;
@@ -157,7 +148,7 @@ private:
     // MLX/model state (worker thread only).
     std::unique_ptr<orch::Pipeline> pipe_models_;
     std::unique_ptr<stream::StreamPipeline> pipe_;
-    stream::DiTForward dit_fwd_;             // bound DiT, reused for the styled-target pass
+    stream::DiTForward dit_fwd_;             // bound DiT forward (model-agnostic)
     // Codec decode bound to the active family: (latents[1,256,T], chunk, ovl,
     // cyclic) -> patches [1,512,T*16]. Lets decode_crop stay family-agnostic.
     std::function<mx::array(const mx::array&, int, int, bool)> codec_decode_;
@@ -176,7 +167,6 @@ private:
     int chunk_ = 8, ovl_ = 2;  // codec decode params (SAME-S 8/2, SAME-L 128/2)
     uint64_t seed_ = 0;
     std::optional<mx::array> init_latents_;
-    std::optional<mx::array> styled_target_;   // banked styled latent (the "wet" endpoint)
     std::optional<mx::array> cross_;
     std::optional<mx::array> gcond_;
     std::optional<mx::array> neg_cross_;    // null (empty-prompt) conditioning for CFG
@@ -184,16 +174,14 @@ private:
     std::optional<mx::array> last_latent_;   // static-loop mode: last finished latent
     bool prompt_active_ = false;            // non-empty style prompt -> enable CFG
 
-    // Playthrough = stable banked-target morph per chunk. Each chunk has a SOURCE
-    // latent (_src_, the Amount=0 endpoint) and a styled TARGET latent (_latent_,
-    // the Amount=1 endpoint, generated ONCE and held -> stable, no per-completion
-    // stochastic silence). The output is a latent morph lerp(src,tgt,Amount) decoded
-    // at the playhead (Amount = 1-tick). The pipe builds the NEXT chunk's target one
-    // chunk ahead; at the overlap we crossfade cur->next.
-    std::optional<mx::array> cur_src_, cur_latent_;   // current chunk: source + styled target
-    std::optional<mx::array> nxt_src_, next_latent_;  // next chunk: source + styled target
-    bool transitioning_ = false;
-    long next_base_ = 0, next_scan_ = 0;     // incoming chunk's play-base / source-start
+    // Playthrough = streaming img2img. Each window is a clean img2img generation
+    // (init-mix at sigma(Amount), text-conditioned trajectory) banked as a FINISHED
+    // latent and windowed-decoded at the playhead. The pipe builds the NEXT window one
+    // window ahead (next_pending_); at the overlap we crossfade cur->next windows.
+    std::optional<mx::array> cur_latent_;    // current window: finished img2img latent
+    std::optional<mx::array> next_latent_;   // next window: finished img2img latent
+    bool next_pending_ = false;              // a next window is generating / ready
+    long next_base_ = 0, next_scan_ = 0;     // incoming window's play-base / source-start
     long xfade_start_ = -1;                  // playhead where the cur->next crossfade began
 };
 

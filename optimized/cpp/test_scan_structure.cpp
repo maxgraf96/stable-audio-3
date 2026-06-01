@@ -35,7 +35,7 @@ static mx::array to_mx(const std::vector<std::vector<float>>& planar) {
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr,
-            "usage: %s <models_dir> [amount=0] [prompt] [src_s=60] [win_s=10] [quality=0]\n", argv[0]);
+            "usage: %s <models_dir> [amount=0] [prompt] [src_s=60] [win_s=10] [quality=0] [rich=0] [cfg=2] [wav] [start_s=0]\n", argv[0]);
         return 2;
     }
     const std::string models_dir = argv[1];
@@ -46,31 +46,49 @@ int main(int argc, char** argv) {
     const bool quality = argc > 6 ? (std::stoi(argv[6]) != 0) : false;
     const bool rich = argc > 7 ? (std::stoi(argv[7]) != 0) : false;  // add rhythm/texture
     const float cfgv = argc > 8 ? std::stof(argv[8]) : 2.0f;         // CFG strength
+    const std::string wav = argc > 9 ? std::string(argv[9]) : "";    // real-audio source (44.1k/16-bit)
+    const float start_s = argc > 10 ? std::stof(argv[10]) : 0.0f;    // slice offset into the wav
 
     const int SR = orch::SAMPLE_RATE;
-    const int n = (int)(src_s * SR);
+    int n = (int)(src_s * SR);
 
-    // Stereo linear chirp f0->f1 over the whole source (so output freq -> source time)
-    // + slow 1 Hz tremolo. `rich` adds a 2 Hz kick + steady bass + hi-hat noise so a
-    // style prompt has rhythm/texture to grab (the chirp alone is a poor style target).
     std::vector<std::vector<float>> source(2, std::vector<float>(n));
-    const double f0 = 120.0, f1 = 3000.0;
-    unsigned int rng = 12345;
-    auto frand = [&]() { rng = rng * 1664525u + 1013904223u; return (float)(rng >> 9) / 8388608.0f - 1.0f; };
-    for (int i = 0; i < n; ++i) {
-        double t = (double)i / SR;
-        double phase = 2.0 * M_PI * (f0 * t + 0.5 * (f1 - f0) / src_s * t * t);
-        double amp = 0.35 * (0.85 + 0.15 * std::sin(2.0 * M_PI * 1.0 * t));
-        double s = amp * std::sin(phase);
-        if (rich) {
-            double tb = std::fmod(t, 0.5);                       // 2 Hz grid
-            double kick = std::exp(-tb * 30.0) * std::sin(2.0 * M_PI * 60.0 * tb);  // kick
-            double bass = 0.18 * std::sin(2.0 * M_PI * 90.0 * t);                   // bass
-            double hat = (std::fmod(t, 0.25) < 0.02) ? 0.15 * frand() : 0.0;        // hat
-            s = 0.5 * s + 0.4 * kick + bass + hat;
+    if (!wav.empty()) {
+        // Real-music source: a [start_s, start_s+src_s] slice of a 44.1k/16-bit WAV.
+        int wsr, wch, wn;
+        std::vector<float> planar = orch::read_wav_pcm16(wav, wsr, wch, wn);
+        if (wsr != SR) { std::fprintf(stderr, "wav sr %d != %d\n", wsr, SR); return 2; }
+        const long off = (long)(start_s * SR);
+        for (int c = 0; c < 2; ++c) {
+            const int sc = std::min(c, wch - 1);
+            for (int i = 0; i < n; ++i) {
+                long s = off + i;
+                source[c][i] = (s >= 0 && s < wn) ? planar[(size_t)sc * wn + s] : 0.0f;
+            }
         }
-        source[0][i] = (float)s;
-        source[1][i] = (float)s;
+        std::printf("  source = '%s' [%.0f..%.0fs]\n", wav.c_str(), start_s, start_s + src_s);
+    } else {
+        // Stereo linear chirp f0->f1 over the whole source (so output freq -> source time)
+        // + slow 1 Hz tremolo. `rich` adds a 2 Hz kick + steady bass + hi-hat noise so a
+        // style prompt has rhythm/texture to grab (the chirp alone is a poor style target).
+        const double f0 = 120.0, f1 = 3000.0;
+        unsigned int rng = 12345;
+        auto frand = [&]() { rng = rng * 1664525u + 1013904223u; return (float)(rng >> 9) / 8388608.0f - 1.0f; };
+        for (int i = 0; i < n; ++i) {
+            double t = (double)i / SR;
+            double phase = 2.0 * M_PI * (f0 * t + 0.5 * (f1 - f0) / src_s * t * t);
+            double amp = 0.35 * (0.85 + 0.15 * std::sin(2.0 * M_PI * 1.0 * t));
+            double s = amp * std::sin(phase);
+            if (rich) {
+                double tb = std::fmod(t, 0.5);                       // 2 Hz grid
+                double kick = std::exp(-tb * 30.0) * std::sin(2.0 * M_PI * 60.0 * tb);  // kick
+                double bass = 0.18 * std::sin(2.0 * M_PI * 90.0 * t);                   // bass
+                double hat = (std::fmod(t, 0.25) < 0.02) ? 0.15 * frand() : 0.0;        // hat
+                s = 0.5 * s + 0.4 * kick + bass + hat;
+            }
+            source[0][i] = (float)s;
+            source[1][i] = (float)s;
+        }
     }
     orch::save_wav_pcm16("/tmp/scan_source.wav", to_mx(source), SR);
 

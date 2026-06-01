@@ -197,7 +197,7 @@ void MorphEngine::loaderThreadMain(juce::MemoryBlock bytes, int peaks_n,
         sa3::rt::GenConfig cfg;
         cfg.seconds = (float)window_secs;
         cfg.depth   = 2;
-        cfg.steps   = 8;
+        cfg.steps   = juce::jlimit(2, 16, steps_.load(std::memory_order_acquire));
         cfg.family  = quality_.load(std::memory_order_acquire)
             ? sa3::orch::Family::Medium : sa3::orch::Family::SmMusic;
         // cfg.denoise is the FIXED base trajectory (GenConfig default); the UI
@@ -275,6 +275,11 @@ void MorphEngine::setCfg(float v) {   // UI "CFG" -> styled-target guidance stre
 }
 void MorphEngine::setWindowSeconds(double s) {
     window_seconds_.store(s, std::memory_order_release);   // applied on next load
+}
+bool MorphEngine::setSteps(int n) {
+    n = juce::jlimit(2, 16, n);
+    const int prev = steps_.exchange(n, std::memory_order_acq_rel);
+    return prev != n;   // changed -> caller reloads the source to apply
 }
 void MorphEngine::setEvolve(bool on) {
     { std::lock_guard<std::mutex> lk(ctrl_mutex_); evolve_ = on; }

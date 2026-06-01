@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 #include <mlx/mlx.h>
@@ -401,7 +402,9 @@ void StreamGenerator::static_tick() {
 // Each window is a clean img2img generation at sigma(Amount); Amount/Style/Intensity
 // are baked per-window at submit (per-window latency). Motion (velocity) is a 1-tick
 // per-step v-scale and stays a shared curve here.
-void StreamGenerator::apply_scan_controls() {
+// Returns true if a new prompt was applied this tick (so scan_tick can rebuild the
+// already-committed next window instead of waiting a whole extra window for it).
+bool StreamGenerator::apply_scan_controls() {
     bool has_vs; float vs; std::optional<std::string> np;
     {
         std::lock_guard<std::mutex> lk(ctrl_mutex_);
@@ -412,6 +415,7 @@ void StreamGenerator::apply_scan_controls() {
     if (np.has_value()) encode_prompt(*np);
     if (has_vs) pipe_->set_shared_curve("velocity_scale", stream::CurveValue{vs});
     else        pipe_->clear_shared_curve("velocity_scale");
+    return np.has_value();
 }
 
 // Amount -> img2img init sigma (sigma_max), the ONLY structure-vs-style knob SA3
@@ -436,6 +440,13 @@ static float sigma_for_amount(float amount, float intensity) {
 // or lerped latent. This is SA3's native, coherent a2a path.
 void StreamGenerator::submit_window(const mx::array& source, float sigma) {
     stream::SlotRequest req{*cross_, *gcond_, cfg_.seed_base, sigma, source};
+    // Sampler: pingpong (sde curve = 1.0 -> re-noise toward the model's x0 with fresh
+    // per-step noise, source term zeroes out) is SA3's trained rf_denoiser default and
+    // what the offline remix path uses; euler is deterministic/smoother. Per-seed
+    // deterministic either way. TEMP env SA3_PINGPONG to A/B; default pingpong.
+    bool pingpong = true;
+    if (const char* e = std::getenv("SA3_PINGPONG")) pingpong = (std::stoi(e) != 0);
+    if (pingpong) req.sde_denoise_curve = stream::CurveValue{1.0f};
     if (prompt_active_ && neg_cross_.has_value()) {
         req.cfg = cfg_styled_;
         req.apg = cfg_.apg;
@@ -470,7 +481,18 @@ std::vector<std::vector<float>> StreamGenerator::decode_window(
 }
 
 void StreamGenerator::scan_tick() {
-    apply_scan_controls();
+    const bool prompt_changed = apply_scan_controls();
+
+    // A Style change makes the already-committed next window stale (it was built one
+    // window ahead with the OLD prompt). Unless we've already started crossfading into
+    // it, drop it and let the look-ahead rebuild it with the new prompt THIS tick — so
+    // a style change lands ~1 window out, not ~2. (The currently-playing window can't
+    // change; that's the per-window-img2img floor — shrink Window to reduce it.)
+    if (prompt_changed && next_pending_ && xfade_start_ < 0) {
+        pipe_->clear();
+        next_pending_ = false;
+        next_latent_.reset();
+    }
 
     const int  SPL = orch::SAMPLES_PER_LATENT;
     const int  lead = SPL * 2;                                          // ~2 frames ahead

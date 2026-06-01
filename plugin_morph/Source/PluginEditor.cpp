@@ -217,6 +217,14 @@ juce::WebBrowserComponent::Options buildOptions(SA3MorphProcessor& processor) {
                 const bool changed = std::abs(eng.windowSeconds() - s) > 1e-6;
                 eng.setWindowSeconds(s);
                 complete(juce::var(changed));
+            })
+        // setSteps(n) -> changed:bool. The denoise schedule is fixed when the generator
+        // is built, so JS reloads the current source when this returns true.
+        .withNativeFunction("setSteps",
+            [&processor](const juce::Array<juce::var>& a,
+                         juce::WebBrowserComponent::NativeFunctionCompletion complete) {
+                const int n = a.isEmpty() ? 8 : (int)(double)a[0];
+                complete(juce::var(processor.getEngine().setSteps(n)));
             });
 }
 
@@ -227,7 +235,7 @@ SA3MorphProcessorEditor::SA3MorphProcessorEditor(SA3MorphProcessor& p)
       processor(p),
       webView(buildOptions(p))
 {
-    setSize(854, 480);   // 16:9
+    setSize(900, 690);   // fits all control rows (BPM/Key/Steps) + Reset without clipping
     addAndMakeVisible(webView);
     webView.goToURL(kIndexURL);
     startTimerHz(30);   // push morphState to JS at ~30 fps

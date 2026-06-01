@@ -45,6 +45,7 @@ const setEvolve      = getNativeFunction("setEvolve");
 const setPrompt      = getNativeFunction("setPrompt");
 const setQuality     = getNativeFunction("setQuality");
 const setWindow      = getNativeFunction("setWindow");
+const setSteps       = getNativeFunction("setSteps");
 
 // ── Constants ────────────────────────────────────────────────────────
 const SOURCE_PEAKS_N = 220;
@@ -68,6 +69,9 @@ const filePicker   = $("file-picker");
 
 const promptEl   = $("prompt");
 const promptClear = $("prompt-clear");
+const bpmEl      = $("bpm");
+const bpmValEl   = $("bpm-value");
+const keyEl      = $("key");
 const denoiseEl  = $("denoise");
 const denoiseVal = $("denoise-value");
 const blendEl    = $("blend");
@@ -77,6 +81,8 @@ const velocityVal = $("velocity-value");
 const cfgEl      = $("cfg");
 const cfgVal     = $("cfg-value");
 const windowEl   = $("window");
+const stepsEl    = $("steps");
+const stepsVal   = $("steps-value");
 const evolveToggle = $("evolve-toggle");
 const qualityToggle = $("quality-toggle");
 const resetBtn   = $("reset");
@@ -262,17 +268,49 @@ windowEl.addEventListener("change", async () => {
     if (changed && state.lastB64) await loadFromB64(state.lastB64);
     saveUiSoon();
 });
-function updatePromptClear() { promptClear.hidden = !promptEl.value; }
-promptEl.addEventListener("input", updatePromptClear);
-promptEl.addEventListener("change", () => {
-    setPrompt(promptEl.value);
+// Steps: diffusion steps per window. Fixed when the generator is built -> reload.
+stepsEl.addEventListener("input", () => { stepsVal.textContent = String(Math.round(Number(stepsEl.value))); });
+stepsEl.addEventListener("change", async () => {
+    const n = Math.max(2, Math.min(16, Math.round(Number(stepsEl.value))));
+    stepsEl.value = n; stepsVal.textContent = String(n);
+    const changed = await setSteps(n);
+    if (changed && state.lastB64) await loadFromB64(state.lastB64);
     saveUiSoon();
 });
-// Clear Style: lifts the style-transfer floors so the loop morphs back toward
-// the dry source. Applied immediately (not on blur) so the change is instant.
+// Build the prompt the engine actually sees: wrap the user's Style in SA3's trained
+// caption format and append the manual BPM / Key anchors (the offline remix recipe).
+// Empty Style -> empty prompt (free variation / morph back to source).
+function buildPrompt() {
+    let p = promptEl.value.trim();
+    if (!p) return "";
+    if (!/^TrackType:/i.test(p)) p = "TrackType: Music, VocalType: Instrumental. " + p;
+    if (!/[.!?]\s*$/.test(p)) p += ".";
+    const bpm = bpmValEl.value.trim();
+    const key = keyEl.value.trim();
+    if (bpm) p += ` ${bpm} BPM.`;
+    if (key) p += ` Key: ${key}.`;
+    return p;
+}
+function sendPrompt() { setPrompt(buildPrompt()); }
+
+function updatePromptClear() { promptClear.hidden = !promptEl.value; }
+promptEl.addEventListener("input", updatePromptClear);
+promptEl.addEventListener("change", () => { sendPrompt(); saveUiSoon(); });
+
+// BPM: slider <-> number field stay in sync; either re-sends the (templated) prompt.
+bpmEl.addEventListener("input", () => { bpmValEl.value = bpmEl.value; });
+bpmEl.addEventListener("change", () => { bpmValEl.value = bpmEl.value; sendPrompt(); saveUiSoon(); });
+bpmValEl.addEventListener("change", () => {
+    const v = parseInt(bpmValEl.value, 10);
+    if (isFinite(v)) bpmEl.value = Math.max(40, Math.min(200, v));
+    sendPrompt(); saveUiSoon();
+});
+keyEl.addEventListener("change", () => { sendPrompt(); saveUiSoon(); });
+
+// Clear Style: empties the prompt so the output morphs back toward the dry source.
 promptClear.addEventListener("click", () => {
     promptEl.value = "";
-    setPrompt("");
+    sendPrompt();
     updatePromptClear();
     promptEl.focus();
     saveUiSoon();
@@ -301,12 +339,12 @@ function pushAllControls() {
     setVelocity(Number(velocityEl.value));
     setCfg(Number(cfgEl.value));
     setEvolve(state.evolve);
-    if (promptEl.value) setPrompt(promptEl.value);
+    if (promptEl.value) sendPrompt();
 }
 
 // Reset the morph sliders + Mode to defaults (leaves Style / Window / Model and
 // the loaded source untouched). Intensity+CFG share one styled-target rebuild.
-const DEFAULTS = { denoise: 0.5, blend: 0.6, velocity: 1.0, cfg: 2.0 };
+const DEFAULTS = { denoise: 0.5, blend: 0.6, velocity: 1.0, cfg: 4.0 };
 resetBtn.addEventListener("click", () => {
     denoiseEl.value = DEFAULTS.denoise;  denoiseVal.textContent = DEFAULTS.denoise.toFixed(2);  setDenoise(DEFAULTS.denoise);
     blendEl.value = DEFAULTS.blend;      blendVal.textContent = DEFAULTS.blend.toFixed(2);      setSourceBlend(DEFAULTS.blend);
@@ -354,11 +392,14 @@ function saveUiSoon() {
     saveTimer = setTimeout(() => {
         setUiState(JSON.stringify({
             prompt: promptEl.value,
+            bpm: bpmValEl.value,
+            key: keyEl.value,
             denoise: denoiseEl.value,
             blend: blendEl.value,
             velocity: velocityEl.value,
             cfg: cfgEl.value,
             window: windowEl.value,
+            steps: stepsEl.value,
             evolve: state.evolve,
             quality: state.quality,
         }));
@@ -370,11 +411,14 @@ async function restoreUiState() {
     if (!json) return;
     let s; try { s = JSON.parse(json); } catch { return; }
     if (s.prompt != null) { promptEl.value = s.prompt; updatePromptClear(); }
+    if (s.bpm != null) { bpmValEl.value = s.bpm; if (s.bpm) bpmEl.value = s.bpm; }
+    if (s.key != null) { keyEl.value = s.key; }
     if (s.denoise != null) { denoiseEl.value = s.denoise; denoiseVal.textContent = Number(s.denoise).toFixed(2); }
     if (s.blend != null) { blendEl.value = s.blend; blendVal.textContent = Number(s.blend).toFixed(2); }
     if (s.velocity != null) { velocityEl.value = s.velocity; velocityVal.textContent = Number(s.velocity).toFixed(2); }
     if (s.cfg != null) { cfgEl.value = s.cfg; cfgVal.textContent = Number(s.cfg).toFixed(1); }
     if (s.window != null) { windowEl.value = s.window; setWindow(Number(s.window)); }
+    if (s.steps != null) { stepsEl.value = s.steps; stepsVal.textContent = String(Math.round(Number(s.steps))); setSteps(Number(s.steps)); }
     if (s.evolve != null) {
         state.evolve = !!s.evolve;
         evolveToggle.textContent = state.evolve ? "Evolve" : "Coherent";

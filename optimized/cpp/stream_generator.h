@@ -70,7 +70,7 @@ struct GenConfig {
     // Character toward "explore" (the SDE re-noise path); Character="preserve"
     // re-anchors to source and ignores the prompt by design. Doubles the per-tick
     // forward (cond + uncond) only while a prompt is active.
-    float    cfg_styled   = 2.0f;
+    float    cfg_styled   = 4.0f;
     float    apg          = 1.0f;    // adaptive projected guidance (1=full)
     mx::Dtype dtype       = mx::float16;
 };
@@ -117,7 +117,7 @@ private:
     mx::array encode_window_latent(long start_sample);   // ...returns the latent (scan: per-chunk source)
     void static_tick();                     // one iteration: looping morph (source <= one window)
     void scan_tick();                       // one iteration: forward-streaming playthrough
-    void apply_scan_controls();             // re-encode prompt + velocity (Amount = per-window sigma)
+    bool apply_scan_controls();             // re-encode prompt + velocity; true if prompt changed
     // Submit one clean windowed img2img (init-mix source to sigma, then text trajectory).
     void submit_window(const mx::array& source, float sigma);
     // Windowed decode of a sub-range [off, off+win] (latent frames) -> planar audio.
@@ -139,7 +139,7 @@ private:
     mutable std::mutex ctrl_mutex_;
     float morph_amount_   = 0.5f;           // Amount (0..1): img2img sigma = original->styled
     float style_intensity_ = 0.6f;          // Intensity (0..1): caps Amount=1's sigma (departure)
-    float cfg_styled_     = 2.0f;           // CFG strength (text guidance) when a prompt is set
+    float cfg_styled_     = 4.0f;           // CFG strength (text guidance) when a prompt is set
     std::optional<float> velocity_scale_;   // nullopt = inactive (Motion)
     std::optional<std::string> new_prompt_;
     bool evolve_;

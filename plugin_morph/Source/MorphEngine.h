@@ -90,6 +90,12 @@ public:
     void setWindowSeconds(double s);
     double windowSeconds() const { return window_seconds_.load(std::memory_order_acquire); }
 
+    // Diffusion steps per window: fewer = faster render (linearly) but rougher; the
+    // schedule is fixed when the generator is built, so this applies on the NEXT load.
+    // Returns true if the value changed (caller reloads to apply).
+    bool setSteps(int n);
+    int steps() const { return steps_.load(std::memory_order_acquire); }
+
     // Quality mode: medium DiT + SAME-L (stronger style transfer, ~6x slower per
     // tick) vs Live: sm-music + SAME-S (fast). The model family is fixed when the
     // generator is built, so this takes effect on the NEXT load — the editor
@@ -122,6 +128,7 @@ private:
     std::atomic<bool>  quality_{true};      // default Quality(medium) — much stronger
                                             // style transfer; false=Live(sm-music, fast)
     std::atomic<double> window_seconds_{10.0};  // morph the last N s of a dropped file
+    std::atomic<int>    steps_{8};              // diffusion steps per window (next load)
                                                 // (<=0 = whole file); applied on load
 
     std::thread loader_;        // one-shot loader (joined on next load / dtor)

@@ -42,10 +42,12 @@ if [[ ! -d "$bundle" ]]; then
     exit 1
 fi
 
-# JUCE names every binary "SA3 Variations" regardless of format.
-binary="$bundle/Contents/MacOS/SA3 Variations"
-if [[ ! -f "$binary" ]]; then
-    echo "vendor_bundle: binary not found at $binary" >&2
+# Discover the bundle's executable from Contents/MacOS/ (there's exactly one).
+# Works for any product name — "SA3 Variations", "SA3 Morph", etc. — so this
+# script is reusable across sibling plugins.
+binary="$(find "$bundle/Contents/MacOS" -maxdepth 1 -type f -perm +111 2>/dev/null | head -1)"
+if [[ -z "$binary" || ! -f "$binary" ]]; then
+    echo "vendor_bundle: no executable found in $bundle/Contents/MacOS" >&2
     exit 1
 fi
 

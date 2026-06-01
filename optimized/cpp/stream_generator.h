@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -40,11 +41,21 @@ namespace rt {
 namespace mx = mlx::core;
 
 struct GenConfig {
+    // Live = sm-music DiT + SAME-S codec (fast ~30ms/step, weaker text-following);
+    // Quality = medium DiT + SAME-L codec (~270ms/step, much stronger style
+    // transfer — dubstep-vs-rock spectral cos 0.26 vs 0.46 for sm-music, and
+    // cleaner peaks). Both share the streaming pipeline; only the model set + the
+    // codec decode params differ.
+    orch::Family family   = orch::Family::SmMusic;
     float    seconds      = 8.0f;
     int      steps        = 8;
     int      depth        = 2;
     float    denoise      = 0.5f;
-    float    denoise_slew = 0.04f;   // max change in effective denoise per submission
+    float    denoise_slew = 0.25f;   // max change in effective denoise per SUBMISSION
+                                     // (~completion). 0.25 -> a full-range Amount
+                                     // move converges in ~3 completions, model-speed-
+                                     // independent. Was 0.04 = ~16 completions, which
+                                     // felt stuck on the slow medium model.
     std::string prompt;
     uint64_t seed_base    = 1000;
     float    margin_s     = 0.0f;    // interior-windowing margin per side (0 = cyclic decode)
@@ -52,6 +63,17 @@ struct GenConfig {
     bool     evolve       = false;   // false = fixed seed (coherent morph)
     float    mse_skip     = 5e-4f;   // skip decode when consecutive latents barely move
     bool     cyclic       = true;    // seamless-loop decode (wrap-around context)
+    // Classifier-free guidance strength applied WHEN a non-empty style prompt is
+    // set. cfg=1 (no prompt) is source-preserving free variation; cfg>1 transfers
+    // style. Measured sweet spot for this streaming SDE path is ~2.0: dubstep-vs-
+    // rock spectral cos 0.46 (strong, distinct), peaks ~1.2 (the output limiter
+    // in MorphEngine handles the residual). cfg=5 over-drove to peak ~2.5 =
+    // clipped distortion where every prompt sounded the same. Only effective with
+    // Character toward "explore" (the SDE re-noise path); Character="preserve"
+    // re-anchors to source and ignores the prompt by design. Doubles the per-tick
+    // forward (cond + uncond) only while a prompt is active.
+    float    cfg_styled   = 2.0f;
+    float    apg          = 1.0f;    // adaptive projected guidance (1=full)
     mx::Dtype dtype       = mx::float16;
 };
 
@@ -110,17 +132,22 @@ private:
     // MLX/model state (worker thread only).
     std::unique_ptr<orch::Pipeline> pipe_models_;
     std::unique_ptr<stream::StreamPipeline> pipe_;
+    // Codec decode bound to the active family: (latents[1,256,T], chunk, ovl,
+    // cyclic) -> patches [1,512,T*16]. Lets decode_crop stay family-agnostic.
+    std::function<mx::array(const mx::array&, int, int, bool)> codec_decode_;
     int gen_T_ = 0;
     int crop_start_ = 0;       // interior-window start (samples)
     int loop_samples_ = 0;     // interior length played back (samples)
-    int chunk_ = 8, ovl_ = 2;  // SAME-S decode params
+    int chunk_ = 8, ovl_ = 2;  // codec decode params (SAME-S 8/2, SAME-L 128/2)
     uint64_t seed_ = 0;
     float denoise_eff_ = 0.5f;
     std::optional<mx::array> init_latents_;
     std::optional<mx::array> cross_;
     std::optional<mx::array> gcond_;
+    std::optional<mx::array> neg_cross_;    // null (empty-prompt) conditioning for CFG
     std::optional<mx::array> secs_e_;
     std::optional<mx::array> last_latent_;
+    bool prompt_active_ = false;            // non-empty style prompt -> enable CFG
 };
 
 }  // namespace rt

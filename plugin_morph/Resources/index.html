@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SA3 · Realtime</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Inter+Tight:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="hl">
+    <!-- Top bar -->
+    <header class="top">
+      <div class="brand">
+        <h1>SA3</h1>
+        <span class="tag">Realtime</span>
+      </div>
+      <div class="status" id="status">
+        <span class="dot"></span>
+        <span id="status-text">Drop a loop</span>
+      </div>
+    </header>
+
+    <!-- Error banner -->
+    <div class="error-banner" id="error-banner" hidden>
+      <span class="error-text" id="error-text"></span>
+      <button type="button" class="error-dismiss" id="error-dismiss" aria-label="Dismiss">×</button>
+    </div>
+
+    <input type="file" id="file-picker" hidden
+           accept="audio/wav,audio/aiff,audio/flac,audio/ogg,.wav,.aiff,.aif,.flac,.ogg" />
+
+    <!-- 16:9 two-column body: source + meter (left), controls (right) -->
+    <div class="body">
+    <div class="col col-left">
+    <!-- Source: drop target / loaded waveform with a live morph playhead -->
+    <section class="source empty" id="source">
+      <div class="source-empty" id="source-empty">
+        <div class="drophint"><b>Drop</b> a loop, or <b>browse&hairsp;…</b></div>
+        <div class="formats">WAV · AIFF · FLAC · OGG</div>
+      </div>
+      <div class="source-loaded" id="source-loaded" hidden>
+        <div class="srcname">
+          <b id="srcname-text"></b>
+          <span id="srcdur-text" class="srcdur"></span>
+        </div>
+        <div class="srcwave" id="srcwave"></div>
+      </div>
+    </section>
+
+    <!-- Live morph meter (fed by the C++ morphState push) -->
+    <section class="meter" id="meter" hidden>
+      <div class="meter-row">
+        <span class="meter-lbl">tick</span><span class="meter-val" id="m-tick">–</span>
+        <span class="meter-lbl">decode</span><span class="meter-val" id="m-decode">–</span>
+        <span class="meter-lbl">gens</span><span class="meter-val" id="m-gens">–</span>
+      </div>
+    </section>
+    </div><!-- /col-left -->
+
+    <div class="col col-right">
+    <!-- Morph controls -->
+    <section class="controls" id="controls">
+      <!-- Style prompt: the live re-prompt field -->
+      <div class="row">
+        <span class="lbl">Style</span>
+        <input type="text" id="prompt" placeholder="e.g. warm analog synth, lo-fi tape" />
+      </div>
+
+      <!-- Variation amount (denoise) -->
+      <div class="row">
+        <span class="lbl">Amount</span>
+        <input type="range" id="denoise" min="0.20" max="0.85" step="0.01" value="0.50" />
+        <span class="val" id="denoise-value">0.50</span>
+      </div>
+
+      <!-- Source blend (SDE): preserve <-> explore -->
+      <div class="row">
+        <span class="lbl">Character</span>
+        <input type="range" id="blend" min="0.00" max="1.00" step="0.01" value="1.00" />
+        <span class="val" id="blend-value">explore</span>
+      </div>
+
+      <!-- Velocity scale (texture) -->
+      <div class="row">
+        <span class="lbl">Motion</span>
+        <input type="range" id="velocity" min="0.50" max="1.50" step="0.01" value="1.00" />
+        <span class="val" id="velocity-value">1.00</span>
+      </div>
+
+      <!-- Evolve toggle -->
+      <div class="row">
+        <span class="lbl">Mode</span>
+        <button type="button" class="mode-toggle" id="evolve-toggle"
+                title="Fixed seed morphs one coherent loop; Evolve browses new variations">Coherent</button>
+        <div style="flex:1"></div>
+      </div>
+
+      <!-- Model quality toggle: Live (sm-music, fast) vs Quality (medium,
+           stronger style transfer but slower). Switching reloads the source. -->
+      <div class="row">
+        <span class="lbl">Model</span>
+        <button type="button" class="mode-toggle one-shot" id="quality-toggle"
+                title="Quality = larger model: much stronger style transfer, slower to respond. Live = fast small model.">Quality</button>
+        <div style="flex:1"></div>
+      </div>
+
+      <button type="button" class="gen" id="play" disabled>
+        <span class="gen-label" id="play-label">Play</span>
+      </button>
+    </section>
+    </div><!-- /col-right -->
+    </div><!-- /body -->
+
+    <footer class="footer">
+      <span class="kbd-hint" id="kbd-hint">
+        <kbd>Space</kbd> play/stop · twist knobs to morph live · clear Style + Character→preserve to return to source
+      </span>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

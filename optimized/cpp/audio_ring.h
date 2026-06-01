@@ -42,9 +42,16 @@ public:
     bool has_audio() const;
 
     // Read the next n frames into `out` (planar [ch][n]), wrapping once at the
-    // loop boundary. Real-time safe: one short lock to snapshot buffer + cursor.
-    // `out` must be sized [ch][>=n]; only the first n per channel are written.
+    // loop boundary, and ADVANCE the play cursor by n. Real-time safe: one short
+    // lock to snapshot buffer + cursor. `out` sized [ch][>=n].
     void read(int n, std::vector<std::vector<float>>& out);
+
+    // Peek n frames starting at the current cursor WITHOUT advancing it, then
+    // call advance(used) once you know how many input frames were consumed.
+    // Lets a resampling caller drive the cursor at real-time rate when the host
+    // sample rate differs from the ring's 44.1k. RT-safe (one short lock each).
+    void read_peek(int n, std::vector<std::vector<float>>& out) const;
+    void advance(int n);
 
     // Install a new loop, equal-power-crossfaded against the current one over the
     // xfade frames starting at the current play cursor. `audio` is the full
@@ -54,6 +61,8 @@ public:
 
 private:
     std::vector<std::vector<float>> fit(const std::vector<std::vector<float>>& audio) const;
+    // Copy n frames from `pos` into out (wrapping once). Caller holds mutex_.
+    void copy_from(long pos, int n, std::vector<std::vector<float>>& out) const;
 
     int loop_xfade_;
     int L_;

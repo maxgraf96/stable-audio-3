@@ -61,14 +61,8 @@ bool AudioRing::has_audio() const {
     return has_audio_;
 }
 
-void AudioRing::read(int n, std::vector<std::vector<float>>& out) {
-    long pos;
-    // Snapshot under lock; copy outside (buf_ is swapped wholesale by the writer,
-    // and we hold the lock across the copy to keep buf_ stable — the copy is a
-    // few-KB memcpy, sub-microsecond).
-    std::lock_guard<std::mutex> lk(mutex_);
-    pos = pos_;
-    pos_ = (pos + n) % L_;
+// Copy n frames from `pos` into out (wrapping once). Caller holds the lock.
+void AudioRing::copy_from(long pos, int n, std::vector<std::vector<float>>& out) const {
     if (static_cast<int>(out.size()) < ch_) out.resize(ch_);
     for (int c = 0; c < ch_; ++c) {
         if (static_cast<int>(out[c].size()) < n) out[c].resize(n);
@@ -82,6 +76,23 @@ void AudioRing::read(int n, std::vector<std::vector<float>>& out) {
                       out[c].begin() + first);
         }
     }
+}
+
+void AudioRing::read(int n, std::vector<std::vector<float>>& out) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    const long pos = pos_;
+    pos_ = (pos + n) % L_;
+    copy_from(pos, n, out);
+}
+
+void AudioRing::read_peek(int n, std::vector<std::vector<float>>& out) const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    copy_from(pos_, n, out);
+}
+
+void AudioRing::advance(int n) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    pos_ = (pos_ + n) % L_;
 }
 
 void AudioRing::write_loop(const std::vector<std::vector<float>>& audio_in) {

@@ -115,12 +115,18 @@ void StreamGenerator::setup() {
     const int gen_samples = gen_T_ * orch::SAMPLES_PER_LATENT;
     const float gen_seconds = (float)gen_samples / orch::SAMPLE_RATE;
 
-    // Load models (SmMusic family) via the orchestrator loader.
+    // Load the model family: Live (sm-music + SAME-S) or Quality (medium + SAME-L).
     auto p = [&](const char* n) { return models_dir_ + "/" + n; };
-    pipe_models_ = std::make_unique<orch::Pipeline>(orch::load_pipeline(
-        p("t5gemma_f16.safetensors"), p("dit_sm-music_f16.safetensors"),
-        p("same_s_encoder_f32.safetensors"), p("same_s_decoder_f32.safetensors"),
-        orch::Family::SmMusic, cfg_.dtype));
+    const bool quality = (cfg_.family == orch::Family::Medium);
+    pipe_models_ = std::make_unique<orch::Pipeline>(quality
+        ? orch::load_pipeline(
+              p("t5gemma_f16.safetensors"), p("dit_medium_f16.safetensors"),
+              p("same_l_encoder_f32.safetensors"), p("same_l_decoder_f32.safetensors"),
+              orch::Family::Medium, cfg_.dtype)
+        : orch::load_pipeline(
+              p("t5gemma_f16.safetensors"), p("dit_sm-music_f16.safetensors"),
+              p("same_s_encoder_f32.safetensors"), p("same_s_decoder_f32.safetensors"),
+              orch::Family::SmMusic, cfg_.dtype));
 
     // Build the extended source: tile one loop period so the interior crop aligns
     // and the margins are a musically-continuous continuation (source is a loop).
@@ -137,7 +143,9 @@ void StreamGenerator::setup() {
     }
     mx::array extended(planar.data(), mx::Shape{1, ch, gen_samples}, mx::float32);
     mx::array patches = patch_audio(extended, 256);
-    init_latents_ = mx::astype((*pipe_models_->sames_encoder)(patches), cfg_.dtype);
+    init_latents_ = mx::astype(quality
+        ? (*pipe_models_->samel_encoder)(patches)
+        : (*pipe_models_->sames_encoder)(patches), cfg_.dtype);
     mx::eval(*init_latents_);
 
     // Conditioner: condition on the TRUE generated duration (so SA3's intro/outro
@@ -145,14 +153,32 @@ void StreamGenerator::setup() {
     secs_e_ = mx::astype(pipe_models_->conditioner.seconds_embedder(gen_seconds), cfg_.dtype);
     encode_prompt(cfg_.prompt);
 
-    chunk_ = 8; ovl_ = 2;
-
-    // Build the streaming pipeline with a dit_sm forward binding.
-    auto& dit = *pipe_models_->dit_small;
-    stream::DiTForward dit_fwd = [&dit](const mx::array& x, const mx::array& t,
-                                        const mx::array& c, const mx::array& g) {
-        return dit(x, t, c, g);
-    };
+    // Codec decode params + DiT forward binding, per family. SAME-S: chunk=8/2;
+    // SAME-L: chunk=128/8 (its larger receptive field). The DiT call signature is
+    // identical across families, so a std::function captures either.
+    stream::DiTForward dit_fwd = nullptr;
+    if (quality) {
+        chunk_ = 128; ovl_ = 8;
+        auto& dit = *pipe_models_->dit_medium;
+        dit_fwd = [&dit](const mx::array& x, const mx::array& t,
+                         const mx::array& c, const mx::array& g) { return dit(x, t, c, g); };
+        auto& d = *pipe_models_->samel_decoder;
+        codec_decode_ = [&d](const mx::array& lat, int chunk, int ovl, bool /*cyclic*/) {
+            // SAME-L has no cyclic-wrap helper; chunked decode covers all sizes.
+            return samel::decode_chunked(d, lat, chunk, ovl);
+        };
+    } else {
+        chunk_ = 8; ovl_ = 2;
+        auto& dit = *pipe_models_->dit_small;
+        dit_fwd = [&dit](const mx::array& x, const mx::array& t,
+                         const mx::array& c, const mx::array& g) { return dit(x, t, c, g); };
+        auto& d = *pipe_models_->sames_decoder;
+        codec_decode_ = [&d](const mx::array& lat, int chunk, int ovl, bool cyclic) {
+            const int T = lat.shape()[2], kernel = chunk + 2 * ovl;
+            if (cyclic && T > 2 * CYCLIC_PAD) return cyclic_decode(d, lat, chunk, ovl);
+            return (T > kernel) ? sames::decode_chunked(d, lat, chunk, ovl) : d(lat);
+        };
+    }
     pipe_ = std::make_unique<stream::StreamPipeline>(
         dit_fwd, gen_T_, cfg_.steps, cfg_.depth, cfg_.dtype);
 
@@ -166,13 +192,31 @@ void StreamGenerator::setup() {
 }
 
 void StreamGenerator::encode_prompt(const std::string& text) {
-    auto enc = pipe_models_->t5.encode({text}, 256);
-    mx::array embeds = mx::astype(enc.first, cfg_.dtype);
-    mx::array ep = apply_prompt_padding(
-        embeds, enc.second, mx::astype(pipe_models_->conditioner.padding_embedding, cfg_.dtype));
-    cross_ = mx::concatenate({ep, *secs_e_}, 1);                 // [1,257,768]
+    // Trim to decide whether a real style prompt is present (enables CFG).
+    std::string trimmed = text;
+    size_t b = trimmed.find_first_not_of(" \t\n\r");
+    if (b == std::string::npos) trimmed.clear();
+    else trimmed = trimmed.substr(b, trimmed.find_last_not_of(" \t\n\r") - b + 1);
+    prompt_active_ = !trimmed.empty();
+
+    auto encode_one = [&](const std::string& t) {
+        auto enc = pipe_models_->t5.encode({t}, 256);
+        mx::array embeds = mx::astype(enc.first, cfg_.dtype);
+        mx::array ep = apply_prompt_padding(
+            embeds, enc.second, mx::astype(pipe_models_->conditioner.padding_embedding, cfg_.dtype));
+        return mx::concatenate({ep, *secs_e_}, 1);              // [1,257,768]
+    };
+    cross_ = encode_one(trimmed);
     gcond_ = mx::reshape(*secs_e_, {secs_e_->shape()[0], dit_sm::COND_TOKEN_DIM});  // [1,768]
-    mx::eval(*cross_, *gcond_);
+    // Null (empty-prompt) conditioning is the CFG uncond branch. Encode once;
+    // reused every tick while the prompt is active.
+    if (prompt_active_) {
+        neg_cross_ = encode_one("");
+        mx::eval(*cross_, *gcond_, *neg_cross_);
+    } else {
+        neg_cross_.reset();
+        mx::eval(*cross_, *gcond_);
+    }
 }
 
 void StreamGenerator::submit_morph() {
@@ -184,10 +228,16 @@ void StreamGenerator::submit_morph() {
         has_vs = velocity_scale_.has_value(); vs = has_vs ? *velocity_scale_ : 1.0f;
         evolve = evolve_;
     }
-    // Slew the effective denoise toward the target (gradual morph on slider jumps).
+    // Slew the effective denoise toward the target so a slider jump ramps over a
+    // few COMPLETIONS rather than snapping. denoise_slew is the max change per
+    // submission; submissions ~= completions, so this is model-speed-independent
+    // (unlike a wall-clock rate). At 0.25, a full 0.65-range move converges in ~3
+    // completions (~1s live, ~4s on the medium model) — fast enough to feel
+    // responsive, gradual enough to avoid a hard jump.
     const float slew = cfg_.denoise_slew;
     const float delta = denoise_target - denoise_eff_;
-    denoise_eff_ += std::max(-slew, std::min(slew, delta));
+    if (std::abs(delta) <= slew) denoise_eff_ = denoise_target;   // snap when close
+    else denoise_eff_ += (delta > 0 ? slew : -slew);
     const float denoise = std::round(denoise_eff_ * 1e4f) / 1e4f;
 
     if (evolve) seed_ += 1;
@@ -196,6 +246,15 @@ void StreamGenerator::submit_morph() {
     stream::SlotRequest req{*cross_, *gcond_, seed, denoise, *init_latents_};
     if (has_sdc) req.sde_denoise_curve = stream::CurveValue{sdc};
     if (has_vs)  req.velocity_scale    = stream::CurveValue{vs};
+    // Style transfer: a non-empty prompt enables CFG so the text actually pulls
+    // the sound (cfg=1 barely steers — README_VARIATIONS §3). cond + uncond
+    // batched in one forward; neg_cross is the empty-prompt branch.
+    if (prompt_active_ && neg_cross_.has_value()) {
+        req.cfg = cfg_.cfg_styled;
+        req.apg = cfg_.apg;
+        req.rcfg_mode = "full";
+        req.neg_cross_attn = *neg_cross_;
+    }
     pipe_->submit(req);
 }
 
@@ -218,12 +277,9 @@ void StreamGenerator::apply_shared_curves() {
 // ── decode + interior crop -> planar [ch][loop_samples] ──────────────
 std::vector<std::vector<float>> StreamGenerator::decode_crop(const mx::array& lat) {
     mx::array latf = mx::astype(lat, mx::float32);
-    const int kernel = chunk_ + 2 * ovl_;
-    mx::array patches = (crop_start_ == 0 && cfg_.cyclic && gen_T_ > 2 * CYCLIC_PAD)
-        ? cyclic_decode(*pipe_models_->sames_decoder, latf, chunk_, ovl_)
-        : ((gen_T_ > kernel)
-            ? sames::decode_chunked(*pipe_models_->sames_decoder, latf, chunk_, ovl_)
-            : (*pipe_models_->sames_decoder)(latf));
+    // Cyclic wrap only when there's no interior-window crop (crop_start_==0).
+    const bool use_cyclic = (crop_start_ == 0 && cfg_.cyclic);
+    mx::array patches = codec_decode_(latf, chunk_, ovl_, use_cyclic);
     mx::array audio = sa3::patched_decode(patches, 256, 2);     // [1, 2, gen*4096]
     audio = samel::to_row_contiguous(mx::astype(audio, mx::float32));
     mx::eval(audio);

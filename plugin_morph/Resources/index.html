@@ -67,20 +67,33 @@
       <div class="row">
         <span class="lbl">Style</span>
         <input type="text" id="prompt" placeholder="e.g. warm analog synth, lo-fi tape" />
+        <button type="button" class="prompt-clear" id="prompt-clear" hidden
+                title="Clear Style — morph back toward source" aria-label="Clear style">×</button>
       </div>
 
-      <!-- Variation amount (denoise) -->
+      <!-- Amount = the main morph: 0 = original loop, 1 = fully styled -->
       <div class="row">
         <span class="lbl">Amount</span>
-        <input type="range" id="denoise" min="0.20" max="0.85" step="0.01" value="0.50" />
+        <input type="range" id="denoise" min="0.00" max="1.00" step="0.01" value="0.50"
+               title="Morph between your original loop (0) and the styled version (1)" />
         <span class="val" id="denoise-value">0.50</span>
       </div>
 
-      <!-- Source blend (SDE): preserve <-> explore -->
+      <!-- Intensity = how far the styled endpoint departs from the source.
+           Rebuilds the styled target on release (brief pause). -->
       <div class="row">
-        <span class="lbl">Character</span>
-        <input type="range" id="blend" min="0.00" max="1.00" step="0.01" value="1.00" />
-        <span class="val" id="blend-value">explore</span>
+        <span class="lbl">Intensity</span>
+        <input type="range" id="blend" min="0.00" max="1.00" step="0.01" value="0.60"
+               title="How extreme the styled version is (the Amount=1 endpoint). Recomputes on release." />
+        <span class="val" id="blend-value">0.60</span>
+      </div>
+
+      <!-- CFG = prompt-guidance strength for the styled target. Rebuilds on release. -->
+      <div class="row">
+        <span class="lbl">CFG</span>
+        <input type="range" id="cfg" min="1.0" max="6.0" step="0.1" value="2.0"
+               title="How hard the Style prompt pulls when building the styled endpoint. ~2 is the sweet spot; high values distort." />
+        <span class="val" id="cfg-value">2.0</span>
       </div>
 
       <!-- Velocity scale (texture) -->
@@ -107,6 +120,16 @@
         <div style="flex:1"></div>
       </div>
 
+      <!-- Window: morph only the last N seconds of a dropped file (an entire track
+           loops on its recent window). Changing it reloads the source. -->
+      <div class="row">
+        <span class="lbl">Window</span>
+        <input type="number" id="window" min="2" max="30" step="1" value="10"
+               title="Morph the last N seconds of a dropped file. Changing this reloads." />
+        <div style="flex:1"></div>
+        <span class="val">sec</span>
+      </div>
+
       <button type="button" class="gen" id="play" disabled>
         <span class="gen-label" id="play-label">Play</span>
       </button>
@@ -116,8 +139,10 @@
 
     <footer class="footer">
       <span class="kbd-hint" id="kbd-hint">
-        <kbd>Space</kbd> play/stop · twist knobs to morph live · clear Style + Character→preserve to return to source
+        <kbd>Space</kbd> play/stop · a track plays through, morphing a sliding <b>Window</b> · type a Style + ride <b>Amount</b> (original → styled)
       </span>
+      <button type="button" class="mode-toggle" id="reset"
+              title="Reset Amount / Intensity / CFG / Motion / Mode to defaults">Reset</button>
     </footer>
   </div>
 

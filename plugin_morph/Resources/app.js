@@ -40,9 +40,11 @@ const stopMorph      = getNativeFunction("stopMorph");
 const setDenoise     = getNativeFunction("setDenoise");
 const setSourceBlend = getNativeFunction("setSourceBlend");
 const setVelocity    = getNativeFunction("setVelocity");
+const setCfg         = getNativeFunction("setCfg");
 const setEvolve      = getNativeFunction("setEvolve");
 const setPrompt      = getNativeFunction("setPrompt");
 const setQuality     = getNativeFunction("setQuality");
+const setWindow      = getNativeFunction("setWindow");
 
 // ── Constants ────────────────────────────────────────────────────────
 const SOURCE_PEAKS_N = 220;
@@ -65,14 +67,19 @@ const srcWaveEl    = $("srcwave");
 const filePicker   = $("file-picker");
 
 const promptEl   = $("prompt");
+const promptClear = $("prompt-clear");
 const denoiseEl  = $("denoise");
 const denoiseVal = $("denoise-value");
 const blendEl    = $("blend");
 const blendVal   = $("blend-value");
 const velocityEl = $("velocity");
 const velocityVal = $("velocity-value");
+const cfgEl      = $("cfg");
+const cfgVal     = $("cfg-value");
+const windowEl   = $("window");
 const evolveToggle = $("evolve-toggle");
 const qualityToggle = $("quality-toggle");
+const resetBtn   = $("reset");
 const playBtn    = $("play");
 const playLabel  = $("play-label");
 
@@ -217,30 +224,57 @@ async function loadFromB64(b64) {
 }
 
 // ── Controls ─────────────────────────────────────────────────────────
-function blendWord(v) {
-    if (v <= 0.12) return "preserve";
-    if (v >= 0.88) return "explore";
-    return v.toFixed(2);
-}
-
 denoiseEl.addEventListener("input", () => {
     denoiseVal.textContent = Number(denoiseEl.value).toFixed(2);
     setDenoise(Number(denoiseEl.value));
     saveUiSoon();
 });
+// Intensity rebuilds the styled target (a brief one-shot generation), so apply it
+// on release (change) rather than every input frame — dragging only updates the
+// label; letting go recomputes the Amount=1 endpoint once.
 blendEl.addEventListener("input", () => {
-    const v = Number(blendEl.value);
-    blendVal.textContent = blendWord(v);
-    setSourceBlend(v);
+    blendVal.textContent = Number(blendEl.value).toFixed(2);
     saveUiSoon();
+});
+blendEl.addEventListener("change", () => {
+    setSourceBlend(Number(blendEl.value));
 });
 velocityEl.addEventListener("input", () => {
     velocityVal.textContent = Number(velocityEl.value).toFixed(2);
     setVelocity(Number(velocityEl.value));
     saveUiSoon();
 });
+// CFG rebuilds the styled target (brief one-shot) -> apply on release, label on input.
+cfgEl.addEventListener("input", () => {
+    cfgVal.textContent = Number(cfgEl.value).toFixed(1);
+    saveUiSoon();
+});
+cfgEl.addEventListener("change", () => {
+    setCfg(Number(cfgEl.value));
+});
+// Window: morph the last N seconds. Fixed when the generator is built -> reload.
+windowEl.addEventListener("change", async () => {
+    let s = Math.round(Number(windowEl.value));
+    if (!isFinite(s)) s = 10;
+    s = Math.max(2, Math.min(30, s));
+    windowEl.value = s;
+    const changed = await setWindow(s);
+    if (changed && state.lastB64) await loadFromB64(state.lastB64);
+    saveUiSoon();
+});
+function updatePromptClear() { promptClear.hidden = !promptEl.value; }
+promptEl.addEventListener("input", updatePromptClear);
 promptEl.addEventListener("change", () => {
     setPrompt(promptEl.value);
+    saveUiSoon();
+});
+// Clear Style: lifts the style-transfer floors so the loop morphs back toward
+// the dry source. Applied immediately (not on blur) so the change is instant.
+promptClear.addEventListener("click", () => {
+    promptEl.value = "";
+    setPrompt("");
+    updatePromptClear();
+    promptEl.focus();
     saveUiSoon();
 });
 evolveToggle.addEventListener("click", () => {
@@ -265,9 +299,27 @@ function pushAllControls() {
     setDenoise(Number(denoiseEl.value));
     setSourceBlend(Number(blendEl.value));
     setVelocity(Number(velocityEl.value));
+    setCfg(Number(cfgEl.value));
     setEvolve(state.evolve);
     if (promptEl.value) setPrompt(promptEl.value);
 }
+
+// Reset the morph sliders + Mode to defaults (leaves Style / Window / Model and
+// the loaded source untouched). Intensity+CFG share one styled-target rebuild.
+const DEFAULTS = { denoise: 0.5, blend: 0.6, velocity: 1.0, cfg: 2.0 };
+resetBtn.addEventListener("click", () => {
+    denoiseEl.value = DEFAULTS.denoise;  denoiseVal.textContent = DEFAULTS.denoise.toFixed(2);  setDenoise(DEFAULTS.denoise);
+    blendEl.value = DEFAULTS.blend;      blendVal.textContent = DEFAULTS.blend.toFixed(2);      setSourceBlend(DEFAULTS.blend);
+    velocityEl.value = DEFAULTS.velocity; velocityVal.textContent = DEFAULTS.velocity.toFixed(2); setVelocity(DEFAULTS.velocity);
+    cfgEl.value = DEFAULTS.cfg;          cfgVal.textContent = DEFAULTS.cfg.toFixed(1);          setCfg(DEFAULTS.cfg);
+    if (state.evolve) {
+        state.evolve = false;
+        evolveToggle.textContent = "Coherent";
+        evolveToggle.classList.remove("one-shot");
+        setEvolve(false);
+    }
+    saveUiSoon();
+});
 
 // ── Transport ────────────────────────────────────────────────────────
 function updatePlayButton() {
@@ -305,6 +357,8 @@ function saveUiSoon() {
             denoise: denoiseEl.value,
             blend: blendEl.value,
             velocity: velocityEl.value,
+            cfg: cfgEl.value,
+            window: windowEl.value,
             evolve: state.evolve,
             quality: state.quality,
         }));
@@ -315,10 +369,12 @@ async function restoreUiState() {
     try { json = await getUiState(); } catch { return; }
     if (!json) return;
     let s; try { s = JSON.parse(json); } catch { return; }
-    if (s.prompt != null) promptEl.value = s.prompt;
+    if (s.prompt != null) { promptEl.value = s.prompt; updatePromptClear(); }
     if (s.denoise != null) { denoiseEl.value = s.denoise; denoiseVal.textContent = Number(s.denoise).toFixed(2); }
-    if (s.blend != null) { blendEl.value = s.blend; blendVal.textContent = blendWord(Number(s.blend)); }
+    if (s.blend != null) { blendEl.value = s.blend; blendVal.textContent = Number(s.blend).toFixed(2); }
     if (s.velocity != null) { velocityEl.value = s.velocity; velocityVal.textContent = Number(s.velocity).toFixed(2); }
+    if (s.cfg != null) { cfgEl.value = s.cfg; cfgVal.textContent = Number(s.cfg).toFixed(1); }
+    if (s.window != null) { windowEl.value = s.window; setWindow(Number(s.window)); }
     if (s.evolve != null) {
         state.evolve = !!s.evolve;
         evolveToggle.textContent = state.evolve ? "Evolve" : "Coherent";
@@ -371,8 +427,10 @@ document.addEventListener("keydown", (e) => {
 
 // ── Init ─────────────────────────────────────────────────────────────
 denoiseVal.textContent = Number(denoiseEl.value).toFixed(2);
-blendVal.textContent = blendWord(Number(blendEl.value));
+blendVal.textContent = Number(blendEl.value).toFixed(2);
 velocityVal.textContent = Number(velocityEl.value).toFixed(2);
+cfgVal.textContent = Number(cfgEl.value).toFixed(1);
+updatePromptClear();
 renderSource();
 updatePlayButton();
 restoreUiState();

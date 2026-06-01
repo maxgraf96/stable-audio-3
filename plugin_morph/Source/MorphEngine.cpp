@@ -32,6 +32,7 @@ juce::File resolveModelsDirImpl() {
 }
 
 constexpr int kSampleRate = sa3::orch::SAMPLE_RATE;   // 44100
+constexpr double kMaxScanSeconds = 300.0;   // cap the scanned track length (memory/encode)
 
 // Loop length plan in 44.1k samples for a given source duration (matches
 // StreamGenerator's even_ceil(loop_T) * SAMPLES_PER_LATENT with margin 0).
@@ -78,9 +79,10 @@ juce::AudioBuffer<float> MorphEngine::decodeToStereo44k(const juce::MemoryBlock&
     return out;
 }
 
-std::vector<float> MorphEngine::extractPeaks(const juce::AudioBuffer<float>& buf, int n) {
+std::vector<float> MorphEngine::extractPeaks(const juce::AudioBuffer<float>& buf, int n, int len) {
     std::vector<float> peaks((size_t)std::max(0, n), 0.0f);
-    const int len = buf.getNumSamples();
+    if (len < 0) len = buf.getNumSamples();
+    len = std::min(len, buf.getNumSamples());
     if (len <= 0 || n <= 0) return peaks;
     const int nch = std::max(1, buf.getNumChannels());
     const float* L = buf.getReadPointer(0);
@@ -155,37 +157,51 @@ void MorphEngine::loaderThreadMain(juce::MemoryBlock bytes, int peaks_n,
 
     try {
         writeStatus("Decoding source...");
-        juce::AudioBuffer<float> src = decodeToStereo44k(bytes);
-        const int   src_n   = src.getNumSamples();
-        const double src_secs = (double)src_n / kSampleRate;
+        juce::AudioBuffer<float> full = decodeToStereo44k(bytes);
+        int full_n = full.getNumSamples();
 
-        // peaks (computed on the source buffer)
-        std::vector<float> peaks = extractPeaks(src, peaks_n);
+        // Cap the scanned track length (bounds memory + the per-window encode). A
+        // longer file is truncated to the first kMaxScanSeconds; the playthrough
+        // starts at the top and slides the window forward through it.
+        const int max_n = (int)std::lround(kMaxScanSeconds * (double)kSampleRate);
+        if (full_n > max_n) full_n = max_n;
+
+        // The WINDOW is the morph basis (the engine slides it across the track as it
+        // plays). cfg.seconds = the window length; the source handed to the engine is
+        // the WHOLE (capped) track, which it scans. A file shorter than the window is
+        // just one static loop (no scanning).
+        const double full_secs = (double)full_n / kSampleRate;
+        const double win_s = window_seconds_.load(std::memory_order_acquire);
+        const double window_secs = (win_s > 0.0) ? std::min(full_secs, win_s) : full_secs;
+
+        const int   src_n   = full_n;
+        const double src_secs = full_secs;   // reported duration = the whole track
+
+        // peaks over the WHOLE track (the waveform the scan playhead travels across)
+        std::vector<float> peaks = extractPeaks(full, peaks_n, full_n);
         {
             std::lock_guard<std::mutex> lk(peaks_mutex_);
             source_peaks_ = peaks;
         }
 
-        // Planar source for the generator: [ch][samples].
+        // Planar full track for the generator: [ch][samples].
         std::vector<std::vector<float>> planar(2, std::vector<float>(src_n));
         for (int c = 0; c < 2; ++c)
-            std::copy(src.getReadPointer(c), src.getReadPointer(c) + src_n,
+            std::copy(full.getReadPointer(c), full.getReadPointer(c) + src_n,
                       planar[(size_t)c].begin());
 
-        // Build the ring sized to the playable loop, with the generator's small
-        // loop-fold. Tear down any prior generator first (joins its MLX thread).
+        // Build the ring sized to ONE WINDOW (the playable loop), with the loop-fold.
+        // Tear down any prior generator first (joins its MLX thread).
         if (generator_) { generator_->stop(); generator_.reset(); }
 
         sa3::rt::GenConfig cfg;
-        cfg.seconds = (float)src_secs;
+        cfg.seconds = (float)window_secs;
         cfg.depth   = 2;
         cfg.steps   = 8;
         cfg.family  = quality_.load(std::memory_order_acquire)
             ? sa3::orch::Family::Medium : sa3::orch::Family::SmMusic;
-        {
-            std::lock_guard<std::mutex> lk(ctrl_mutex_);
-            cfg.denoise = denoise_;
-        }
+        // cfg.denoise is the FIXED base trajectory (GenConfig default); the UI
+        // "Amount" is the morph strength, not the base denoise, so don't override.
         const int L = loopLenSamples(cfg.seconds);
         const int loop_xfade = (int)(cfg.loop_xfade_s * kSampleRate);
         ring_ = std::make_unique<sa3::rt::AudioRing>(L, 2, 2048, loop_xfade);
@@ -204,8 +220,9 @@ void MorphEngine::loaderThreadMain(juce::MemoryBlock bytes, int peaks_n,
         // Apply any controls set before load completed.
         {
             std::lock_guard<std::mutex> lk(ctrl_mutex_);
-            generator_->set_denoise(denoise_);
-            generator_->set_shared_curve("sde_denoise_curve", source_blend_);
+            generator_->set_morph_amount(denoise_);
+            generator_->set_style_intensity(source_blend_);
+            generator_->set_cfg(cfg_styled_);
             generator_->set_shared_curve("velocity_scale", velocity_);
             generator_->set_evolve(evolve_);
         }
@@ -240,17 +257,24 @@ void MorphEngine::startPlayback() {
 void MorphEngine::stopPlayback() { playing_.store(false); }
 
 // ── live controls ────────────────────────────────────────────────────
-void MorphEngine::setDenoise(float v) {
+void MorphEngine::setDenoise(float v) {   // UI "Amount" -> morph original<->styled
     { std::lock_guard<std::mutex> lk(ctrl_mutex_); denoise_ = v; }
-    if (generator_) generator_->set_denoise(v);
+    if (generator_) generator_->set_morph_amount(v);
 }
-void MorphEngine::setSourceBlend(float v) {
+void MorphEngine::setSourceBlend(float v) {   // UI "Intensity" -> styled-target strength
     { std::lock_guard<std::mutex> lk(ctrl_mutex_); source_blend_ = v; }
-    if (generator_) generator_->set_shared_curve("sde_denoise_curve", v);
+    if (generator_) generator_->set_style_intensity(v);
 }
 void MorphEngine::setVelocity(float v) {
     { std::lock_guard<std::mutex> lk(ctrl_mutex_); velocity_ = v; }
     if (generator_) generator_->set_shared_curve("velocity_scale", v);
+}
+void MorphEngine::setCfg(float v) {   // UI "CFG" -> styled-target guidance strength
+    { std::lock_guard<std::mutex> lk(ctrl_mutex_); cfg_styled_ = v; }
+    if (generator_) generator_->set_cfg(v);
+}
+void MorphEngine::setWindowSeconds(double s) {
+    window_seconds_.store(s, std::memory_order_release);   // applied on next load
 }
 void MorphEngine::setEvolve(bool on) {
     { std::lock_guard<std::mutex> lk(ctrl_mutex_); evolve_ = on; }
@@ -270,7 +294,7 @@ MorphEngine::MorphState MorphEngine::getMorphState() const {
     s.playing  = playing_.load();
     s.loopSecs = loop_secs_.load();
     const int L = loop_len_.load();
-    if (ring_ && L > 0) s.progress = (double)(ring_->pos() % L) / (double)L;
+    const double phase = (ring_ && L > 0) ? (double)(ring_->pos() % L) / (double)L : 0.0;
     {
         std::lock_guard<std::mutex> lk(ctrl_mutex_);
         s.denoise = denoise_; s.sourceBlend = source_blend_;
@@ -279,6 +303,21 @@ MorphEngine::MorphState MorphEngine::getMorphState() const {
     if (generator_) {
         auto gs = generator_->stats();
         s.tickMs = gs.tick_ms; s.decodeMs = gs.decode_ms; s.completions = gs.completions;
+        // Playhead: when scanning a long track, the track position is the chunk's
+        // source start + how far the play cursor has advanced past the chunk's output
+        // base (NOT the loop phase — that sawtooths against the chunk geometry and made
+        // the cursor jump). total_read() is the live monotonic play cursor.
+        if (gs.full_samples > 0 && gs.window_samples > 0) {
+            const long tr = ring_ ? ring_->total_read() : 0;
+            double trackPos = (double)gs.scan_start + (double)(tr - gs.chunk_base);
+            trackPos = std::max(0.0, std::min((double)gs.full_samples, trackPos));
+            s.progress = trackPos / (double)gs.full_samples;
+            s.loopSecs = (double)gs.full_samples / kSampleRate;   // playhead spans the track
+        } else {
+            s.progress = phase;
+        }
+    } else {
+        s.progress = phase;
     }
     return s;
 }

@@ -56,6 +56,11 @@ long AudioRing::pos() const {
     return pos_;
 }
 
+long AudioRing::total_read() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return total_read_;
+}
+
 bool AudioRing::has_audio() const {
     std::lock_guard<std::mutex> lk(mutex_);
     return has_audio_;
@@ -82,6 +87,7 @@ void AudioRing::read(int n, std::vector<std::vector<float>>& out) {
     std::lock_guard<std::mutex> lk(mutex_);
     const long pos = pos_;
     pos_ = (pos + n) % L_;
+    total_read_ += n;
     copy_from(pos, n, out);
 }
 
@@ -93,6 +99,7 @@ void AudioRing::read_peek(int n, std::vector<std::vector<float>>& out) const {
 void AudioRing::advance(int n) {
     std::lock_guard<std::mutex> lk(mutex_);
     pos_ = (pos_ + n) % L_;
+    total_read_ += n;
 }
 
 void AudioRing::write_loop(const std::vector<std::vector<float>>& audio_in) {
@@ -113,6 +120,38 @@ void AudioRing::write_loop(const std::vector<std::vector<float>>& audio_in) {
         }
     }
     buf_ = std::move(a);
+    has_audio_ = true;
+}
+
+long AudioRing::write_head() const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return write_head_;
+}
+
+void AudioRing::write_forward(long start, const std::vector<std::vector<float>>& audio,
+                              int xfade) {
+    const int len = (audio.empty() || audio[0].empty()) ? 0 : (int)audio[0].size();
+    if (len <= 0) return;
+    auto [fi, fo] = equal_power(std::min({xfade, len, L_}));
+    const int xf = (int)fi.size();
+
+    std::lock_guard<std::mutex> lk(mutex_);
+    for (int c = 0; c < ch_; ++c) {
+        const std::vector<float>& src = audio[std::min(c, (int)audio.size() - 1)];
+        for (int k = 0; k < len; ++k) {
+            long idx = (start + k) % L_;
+            if (idx < 0) idx += L_;
+            // Equal-power blend the leading xfade frames into what's already there
+            // (a fresher decode of the same region), then hard-write the remainder.
+            if (k < xf && has_audio_) {
+                buf_[c][idx] = src[k] * fi[k] + buf_[c][idx] * fo[k];
+            } else {
+                buf_[c][idx] = src[k];
+            }
+        }
+    }
+    const long endp = start + len;
+    if (endp > write_head_) write_head_ = endp;
     has_audio_ = true;
 }
 

@@ -77,11 +77,18 @@ public:
     std::vector<float> getSourcePeaks() const;
 
     // ── Live controls (message thread → generator) ───────────────────
-    void setDenoise(float v);
-    void setSourceBlend(float v);   // sde_denoise_curve scalar: 1=explore, 0=anchor
-    void setVelocity(float v);      // velocity_scale scalar (1=neutral)
+    void setDenoise(float v);       // "Amount": 0=original loop .. 1=styled target
+    void setSourceBlend(float v);   // "Intensity": how extreme the styled endpoint is
+    void setVelocity(float v);      // "Motion": velocity_scale (1=neutral)
+    void setCfg(float v);           // "CFG": prompt-guidance strength for the styled target
     void setEvolve(bool on);
     void setPrompt(const std::string& text);
+
+    // Source window: morph only the LAST n seconds of a dropped file (so an entire
+    // track loops/morphs on its recent window, not its whole length). Applied on
+    // the NEXT load; <=0 means use the whole file. The editor reloads to apply.
+    void setWindowSeconds(double s);
+    double windowSeconds() const { return window_seconds_.load(std::memory_order_acquire); }
 
     // Quality mode: medium DiT + SAME-L (stronger style transfer, ~6x slower per
     // tick) vs Live: sm-music + SAME-S (fast). The model family is fixed when the
@@ -101,7 +108,7 @@ public:
 private:
     void loaderThreadMain(juce::MemoryBlock bytes, int peaks_n, CompletionFn completion);
     static juce::AudioBuffer<float> decodeToStereo44k(const juce::MemoryBlock& bytes);
-    static std::vector<float> extractPeaks(const juce::AudioBuffer<float>& buf, int n);
+    static std::vector<float> extractPeaks(const juce::AudioBuffer<float>& buf, int n, int len = -1);
     std::string resolveModelsDir() const;
     void writeStatus(juce::String s);
 
@@ -114,6 +121,8 @@ private:
     std::atomic<bool>  load_in_flight_{false};
     std::atomic<bool>  quality_{true};      // default Quality(medium) — much stronger
                                             // style transfer; false=Live(sm-music, fast)
+    std::atomic<double> window_seconds_{10.0};  // morph the last N s of a dropped file
+                                                // (<=0 = whole file); applied on load
 
     std::thread loader_;        // one-shot loader (joined on next load / dtor)
 
@@ -123,7 +132,7 @@ private:
 
     // Live control mirror (so getMorphState can report knob values).
     mutable std::mutex ctrl_mutex_;
-    float denoise_ = 0.5f, source_blend_ = 1.0f, velocity_ = 1.0f;
+    float denoise_ = 0.5f, source_blend_ = 0.6f, velocity_ = 1.0f, cfg_styled_ = 2.0f;
     bool  evolve_ = false;
 
     std::vector<float> source_peaks_;

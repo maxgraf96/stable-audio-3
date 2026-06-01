@@ -98,6 +98,15 @@ public:
     // this tick, or std::nullopt during warmup / when none finish.
     std::optional<mx::array> tick();
 
+    // Most-denoised in-flight latent (highest step_idx) for PROGRESSIVE decode —
+    // lets a streaming caller decode a chunk as it sharpens instead of waiting for
+    // a finished generation. nullopt when no slots are active.
+    std::optional<mx::array> best_latent() const;
+
+    // Drop all in-flight slots + queued requests (e.g. when the source window jumps
+    // to a new chunk, so stale content doesn't linger in best_latent()).
+    void clear();
+
     void set_depth(int depth);
 
 private:

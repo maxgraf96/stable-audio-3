@@ -50,12 +50,15 @@ struct GenConfig {
     float    seconds      = 8.0f;
     int      steps        = 8;
     int      depth        = 2;
-    float    denoise      = 0.5f;
-    float    denoise_slew = 0.25f;   // max change in effective denoise per SUBMISSION
-                                     // (~completion). 0.25 -> a full-range Amount
-                                     // move converges in ~3 completions, model-speed-
-                                     // independent. Was 0.04 = ~16 completions, which
-                                     // felt stuck on the slow medium model.
+    float    denoise      = 0.3f;    // STATIC-loop base trajectory: the init mix
+                                     // (source*(1-d)+noise*d) + euler steps that the
+                                     // banked-target morph blends toward the styled
+                                     // endpoint. Low so Amount=0 stays close to the
+                                     // original loop (the target has its own denoise).
+    float    scan_denoise = 0.85f;   // PLAYTHROUGH trajectory: per-frame styling needs
+                                     // room (sigma_max), so this is high; the sde curve
+                                     // (Amount) pulls back to source at Amount=0 and
+                                     // explores/styles at Amount=1. Tunable.
     std::string prompt;
     uint64_t seed_base    = 1000;
     float    margin_s     = 0.0f;    // interior-windowing margin per side (0 = cyclic decode)
@@ -80,6 +83,12 @@ struct GenConfig {
 struct GenStats {
     long ticks = 0, completions = 0, decodes = 0, skips = 0;
     double tick_ms = 0.0, decode_ms = 0.0;
+    // Scan telemetry (sliding window over a track longer than the window). The
+    // playhead's track position = scan_start + (ring.total_read() - chunk_base).
+    long scan_start = 0;        // current chunk's source start (samples into the full track)
+    long chunk_base = 0;        // current chunk's OUTPUT base (play position where its interior starts)
+    int  window_samples = 0;    // window length (samples)
+    long full_samples = 0;      // full track length (samples); <=window => not scanning
 };
 
 class StreamGenerator {
@@ -95,8 +104,10 @@ public:
     bool wait_ready(double timeout_s);     // blocks until first loop is audible
 
     // Control API (any thread).
-    void set_denoise(float v);
-    void set_shared_curve(const std::string& name, float value);   // scalar curve
+    void set_morph_amount(float v);     // Amount: 0=original loop, 1=styled target
+    void set_style_intensity(float v);  // Character: how far the styled endpoint departs
+    void set_cfg(float v);              // CFG strength used to build the styled target
+    void set_shared_curve(const std::string& name, float value);   // velocity_scale
     void clear_shared_curve(const std::string& name);
     void set_prompt(const std::string& text);
     void set_evolve(bool on);
@@ -107,6 +118,18 @@ private:
     void run();                            // worker thread entry
     void setup();                          // model load (on worker thread)
     void encode_prompt(const std::string& text);
+    void encode_window(long start_sample);  // encode init_latents_ from track[start:start+window]
+    mx::array encode_window_latent(long start_sample);   // ...returns the latent (scan: per-chunk source)
+    void static_tick();                     // one iteration: looping morph (source <= one window)
+    void scan_tick();                       // one iteration: forward-streaming playthrough
+    void apply_scan_controls();             // re-encode prompt + velocity (Amount is the decode lerp)
+    void submit_target(const mx::array& source);  // styled-TARGET generation for a chunk (held, stable)
+    // Windowed decode of a sub-range [off, off+win] (latent frames) -> planar audio.
+    std::vector<std::vector<float>> decode_window(const mx::array& lat, int off_frames, int win_frames);
+    // Latent morph lerp(src,tgt,amount) then windowed-decode at the playhead.
+    std::vector<std::vector<float>> decode_morph(const mx::array& src, const mx::array& tgt,
+                                                 float amount, int off_frames, int win_frames);
+    void compute_styled_target();          // (re)build the banked styled latent (wet endpoint)
     void submit_morph();
     void apply_shared_curves();
     std::vector<std::vector<float>> decode_crop(const mx::array& lat);
@@ -122,9 +145,11 @@ private:
 
     // Control state (guarded by ctrl_mutex_).
     mutable std::mutex ctrl_mutex_;
-    float denoise_target_;
-    std::optional<float> sde_curve_;        // nullopt = inactive
-    std::optional<float> velocity_scale_;
+    float morph_amount_   = 0.5f;           // Amount (0..1): original->styled blend
+    float style_intensity_ = 0.6f;          // Character (0..1): styled-target denoise
+    float cfg_styled_     = 2.0f;           // CFG strength for the styled-target pass
+    bool  need_retarget_  = false;          // recompute styled_target_ next tick
+    std::optional<float> velocity_scale_;   // nullopt = inactive (Motion)
     std::optional<std::string> new_prompt_;
     bool evolve_;
     GenStats stats_;
@@ -132,22 +157,44 @@ private:
     // MLX/model state (worker thread only).
     std::unique_ptr<orch::Pipeline> pipe_models_;
     std::unique_ptr<stream::StreamPipeline> pipe_;
+    stream::DiTForward dit_fwd_;             // bound DiT, reused for the styled-target pass
     // Codec decode bound to the active family: (latents[1,256,T], chunk, ovl,
     // cyclic) -> patches [1,512,T*16]. Lets decode_crop stay family-agnostic.
     std::function<mx::array(const mx::array&, int, int, bool)> codec_decode_;
     int gen_T_ = 0;
     int crop_start_ = 0;       // interior-window start (samples)
-    int loop_samples_ = 0;     // interior length played back (samples)
+    int loop_samples_ = 0;     // interior length played back (samples) == window length
+
+    // Traveling window: when the source is longer than one window, slide the
+    // window forward through the track as playback advances (a 1x restyled
+    // playthrough). scanning_ gates it; scan_start_ is the current window's start
+    // sample into the full src_; last_boundary_pos_ is the ring play cursor at the
+    // last advance (a window of playback == one boundary).
+    bool scanning_ = false;
+    long scan_start_ = 0;
+    long last_boundary_pos_ = 0;
     int chunk_ = 8, ovl_ = 2;  // codec decode params (SAME-S 8/2, SAME-L 128/2)
     uint64_t seed_ = 0;
-    float denoise_eff_ = 0.5f;
     std::optional<mx::array> init_latents_;
+    std::optional<mx::array> styled_target_;   // banked styled latent (the "wet" endpoint)
     std::optional<mx::array> cross_;
     std::optional<mx::array> gcond_;
     std::optional<mx::array> neg_cross_;    // null (empty-prompt) conditioning for CFG
     std::optional<mx::array> secs_e_;
-    std::optional<mx::array> last_latent_;
+    std::optional<mx::array> last_latent_;   // static-loop mode: last finished latent
     bool prompt_active_ = false;            // non-empty style prompt -> enable CFG
+
+    // Playthrough = stable banked-target morph per chunk. Each chunk has a SOURCE
+    // latent (_src_, the Amount=0 endpoint) and a styled TARGET latent (_latent_,
+    // the Amount=1 endpoint, generated ONCE and held -> stable, no per-completion
+    // stochastic silence). The output is a latent morph lerp(src,tgt,Amount) decoded
+    // at the playhead (Amount = 1-tick). The pipe builds the NEXT chunk's target one
+    // chunk ahead; at the overlap we crossfade cur->next.
+    std::optional<mx::array> cur_src_, cur_latent_;   // current chunk: source + styled target
+    std::optional<mx::array> nxt_src_, next_latent_;  // next chunk: source + styled target
+    bool transitioning_ = false;
+    long next_base_ = 0, next_scan_ = 0;     // incoming chunk's play-base / source-start
+    long xfade_start_ = -1;                  // playhead where the cur->next crossfade began
 };
 
 }  // namespace rt

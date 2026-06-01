@@ -112,6 +112,9 @@ target_link_libraries(test_stream_parity PRIVATE stream dit_sm samel sa3_pipelin
 add_executable(test_stream_runtime test_stream_runtime.cpp)
 target_link_libraries(test_stream_runtime PRIVATE stream_runtime)
 
+add_executable(test_scan_structure test_scan_structure.cpp)
+target_link_libraries(test_scan_structure PRIVATE stream_runtime)
+
 add_executable(sa3_cli sa3_cli.cpp)
 target_link_libraries(sa3_cli PRIVATE sa3_orchestrator)
 
@@ -121,7 +124,7 @@ target_link_libraries(test_sm_e2e PRIVATE sa3_orchestrator)
 # The MLX dylib lives in the venv; embed its directory as an rpath so the
 # binaries find libmlx.dylib without DYLD_LIBRARY_PATH gymnastics.
 get_filename_component(MLX_LIB_DIR "${MLX_VENV_CMAKE}/../../../lib" ABSOLUTE)
-foreach(tgt spike test_sa3_pipeline test_samel_encoder test_samel_decoder test_t5gemma test_t5gemma_encode test_dit test_dit_sm test_sames_decoder test_sames_encoder sa3_cli test_sm_e2e test_stream_parity test_stream_runtime)
+foreach(tgt spike test_sa3_pipeline test_samel_encoder test_samel_decoder test_t5gemma test_t5gemma_encode test_dit test_dit_sm test_sames_decoder test_sames_encoder sa3_cli test_sm_e2e test_stream_parity test_stream_runtime test_scan_structure)
     set_target_properties(${tgt} PROPERTIES
         INSTALL_RPATH "${MLX_LIB_DIR}"
         BUILD_RPATH   "${MLX_LIB_DIR}")

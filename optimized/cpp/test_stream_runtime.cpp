@@ -91,9 +91,9 @@ int main(int argc, char** argv) {
                 peak = std::max(peak, (double)std::fabs(v));
             }
         // Exercise live controls mid-run.
-        if (i == nblocks / 4)  gen.set_shared_curve("sde_denoise_curve", 0.2f);
-        if (i == nblocks / 2)  gen.set_denoise(0.7f);
-        if (i == 3 * nblocks / 4) gen.set_shared_curve("sde_denoise_curve", 1.0f);
+        if (i == nblocks / 4)  gen.set_style_intensity(0.2f);
+        if (i == nblocks / 2)  gen.set_morph_amount(0.7f);
+        if (i == 3 * nblocks / 4) gen.set_morph_amount(1.0f);
         std::this_thread::sleep_until(next);
     }
 

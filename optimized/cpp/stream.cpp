@@ -231,6 +231,21 @@ void StreamPipeline::advance(std::vector<Slot*>& slots) {
     mx::eval(to_eval);
 }
 
+// ── progressive decode + reset ──────────────────────────────────────
+std::optional<mx::array> StreamPipeline::best_latent() const {
+    const Slot* best = nullptr;
+    for (const auto& s : slots_) {
+        if (s && (best == nullptr || s->step_idx > best->step_idx)) best = s.get();
+    }
+    if (best != nullptr) return best->xt;
+    return std::nullopt;
+}
+
+void StreamPipeline::clear() {
+    for (auto& s : slots_) s.reset();
+    queue_.clear();
+}
+
 // ── hot depth resize (in-flight slots survive) ──────────────────────
 void StreamPipeline::set_depth(int depth) {
     depth = std::max(1, std::min(depth, MAX_DEPTH));

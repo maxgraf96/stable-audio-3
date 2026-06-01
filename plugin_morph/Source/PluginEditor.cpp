@@ -175,6 +175,12 @@ juce::WebBrowserComponent::Options buildOptions(SA3MorphProcessor& processor) {
                 if (! a.isEmpty()) processor.getEngine().setVelocity((float)(double)a[0]);
                 complete(juce::var());
             })
+        .withNativeFunction("setCfg",
+            [&processor](const juce::Array<juce::var>& a,
+                         juce::WebBrowserComponent::NativeFunctionCompletion complete) {
+                if (! a.isEmpty()) processor.getEngine().setCfg((float)(double)a[0]);
+                complete(juce::var());
+            })
         .withNativeFunction("setEvolve",
             [&processor](const juce::Array<juce::var>& a,
                          juce::WebBrowserComponent::NativeFunctionCompletion complete) {
@@ -200,6 +206,17 @@ juce::WebBrowserComponent::Options buildOptions(SA3MorphProcessor& processor) {
             [&processor](const juce::Array<juce::var>&,
                          juce::WebBrowserComponent::NativeFunctionCompletion complete) {
                 complete(peaksToVar(processor.getEngine().getSourcePeaks()));
+            })
+        // setWindow(seconds) -> changed:bool. The source window is fixed when the
+        // generator is built, so JS reloads the current source when this returns true.
+        .withNativeFunction("setWindow",
+            [&processor](const juce::Array<juce::var>& a,
+                         juce::WebBrowserComponent::NativeFunctionCompletion complete) {
+                const double s = a.isEmpty() ? 10.0 : (double)a[0];
+                auto& eng = processor.getEngine();
+                const bool changed = std::abs(eng.windowSeconds() - s) > 1e-6;
+                eng.setWindowSeconds(s);
+                complete(juce::var(changed));
             });
 }
 

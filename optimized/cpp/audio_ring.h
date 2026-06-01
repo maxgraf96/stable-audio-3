@@ -38,7 +38,8 @@ public:
 
     int  length() const { return L_; }
     int  channels() const { return ch_; }
-    long pos() const;
+    long pos() const;             // play cursor, wrapped to [0, L)
+    long total_read() const;      // MONOTONIC frames consumed (never wraps) — for scan timing
     bool has_audio() const;
 
     // Read the next n frames into `out` (planar [ch][n]), wrapping once at the
@@ -59,6 +60,15 @@ public:
     // Generator thread only.
     void write_loop(const std::vector<std::vector<float>>& audio);
 
+    // Forward-FIFO write: install `audio` at ABSOLUTE play position `start` (the
+    // same monotonic frame index total_read() counts in), wrapping the physical
+    // buffer mod L_. The first `xfade` frames equal-power-blend over whatever is
+    // already there so overlapping per-tick decodes don't click. Used by the
+    // streaming playthrough (windowed decode at the advancing playhead). The
+    // producer keeps `start` ahead of the reader; the reader never loops back.
+    void write_forward(long start, const std::vector<std::vector<float>>& audio, int xfade);
+    long write_head() const;   // furthest absolute frame written (monotonic)
+
 private:
     std::vector<std::vector<float>> fit(const std::vector<std::vector<float>>& audio) const;
     // Copy n frames from `pos` into out (wrapping once). Caller holds mutex_.
@@ -69,7 +79,9 @@ private:
     int ch_;
     int xfade_;
     std::vector<std::vector<float>> buf_;   // [ch][L]
-    long pos_ = 0;                          // play cursor (reader-owned)
+    long pos_ = 0;                          // play cursor (reader-owned), wrapped
+    long total_read_ = 0;                   // monotonic frames consumed (reader-owned)
+    long write_head_ = 0;                   // furthest absolute frame written (producer)
     bool has_audio_ = false;
     std::vector<float> fade_in_, fade_out_;
     mutable std::mutex mutex_;

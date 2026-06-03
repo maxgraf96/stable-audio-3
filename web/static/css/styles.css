@@ -493,17 +493,9 @@ input, textarea { font-family: inherit; color: inherit; }
 }
 .beat-grid { position: absolute; inset: 0; pointer-events: none; opacity: 0.5; }
 
-/* Remixing scan + readout */
+/* Remixing overlay — veil + readout while the waveform itself grows from
+ * the centerline outward (see setWaveGrow in app.js). */
 .remix-overlay { position: absolute; inset: 0; pointer-events: none; }
-.remix-overlay .scan {
-  position: absolute;
-  top: 0; bottom: 0;
-  width: 2px;
-  background: linear-gradient(to bottom, transparent, var(--accent), transparent);
-  box-shadow: 0 0 12px var(--accent);
-  opacity: 0.85;
-  transition: left 200ms linear;
-}
 .remix-overlay .veil {
   position: absolute; inset: 0;
   background: linear-gradient(180deg, transparent 0%, color-mix(in oklab, var(--accent), transparent 95%) 50%, transparent 100%);
@@ -849,6 +841,19 @@ input, textarea { font-family: inherit; color: inherit; }
   color: var(--ink-3);
 }
 .prompt-cta .lead b { color: var(--ink-2); font-weight: 500; }
+.lead-analyzing {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink-2);
+}
+.lead-analyzing .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: blink 1.2s ease-in-out infinite;
+}
 
 .remix-btn {
   appearance: none;
@@ -1138,7 +1143,7 @@ input, textarea { font-family: inherit; color: inherit; }
 
 .stage-list {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(6, 1fr);
   gap: 10px;
 }
 .stage-list .stg {
@@ -1296,7 +1301,7 @@ input, textarea { font-family: inherit; color: inherit; }
   .controls { grid-template-columns: 1fr; }
   .transport { grid-template-columns: auto 1fr; }
   .transport .tp-right { grid-column: 1 / -1; justify-content: space-between; flex-wrap: wrap; }
-  .stage-list { grid-template-columns: 1fr 1fr; }
+  .stage-list { grid-template-columns: repeat(3, 1fr); }
   .guide { grid-template-columns: 1fr; gap: 0; }
   .guide .step { border-top: 1px solid var(--line-soft); padding-top: 14px; padding-bottom: 4px; }
 }

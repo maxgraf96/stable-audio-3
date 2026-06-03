@@ -10,6 +10,7 @@ import asyncio
 import io
 import json
 import os
+import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -18,7 +19,7 @@ import soundfile as sf
 import torch
 import torchaudio
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -186,27 +187,62 @@ async def remix(
                 model, prompt, waveform, sr, duration,
                 init_noise_level, steps, cfg_scale, seed, step_callback,
             )
+            # Diffusion + VAE decode are both inside model.generate(). Once it
+            # returns, the GPU work is done — tell the client so it can stop
+            # showing "step N/N" and switch to "encoding & sending".
+            if queue is not None:
+                queue.put_nowait({"stage": "vae_done"})
+
+            mp3_bytes = await asyncio.to_thread(
+                _encode_mp3, audio_out, model.model.sample_rate,
+            )
         finally:
             if job_id:
                 JOBS.pop(job_id, None)
                 if queue is not None:
                     queue.put_nowait(None)  # sentinel: done
 
-    np_out = audio_out.transpose(0, 1).contiguous().numpy()
-    buf = io.BytesIO()
-    sf.write(buf, np_out, model.model.sample_rate, format="WAV", subtype="PCM_16")
-    buf.seek(0)
-    return StreamingResponse(
-        buf,
-        media_type="audio/wav",
-        headers={"Content-Disposition": 'inline; filename="remix.wav"'},
+    return Response(
+        content=mp3_bytes,
+        media_type="audio/mpeg",
+        headers={"Content-Disposition": 'inline; filename="remix.mp3"'},
     )
+
+
+def _encode_mp3(audio_tensor, sample_rate, bitrate_kbps=320):
+    """Encode a (channels, samples) float tensor as 320 kbps MP3 via ffmpeg.
+
+    We write the audio as WAV into ffmpeg's stdin and read the MP3 from stdout
+    — keeps the encoder in-memory and avoids touching disk. ~10× smaller wire
+    payload than raw WAV; decodes natively in Web Audio's decodeAudioData.
+    """
+    # (channels, samples) → (samples, channels) for soundfile.
+    np_out = audio_tensor.transpose(0, 1).contiguous().numpy()
+    wav_buf = io.BytesIO()
+    sf.write(wav_buf, np_out, sample_rate, format="WAV", subtype="PCM_16")
+    proc = subprocess.run(
+        [
+            "ffmpeg", "-loglevel", "error",
+            "-f", "wav", "-i", "pipe:0",
+            "-c:a", "libmp3lame", "-b:a", f"{bitrate_kbps}k",
+            "-f", "mp3", "pipe:1",
+        ],
+        input=wav_buf.getvalue(),
+        capture_output=True,
+        check=True,
+    )
+    return proc.stdout
 
 
 def _generate(model, prompt, waveform, sr, duration, noise, steps, cfg, seed, callback):
     out = model.generate(
         prompt=prompt,
         duration=duration,
+        # Raise the hard sample-count cap to the model's full configured length.
+        # The default in model.generate is 5292032 samples (~120s @ 44.1 kHz),
+        # which silently truncated everything to 2 minutes regardless of the
+        # duration argument. The medium model is trained up to ~6m20s.
+        sample_size=model.model_config["sample_size"],
         steps=int(steps),
         cfg_scale=float(cfg),
         seed=int(seed),

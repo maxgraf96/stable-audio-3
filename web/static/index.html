@@ -4,7 +4,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Remix — A/B lab</title>
+    <title>Remix</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&display=swap">
@@ -154,7 +154,7 @@
                 </div>
                 <div class="prompt-wrap">
                     <textarea id="prompt" spellcheck="false"
-                        placeholder="e.g. Bossa nova jazz, brushed drums, Brazilian violins.">TrackType: Music, VocalType: Vocal harmonies. Bossa nova jazz background harmonies. Light acoustic guitar, Brazilian percussion and upright bass.</textarea>
+                        placeholder="e.g. Bossa nova, brushed drums, Brazilian violins.">TrackType: Music, VocalType: Instrumental. Bossa nova background harmonies. Light acoustic guitar, Brazilian percussion and upright bass.</textarea>
                     <div class="prompt-suffix">
                         <span class="lbl">Auto-appended on submit:</span>
                         <span class="auto">BPM <b id="suffixBpm">—</b></span>
@@ -163,7 +163,10 @@
                 </div>
                 <div class="prompt-cta">
                     <div class="lead">
-                        <b id="promptCharCount">0</b> characters
+                        <span id="ctaLeadDefault"><b id="promptCharCount">0</b> characters</span>
+                        <span id="ctaLeadAnalyzing" class="lead-analyzing" hidden>
+                            <span class="dot"></span>Estimating tempo and key…
+                        </span>
                     </div>
                     <button class="remix-btn" id="remixBtn">
                         <span class="arr" id="remixArr">▶</span>

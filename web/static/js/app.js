@@ -15,10 +15,12 @@ const MAX_VARIANTS = 4;
 const ETA_BASE_SEC = 12;
 
 const STAGES = [
-  { id: "separate", label: "Separating vocals",     short: "Vocals",  weight: 0.30 },
-  { id: "upload",   label: "Uploading instrumental", short: "Upload",  weight: 0.10 },
-  { id: "gpu",      label: "Generating audio",       short: "Generate", weight: 0.50 },
-  { id: "mixdown",  label: "Mixing vocals back",    short: "Mixdown", weight: 0.10 },
+  { id: "analyze",  label: "Estimating tempo and key", short: "Analyze",  weight: 0.05 },
+  { id: "separate", label: "Separating vocals",        short: "Vocals",   weight: 0.20 },
+  { id: "upload",   label: "Uploading instrumental",   short: "Upload",   weight: 0.10 },
+  { id: "gpu",      label: "Generating audio",         short: "Generate", weight: 0.40 },
+  { id: "finalize", label: "Finalizing audio",         short: "Finalize", weight: 0.15 },
+  { id: "mixdown",  label: "Mixing vocals back",       short: "Mixdown",  weight: 0.10 },
 ];
 
 // ─── DOM ────────────────────────────────────────────────────────────────────
@@ -119,6 +121,7 @@ const state = {
   inputBuffer: null,   // AudioBuffer, 44.1k stereo
   inputPeaks: null,    // Float32Array of length 420
   analysis: { bpm: null, key: null, analyzing: false },
+  analysisPromise: null,
   vocalsBuffer: null,
   instrumentalBuffer: null,
   variants: [],        // [{n, prompt, label, runtime, audioBuffer, peaks, wavUrl}]
@@ -141,6 +144,23 @@ vocalGainEl.addEventListener("input", () => {
   vocalGainVal.textContent = parseFloat(vocalGainEl.value).toFixed(2) + "×";
 });
 promptEl.addEventListener("input", updatePromptCharCount);
+
+// Surface a small inline notice next to the Remix button while BPM/Key
+// detection is in flight. The button itself stays clickable — if the user
+// hits Remix early, the loading screen handles the wait as the first stage.
+function updateRemixDisabled() {
+  const analyzing =
+    state.analysis.analyzing
+    && !bpmEl.value.trim()
+    && !keyEl.value.trim();
+  remixBtn.title = analyzing
+    ? "Tempo/key still detecting — we'll wait briefly in the next step if you remix now."
+    : "";
+  const leadDefault = document.getElementById("ctaLeadDefault");
+  const leadAnalyzing = document.getElementById("ctaLeadAnalyzing");
+  if (leadDefault) leadDefault.hidden = analyzing;
+  if (leadAnalyzing) leadAnalyzing.hidden = !analyzing;
+}
 function updatePromptCharCount() { promptCharCount.textContent = String(promptEl.value.length); }
 updatePromptCharCount();
 
@@ -204,6 +224,7 @@ function reset() {
   state.inputBuffer = null;
   state.inputPeaks = null;
   state.analysis = { bpm: null, key: null, analyzing: false };
+  state.analysisPromise = null;
   state.vocalsBuffer = null;
   state.instrumentalBuffer = null;
   state.variants = [];
@@ -237,29 +258,41 @@ async function handleFile(file) {
   state.stage = "ready";
   render();
 
-  // Fire analysis in the background.
+  // Fire analysis in the background. Remix stays clickable — if the user
+  // submits before it lands, startRemix treats "Estimating tempo and key"
+  // as the first stage in the progress card.
   analyzeTrack(file);
+  updateRemixDisabled();
 }
 
-async function analyzeTrack(file) {
+function analyzeTrack(file) {
+  // Wrap the actual work in a promise we stash on state so startRemix can
+  // optionally await it (with a timeout) when the user hits Remix early.
   state.analysis = { bpm: null, key: null, analyzing: true };
   updateBpmKeyStatus();
-  try {
-    const fd = new FormData();
-    fd.append("audio", file, file.name);
-    const r = await fetch("/api/analyze", { method: "POST", body: fd });
-    if (!r.ok) throw new Error(`status ${r.status}`);
-    const { bpm, key } = await r.json();
-    state.analysis = { bpm, key, analyzing: false };
-    if (bpm != null && bpmEl.value.trim() === "") bpmEl.value = String(Math.round(bpm));
-    if (key && keyEl.value.trim() === "") keyEl.value = titleCaseKey(key);
-  } catch (e) {
-    console.warn("[analyze] failed:", e);
-    state.analysis = { bpm: null, key: null, analyzing: false };
-  }
-  updateBpmKeyStatus();
-  updateReelAStats();
-  updatePromptSuffix();
+  const p = (async () => {
+    try {
+      const fd = new FormData();
+      fd.append("audio", file, file.name);
+      const r = await fetch("/api/analyze", { method: "POST", body: fd });
+      if (!r.ok) throw new Error(`status ${r.status}`);
+      const { bpm, key } = await r.json();
+      state.analysis = { bpm, key, analyzing: false };
+      if (bpm != null && bpmEl.value.trim() === "") bpmEl.value = String(Math.round(bpm));
+      if (key && keyEl.value.trim() === "") keyEl.value = titleCaseKey(key);
+    } catch (e) {
+      console.warn("[analyze] failed:", e);
+      state.analysis = { bpm: null, key: null, analyzing: false };
+    }
+    updateBpmKeyStatus();
+    updateReelAStats();
+    updatePromptSuffix();
+    updateRemixDisabled();
+  })();
+  state.analysisPromise = p;
+  p.finally(() => {
+    if (state.analysisPromise === p) state.analysisPromise = null;
+  });
 }
 
 function titleCaseKey(k) {
@@ -282,8 +315,8 @@ function updatePromptSuffix() {
   suffixBpm.textContent = state.analysis.analyzing ? "…" : (bpmEl.value || "—");
   suffixKey.textContent = state.analysis.analyzing ? "…" : (keyEl.value || "—");
 }
-bpmEl.addEventListener("input", updatePromptSuffix);
-keyEl.addEventListener("input", updatePromptSuffix);
+bpmEl.addEventListener("input", () => { updatePromptSuffix(); updateRemixDisabled(); });
+keyEl.addEventListener("input", () => { updatePromptSuffix(); updateRemixDisabled(); });
 
 function updateBpmKeyStatus() {
   if (state.analysis.analyzing) {
@@ -554,20 +587,21 @@ function paintReel(bodyEl, role, peaks, durationSec, bpm, opts = {}) {
   bodyEl.appendChild(ruler);
 
   // Remixing overlay — created hidden; only revealed once the actual GPU
-  // diffusion step begins (see beginScanAnim).
+  // diffusion step begins (see beginScanAnim). The waveform itself starts
+  // collapsed flat against the centerline and grows outward as the model
+  // generates (driven by the real per-step progress).
   if (opts.remixing) {
     const ov = document.createElement("div");
     ov.className = "remix-overlay";
     ov.hidden = true;
     ov.innerHTML = `
       <div class="veil"></div>
-      <div class="scan" style="left:6%"></div>
       <div class="readout"><span class="blip"></span><span id="ovReadout">generating · 0%</span></div>
     `;
     bodyEl.appendChild(ov);
     bodyEl._overlay = ov;
-    bodyEl._scan = ov.querySelector(".scan");
     bodyEl._ovReadout = ov.querySelector("#ovReadout");
+    setWaveGrow(bodyEl._svg, 0);
   }
 
   // Hover readout + click-to-seek
@@ -641,18 +675,23 @@ function paintWaveformInto(svg, peaks, role, playPct) {
     <defs>
       <clipPath id="clip-played-${role}"><rect data-clip="played" x="0" y="0" width="0" height="${H}"/></clipPath>
       <clipPath id="clip-future-${role}"><rect data-clip="future" x="0" y="0" width="${W}" height="${H}"/></clipPath>
+      <filter id="grow-fx-${role}" x="-10%" y="-10%" width="120%" height="120%">
+        <feGaussianBlur data-blur stdDeviation="0"/>
+      </filter>
     </defs>
-    <g clip-path="url(#clip-future-${role})" opacity="0.42">
-      <path d="${dTop} L ${W} ${H/2} Z" fill="${color}" opacity="0.18"/>
-      <path d="${dBot} L ${W} ${H/2} Z" fill="${color}" opacity="0.18"/>
-      <path d="${dTop}" stroke="${color}" stroke-width="1" fill="none"/>
-      <path d="${dBot}" stroke="${color}" stroke-width="1" fill="none"/>
-    </g>
-    <g clip-path="url(#clip-played-${role})">
-      <path d="${dTop} L ${W} ${H/2} Z" fill="${color}" opacity="0.35"/>
-      <path d="${dBot} L ${W} ${H/2} Z" fill="${color}" opacity="0.35"/>
-      <path d="${dTop}" stroke="${color}" stroke-width="1.2" fill="none"/>
-      <path d="${dBot}" stroke="${color}" stroke-width="1.2" fill="none"/>
+    <g data-grow>
+      <g clip-path="url(#clip-future-${role})" opacity="0.42">
+        <path d="${dTop} L ${W} ${H/2} Z" fill="${color}" opacity="0.18"/>
+        <path d="${dBot} L ${W} ${H/2} Z" fill="${color}" opacity="0.18"/>
+        <path d="${dTop}" stroke="${color}" stroke-width="1" fill="none"/>
+        <path d="${dBot}" stroke="${color}" stroke-width="1" fill="none"/>
+      </g>
+      <g clip-path="url(#clip-played-${role})">
+        <path d="${dTop} L ${W} ${H/2} Z" fill="${color}" opacity="0.35"/>
+        <path d="${dBot} L ${W} ${H/2} Z" fill="${color}" opacity="0.35"/>
+        <path d="${dTop}" stroke="${color}" stroke-width="1.2" fill="none"/>
+        <path d="${dBot}" stroke="${color}" stroke-width="1.2" fill="none"/>
+      </g>
     </g>
     <line x1="0" y1="${H/2}" x2="${W}" y2="${H/2}" stroke="${color}" stroke-opacity="0.25" stroke-width="0.5"/>
     <g data-playhead style="display:none">
@@ -662,6 +701,43 @@ function paintWaveformInto(svg, peaks, role, playPct) {
     </g>
   `;
   setPlayheadPosition(svg, playPct);
+}
+
+// Animate the wave geometry during diffusion. Combines three things:
+//   • scaleY around the centerline, ease-out cubic — wave grows quickly
+//     early on, settles smoothly into the final shape.
+//   • feGaussianBlur stdDeviation that decays as progress increases — the
+//     wave starts noisy/blurred and sharpens into the final signal, which
+//     is roughly what diffusion actually does.
+//   • opacity ramp from ~0.45 to 1, so the wave fades in rather than just
+//     stretching.
+// frac = 0 → flat, blurred, faint; frac = 1 → fully formed.
+function setWaveGrow(svg, frac) {
+  if (!svg) return;
+  const g = svg.querySelector('[data-grow]');
+  if (!g) return;
+  const f = Math.max(0, Math.min(1, frac));
+  if (f >= 0.999) {
+    g.removeAttribute("transform");
+    g.removeAttribute("filter");
+    g.removeAttribute("opacity");
+    const blur = svg.querySelector('[data-blur]');
+    if (blur) blur.setAttribute("stdDeviation", "0");
+    return;
+  }
+  // Ease-out cubic: snappy early, gentle into the final value.
+  const easedScale = 1 - Math.pow(1 - f, 3);
+  g.setAttribute(
+    "transform",
+    `translate(0 110) scale(1 ${easedScale.toFixed(4)}) translate(0 -110)`
+  );
+  // Blur amount decays linearly from 5 → 0 as f goes 0 → 1.
+  const blur = svg.querySelector('[data-blur]');
+  if (blur) blur.setAttribute("stdDeviation", ((1 - f) * 5).toFixed(2));
+  const filter = svg.querySelector('filter');
+  if (filter) g.setAttribute("filter", `url(#${filter.id})`);
+  // Opacity fade-in.
+  g.setAttribute("opacity", (0.45 + 0.55 * f).toFixed(3));
 }
 
 // Move the playhead and update the played/future clip regions without
@@ -720,9 +796,7 @@ function updatePlayhead(bodyEl, role, playPct) {
 function pickVariant(i) {
   if (i < 0 || i >= state.variants.length) return;
   state.activeVariantIdx = i;
-  state.mode = "B";
-  abLoad(state.inputBuffer, state.variants[i].audioBuffer);
-  abSetMode("B");
+  abAdoptNewVariant(state.variants[i].audioBuffer, /* listen */ true);
   render();
 }
 
@@ -736,7 +810,8 @@ function removeVariant(i) {
     abReset();
   } else {
     state.activeVariantIdx = Math.min(state.activeVariantIdx, state.variants.length - 1);
-    abLoad(state.inputBuffer, state.variants[state.activeVariantIdx].audioBuffer);
+    // Don't force a mode switch on remove — user keeps listening to whatever side they were on.
+    abAdoptNewVariant(state.variants[state.activeVariantIdx].audioBuffer, /* listen */ false);
   }
   render();
 }
@@ -761,6 +836,20 @@ async function startRemix() {
   setupProgressCard(variantNumber);
 
   try {
+    // Step 0: if BPM/Key analysis is still in flight, wait for it as a
+    // first-class stage in the progress card. Capped at 30s so a slow or
+    // hung pipeline can't permanently stall the remix.
+    if (state.analysis.analyzing && state.analysisPromise) {
+      enterStage("analyze");
+      pcSubtitle.textContent = "Estimating tempo and key…";
+      await Promise.race([
+        state.analysisPromise,
+        new Promise((r) => setTimeout(r, 30000)),
+      ]);
+    } else {
+      markStageSkipped("analyze");
+    }
+
     let bufferToSend = state.inputBuffer;
     const stripBefore = state.separateOn;
     const addAfter = state.readdOn;
@@ -823,6 +912,20 @@ async function startRemix() {
         if (stgEl) stgEl.textContent = `step ${m.step} / ${m.total}`;
         setStageProgress("gpu", pct);
         updateScanFrac(pct);
+        // Last step done — VAE decoding has begun on the server. Transition
+        // into the finalize stage so the user sees something happening.
+        if (m.step >= m.total) {
+          enterStage("finalize");
+          pcSubtitle.textContent = "Decoding audio…";
+          setOverlayReadout("decoding…");
+          freezeScanAnim(); // wave is at 100% — stop the grow loop
+          setStageProgress("finalize", 0.3);
+        }
+      } else if (m.stage === "vae_done") {
+        // Server-side VAE finished, MP3 encoding + transfer starts now.
+        pcSubtitle.textContent = "Encoding & sending…";
+        setOverlayReadout("encoding…");
+        setStageProgress("finalize", 0.7);
       }
     });
     sse.addEventListener("done", () => sse.close());
@@ -880,9 +983,8 @@ async function startRemix() {
     state.variants.push(variant);
     state.activeVariantIdx = state.variants.length - 1;
     state.stage = "compared";
-    state.mode = "B";
-    abLoad(state.inputBuffer, variant.audioBuffer);
-    abSetMode("B");
+    // Seamless if currently playing; otherwise a clean fresh load.
+    abAdoptNewVariant(variant.audioBuffer, /* listen */ true);
 
     // Mark all stages done & finish progress
     finishAllStages();
@@ -898,15 +1000,15 @@ async function startRemix() {
   } finally {
     endScanAnim();
     stopProgressTimer();
-    remixBtn.disabled = false;
     remixArr.textContent = "▶";
     remixLabel.textContent = "Remix track";
     render();
+    updateRemixDisabled();
   }
 }
 
 // Per-stage fraction (0–1). Live signals from demucs / XHR / SSE push into this.
-const stageFracs = { separate: 0, upload: 0, gpu: 0, mixdown: 0 };
+const stageFracs = { analyze: 0, separate: 0, upload: 0, gpu: 0, finalize: 0, mixdown: 0 };
 const stageWeights = Object.fromEntries(STAGES.map((s) => [s.id, s.weight]));
 
 function setStageProgress(id, frac) {
@@ -1020,19 +1122,35 @@ function beginScanAnim() {
   scanGpuFrac = null;
   const step = () => {
     const elapsed = (performance.now() - scanT0) / 1000;
-    // Prefer the real progress from setStageProgress when available.
+    // Use the real per-step diffusion fraction when SSE has delivered one.
+    // Otherwise grow monotonically toward 95% over the expected runtime, so
+    // the wave doesn't pulse before the first step lands.
     const pct = scanGpuFrac != null
       ? scanGpuFrac
-      : (elapsed / (ETA_BASE_SEC + 4)) % 1;
-    if (bBody._scan) bBody._scan.style.left = `${6 + pct * 88}%`;
+      : Math.min(0.95, elapsed / ETA_BASE_SEC);
+    setWaveGrow(bBody._svg, pct);
     if (bBody._ovReadout) bBody._ovReadout.textContent = `generating · ${Math.min(100, Math.floor(pct * 100))}%`;
     scanRAF = requestAnimationFrame(step);
   };
   scanRAF = requestAnimationFrame(step);
 }
-function endScanAnim() {
+// Stop the grow RAF and lock the wave at full height — but keep the overlay
+// visible (we're still doing post-GPU work like VAE decoding, MP3 encoding,
+// and the response transfer; the readout text gets updated separately).
+function freezeScanAnim() {
   if (scanRAF) { cancelAnimationFrame(scanRAF); scanRAF = 0; }
+  if (bBody._svg) setWaveGrow(bBody._svg, 1);
+}
+
+// Fully tear down the overlay — called when we leave the finalize stage and
+// enter mixdown (i.e., the response has actually arrived).
+function endScanAnim() {
+  freezeScanAnim();
   if (bBody._overlay) bBody._overlay.hidden = true;
+}
+
+function setOverlayReadout(text) {
+  if (bBody._ovReadout) bBody._ovReadout.textContent = text;
 }
 function updateScanFrac(frac) {
   scanGpuFrac = Math.max(0, Math.min(1, frac));
@@ -1074,6 +1192,102 @@ function abLoad(a, b) {
   tpNow.textContent = "0:00";
   tpTotal.textContent = formatTime(abDuration);
   setPlayIcon(false);
+}
+
+/**
+ * Swap B's audio buffer (variant) without interrupting playback.
+ *
+ * - If we're not currently playing, this just becomes a normal abLoad + (optional) mode-set.
+ * - If we are playing, we keep srcA running, spin up a new buffer source for B
+ *   at the current playback offset, crossfade old B → new B over ~60ms while
+ *   also moving A/B gains to the target listening mode, then tear down the old
+ *   B source after the fade completes.
+ *
+ * `listen=true` forces the listener onto B (i.e. switch to the new variation).
+ * `listen=false` keeps the listener on whatever side they're already on.
+ */
+function abAdoptNewVariant(newBuffer, listen) {
+  if (!abCtx || !abBufA || !abPlaying) {
+    // Not currently playing — just replace cleanly.
+    abLoad(state.inputBuffer, newBuffer);
+    if (listen) { state.mode = "B"; abSetMode("B"); }
+    return;
+  }
+
+  const t = abCtx.currentTime;
+  const offset = abCurrentTime();
+  const xfade = 0.060;
+
+  // Stand up the new B source on a fresh gain node so we can crossfade
+  // independently of any in-flight gain ramps on the old one.
+  const newGain = abCtx.createGain();
+  const newSrc = abCtx.createBufferSource();
+  newSrc.buffer = newBuffer;
+  newSrc.connect(newGain);
+  newGain.connect(abCtx.destination);
+
+  // Compute targets after this swap completes.
+  if (listen) state.mode = "B";
+  const targetA = state.mode === "A" ? 1 : 0;
+  const targetB = state.mode === "B" ? 1 : 0;
+
+  // Old B → 0 (always — it's being replaced regardless of mode).
+  if (abGainB) {
+    abGainB.gain.cancelScheduledValues(t);
+    abGainB.gain.setValueAtTime(abGainB.gain.value, t);
+    abGainB.gain.linearRampToValueAtTime(0, t + xfade);
+  }
+  // A → wherever it should be in the post-swap mode.
+  if (abGainA) {
+    abGainA.gain.cancelScheduledValues(t);
+    abGainA.gain.setValueAtTime(abGainA.gain.value, t);
+    abGainA.gain.linearRampToValueAtTime(targetA, t + xfade);
+  }
+  // New B starts silent and ramps up to its target.
+  newGain.gain.value = 0;
+  newGain.gain.linearRampToValueAtTime(targetB, t + xfade);
+
+  const off = Math.max(0, Math.min(offset, newBuffer.duration));
+  newSrc.start(t, off);
+
+  const oldSrcB = abSrcB;
+  const oldGainB = abGainB;
+
+  abSrcB = newSrc;
+  abGainB = newGain;
+  abBufB = newBuffer;
+  abDuration = Math.min(abBufA.duration, abBufB.duration);
+  tpTotal.textContent = formatTime(abDuration);
+
+  // Re-arm natural-end detection: clear stale handlers on prior ender, set a
+  // new one on whichever side is now shorter.
+  if (abSrcA) abSrcA.onended = null;
+  if (oldSrcB) oldSrcB.onended = null;
+  const ender = abBufA.duration <= abBufB.duration ? abSrcA : abSrcB;
+  ender.onended = () => {
+    if (!abPlaying) return;
+    abPause();
+    abOffset = 0;
+    tpFill.style.width = "0%";
+    tpHead.style.left = "0%";
+    tpNow.textContent = "0:00";
+    paintPlayheads(0);
+  };
+
+  // Clean up the old B source/gain after the crossfade has fully completed.
+  setTimeout(() => {
+    if (oldSrcB) {
+      oldSrcB.onended = null;
+      try { oldSrcB.stop(); } catch {}
+      try { oldSrcB.disconnect(); } catch {}
+    }
+    if (oldGainB) {
+      try { oldGainB.disconnect(); } catch {}
+    }
+  }, xfade * 1000 + 30);
+
+  updateTpListening();
+  updateReelClickability();
 }
 
 function abTeardown() {

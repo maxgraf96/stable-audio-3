@@ -13,11 +13,15 @@
 
 #include <optional>
 #include <utility>
+#include <variant>
 
 #include "dit.h"
+#include "dit_small.h"
 #include "sa3_pipeline.h"
 #include "samel_decoder.h"
 #include "samel_encoder.h"
+#include "sames_decoder.h"
+#include "sames_encoder.h"
 #include "t5gemma.h"
 
 namespace sa3 {
@@ -28,6 +32,22 @@ namespace mx = mlx::core;
 constexpr int SAMPLE_RATE        = 44100;
 constexpr int SAMPLES_PER_LATENT = 4096;   // PatchedPretransform 256 × SAME 16× expansion
 
+// IO_CHANNELS and SAMPLES_PER_LATENT are identical across all three model
+// kinds — verified at compile time so any future drift surfaces here.
+static_assert(dit::IO_CHANNELS == dit_small::IO_CHANNELS,
+              "DiT IO_CHANNELS must match across architectures");
+
+// Which of the three SA3 model bundles a Pipeline holds. Determines which
+// DiT/autoencoder variant is active and (downstream) which decode_chunked
+// parameters to use. Both small variants share an architecture — they
+// differ only in fine-tuning, so SMALL_MUSIC and SMALL_SFX use the same
+// C++ code paths with different weights.
+enum class ModelKind {
+    MEDIUM       = 0,   // sa3-medium       (DiT-Medium  + SAME-L)
+    SMALL_MUSIC  = 1,   // sa3-sm-music     (DiT-Small   + SAME-S)
+    SMALL_SFX    = 2,   // sa3-sm-sfx       (DiT-Small   + SAME-S)
+};
+
 // Source audio for a2a / inpaint generation. Layout matches MLX/Python:
 // planar channels-first, normalized fp32 in [-1, 1] at SAMPLE_RATE.
 struct InitAudio {
@@ -36,13 +56,39 @@ struct InitAudio {
     int samples;         // per channel
 };
 
+// Polymorphic holders. Both alternatives in each variant have identical
+// operator() signatures, so generate() can dispatch via std::visit without
+// any architecture-specific code outside the helper methods below.
+using DitVariant     = std::variant<dit::DiT,            dit_small::DiT>;
+using EncoderVariant = std::variant<samel::SAMELEncoder, sames::SAMESEncoder>;
+using DecoderVariant = std::variant<samel::SAMELDecoder, sames::SAMESDecoder>;
+
 struct Pipeline {
-    t5g::T5Gemma        t5;            // text encoder (fp16) + SentencePiece
+    ModelKind           kind;          // determines which alternative is active in each variant
+    t5g::T5Gemma        t5;            // text encoder (fp16) + SentencePiece (shared across kinds)
     LoadedConditioner   conditioner;   // padding_embedding + seconds_embedder (baked into the DiT safetensors)
-    dit::DiT            dit;           // velocity-prediction model (fp16 by default)
-    samel::SAMELEncoder encoder;       // audio → SAME-L latents (fp32, used for init_audio)
-    samel::SAMELDecoder decoder;       // SAME-L latents → audio (fp32)
+    DitVariant          dit_var;       // velocity-prediction model
+    EncoderVariant      encoder_var;   // audio → latents (for init_audio paths)
+    DecoderVariant      decoder_var;   // latents → audio
     mx::Dtype           dit_dtype;     // dtype the DiT was loaded at — drives noise/sample dtype
+
+    // Architecture-agnostic dispatch helpers. Each visits the appropriate
+    // variant and calls the underlying model's operator(); the call shapes
+    // are identical across kinds so the caller doesn't need to care.
+    mx::array dit_forward(
+        const mx::array& x,
+        const mx::array& t,
+        const mx::array& cross_attn_cond_raw,
+        const mx::array& global_cond_raw,
+        const std::optional<mx::array>& local_add_cond = std::nullopt) const;
+
+    mx::array encoder_forward(const mx::array& patches) const;
+
+    // Calls decode_chunked from the active autoencoder's namespace. SAME-L
+    // and SAME-S have different chunked-decode constants (sa3_mlx.py:
+    // same-l → (128, 8), same-s → (8, 2)); the helper picks the right
+    // pair based on `kind`.
+    mx::array decoder_decode_chunked(const mx::array& latents) const;
 
     // Generate audio.
     //
@@ -70,12 +116,17 @@ struct Pipeline {
 
 // Load the full pipeline from four safetensors paths. The DiT safetensors
 // also contains the conditioner under "cond.*" keys (extracted here).
+// `kind` selects which DiT and which autoencoder code path to load — the
+// caller is responsible for passing matching paths (e.g. dit_medium.* +
+// same_l_*.* for MEDIUM, dit_sm-music_* / dit_sm-sfx_* + same_s_*.* for
+// the small kinds). Defaulting to MEDIUM keeps the legacy call shape.
 Pipeline load_pipeline(
     const std::string& t5gemma_path,
     const std::string& dit_path,
-    const std::string& samel_encoder_path,
-    const std::string& samel_decoder_path,
-    mx::Dtype dit_dtype = mx::float16);
+    const std::string& encoder_path,
+    const std::string& decoder_path,
+    mx::Dtype dit_dtype = mx::float16,
+    ModelKind kind      = ModelKind::MEDIUM);
 
 // ── Variation orchestration ──────────────────────────────────────────
 // One generation candidate for the variations harness. Mirrors the

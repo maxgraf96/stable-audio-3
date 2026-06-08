@@ -42,6 +42,7 @@ const seek = getNativeFunction("seek");
 const getPlayState = getNativeFunction("getPlayState");
 const setOneShotMode           = getNativeFunction("setOneShotMode");
 const copyVariationToClipboard = getNativeFunction("copyVariationToClipboard");
+const switchModel              = getNativeFunction("switchModel");
 
 // Fire a JUCE event (vs a native-function call). emitEvent is
 // fire-and-forget and dispatches the listener on the C++ message thread
@@ -102,6 +103,7 @@ const srcPlayBtn = $("src-play");
 const srcTimeCurEl = $("src-time-cur");
 const srcTimeRemEl = $("src-time-rem");
 
+const modelSelectEl = $("model-select");
 const presetEl = $("preset");
 const presetToggle = $("preset-toggle");
 const presetLabelEl = $("preset-label");
@@ -152,6 +154,12 @@ const state = {
     // via the mode toggle. When true: cycling variations restarts from 0;
     // engine stops at end of buffer instead of looping.
     oneShot: false,
+    // Active DiT + autoencoder pair. Mirrors VariationsEngine::getModelKind().
+    // The poll updates this; the model dropdown reflects it. Set to
+    // `null` while a switchModel call is in flight so the poll doesn't
+    // bounce the dropdown back to the old value before completion fires.
+    modelKind: "medium",
+    modelSwitchInFlight: false,
 };
 
 // Heuristic: filename keywords first (strong signal), then duration (short
@@ -626,6 +634,21 @@ function updateStatus(s) {
     if (phase === "error" || status.startsWith("Error")) {
         showError(status);
     }
+
+    // Keep the model dropdown reflecting the engine's actual current kind,
+    // unless WE just changed it — in that case the inFlight flag prevents
+    // the poll from snapping the select back before the load finishes.
+    const kind = typeof s.modelKind === "string" ? s.modelKind : null;
+    if (kind && !state.modelSwitchInFlight) {
+        if (state.modelKind !== kind) state.modelKind = kind;
+        if (modelSelectEl.value !== kind) modelSelectEl.value = kind;
+    }
+    // Disable model-swapping while the engine is busy OR the pipeline
+    // isn't loaded; otherwise re-entry can race with an in-flight load.
+    modelSelectEl.disabled = state.modelSwitchInFlight
+                          || busy
+                          || phase === "loading";
+
     updateButton();
 }
 
@@ -700,6 +723,38 @@ function renderPreset() {
         });
     }
 }
+
+// Model dropdown: native <select>. On change we fire switchModel and
+// flip an inFlight flag so the next status poll won't snap the select
+// back to the old value before the engine finishes loading the new
+// pipeline. Native side is idempotent — switching to the active kind
+// is a no-op success.
+modelSelectEl.addEventListener("change", async () => {
+    const target = modelSelectEl.value;
+    if (target === state.modelKind) return;
+    state.modelSwitchInFlight = true;
+    modelSelectEl.disabled = true;
+    // Variations stop being meaningful when the model changes — clear
+    // them so the UI doesn't suggest the new model produced the old set.
+    clearVariations();
+    try {
+        const resp = await switchModel(target);
+        if (resp && resp.ok) {
+            state.modelKind = target;
+        } else {
+            // Roll the select back and surface the error.
+            modelSelectEl.value = state.modelKind;
+            showError((resp && resp.error) || "switchModel failed");
+        }
+    } catch (e) {
+        modelSelectEl.value = state.modelKind;
+        showError("switchModel bridge error: " + e);
+    } finally {
+        state.modelSwitchInFlight = false;
+        // Re-enabling happens via the next status poll based on
+        // load_phase_ + busy. No manual setter here.
+    }
+});
 
 presetToggle.addEventListener("click", (e) => {
     e.stopPropagation();

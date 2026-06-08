@@ -42,6 +42,15 @@ namespace sa3 { namespace orch { struct Pipeline; } }
 
 namespace sa3plugin {
 
+// Mirrors sa3::orch::ModelKind (kept in sync by static_assert in the .cpp)
+// so the public API stays free of orchestrator headers. Same integer
+// values, so the engine just static_cast<> when calling load_pipeline.
+enum class ModelKind {
+    MEDIUM      = 0,    // sa3-medium      (DiT-Medium + SAME-L)
+    SMALL_MUSIC = 1,    // sa3-sm-music    (DiT-Small  + SAME-S)
+    SMALL_SFX   = 2,    // sa3-sm-sfx      (DiT-Small  + SAME-S)
+};
+
 struct GenerateRequest {
     std::string preset;
     float       seconds       = 5.0f;
@@ -92,6 +101,16 @@ public:
     LoadPhase    getLoadPhase() const { return load_phase_.load(std::memory_order_acquire); }
     bool         isBusy()       const { return busy_.load(std::memory_order_acquire); }
     juce::String getStatus()    const;
+    ModelKind    getModelKind() const {
+        return static_cast<ModelKind>(current_model_kind_.load(std::memory_order_acquire));
+    }
+
+    // Tear down the current pipeline and load a new one for the requested
+    // model kind. Returns false if the worker is already busy or the new
+    // kind == current kind. The completion fires (on the worker thread)
+    // when the new pipeline is loaded or load failed; same shape as
+    // requestUploadSource: `{ ok: bool, error?: string }`.
+    bool requestSwitchModel(ModelKind kind, CompletionFn completion);
 
     // ── Source / generate ────────────────────────────────────────────
     // Submit decoded source audio to the worker.  The completion fires
@@ -153,6 +172,7 @@ private:
 
     // ── Worker-thread jobs ───────────────────────────────────────────
     void doLoad();
+    void doSwitchModel(ModelKind kind);
     juce::var doUploadSource(juce::MemoryBlock bytes, int peaks_n);
     juce::var doGenerate(GenerateRequest req, int peaks_n);
 
@@ -165,7 +185,7 @@ private:
     static std::vector<float> extractPeaks(const juce::AudioBuffer<float>& buf, int n);
 
     // ── Worker job queue ─────────────────────────────────────────────
-    enum class JobKind { LoadPipeline, UploadSource, Generate };
+    enum class JobKind { LoadPipeline, SwitchModel, UploadSource, Generate };
     struct Job {
         JobKind kind;
         // UploadSource payload
@@ -173,6 +193,8 @@ private:
         int                              peaks_n = 0;
         // Generate payload
         std::optional<GenerateRequest>   gen_req;
+        // SwitchModel payload
+        ModelKind                        target_kind = ModelKind::MEDIUM;
         // Common
         CompletionFn                     completion;
     };
@@ -228,6 +250,10 @@ private:
     std::atomic<bool>      busy_{false};
     std::atomic<bool>      shutdown_{false};
     std::atomic<bool>      load_pending_{false};
+    // Tracks the kind currently held by pipeline_. Stored as int so getters
+    // can be lock-free; the .cpp casts to/from ModelKind. Defaults to
+    // MEDIUM — initial doLoad() honours this value.
+    std::atomic<int>       current_model_kind_{static_cast<int>(ModelKind::MEDIUM)};
 
     JUCE_LEAK_DETECTOR(VariationsEngine)
 };

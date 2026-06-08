@@ -10,12 +10,58 @@
 
 namespace sa3plugin {
 
+// Keep our public enum in lock-step with the orchestrator's so the
+// static_cast in doSwitchModel / doLoad below is well-defined.
+static_assert(static_cast<int>(ModelKind::MEDIUM)
+              == static_cast<int>(sa3::orch::ModelKind::MEDIUM),
+              "ModelKind::MEDIUM must mirror sa3::orch::ModelKind::MEDIUM");
+static_assert(static_cast<int>(ModelKind::SMALL_MUSIC)
+              == static_cast<int>(sa3::orch::ModelKind::SMALL_MUSIC),
+              "ModelKind::SMALL_MUSIC must mirror sa3::orch::ModelKind::SMALL_MUSIC");
+static_assert(static_cast<int>(ModelKind::SMALL_SFX)
+              == static_cast<int>(sa3::orch::ModelKind::SMALL_SFX),
+              "ModelKind::SMALL_SFX must mirror sa3::orch::ModelKind::SMALL_SFX");
+
 namespace {
 
+// All three model kinds share the same T5Gemma encoder; only the DiT +
+// autoencoder pair differs. End-users keep all candidate files in the
+// same models directory and the engine picks the right four at load time.
 constexpr const char* kT5GemmaFile = "t5gemma_f16.safetensors";
-constexpr const char* kDitFile     = "dit_medium_f16.safetensors";
-constexpr const char* kEncoderFile = "same_l_encoder_f32.safetensors";
-constexpr const char* kDecoderFile = "same_l_decoder_f32.safetensors";
+
+struct ModelFiles {
+    const char* dit;
+    const char* encoder;
+    const char* decoder;
+    const char* display_name;
+};
+
+constexpr ModelFiles modelFilesFor(ModelKind kind) {
+    switch (kind) {
+        case ModelKind::SMALL_MUSIC:
+            return {
+                "dit_sm-music_f16.safetensors",
+                "same_s_encoder_f32.safetensors",
+                "same_s_decoder_f32.safetensors",
+                "SA3-sm-music",
+            };
+        case ModelKind::SMALL_SFX:
+            return {
+                "dit_sm-sfx_f16.safetensors",
+                "same_s_encoder_f32.safetensors",
+                "same_s_decoder_f32.safetensors",
+                "SA3-sm-sfx",
+            };
+        case ModelKind::MEDIUM:
+        default:
+            return {
+                "dit_medium_f16.safetensors",
+                "same_l_encoder_f32.safetensors",
+                "same_l_decoder_f32.safetensors",
+                "SA3-medium",
+            };
+    }
+}
 
 // Where the four safetensors files live for the currently-running plugin.
 // Resolution order:
@@ -219,6 +265,39 @@ bool VariationsEngine::requestGenerate(GenerateRequest req, int peaks_n,
         j.peaks_n    = peaks_n;
         j.completion = std::move(completion);
         pending_job_ = std::move(j);
+        busy_.store(true, std::memory_order_release);
+    }
+    notify();
+    return true;
+}
+
+bool VariationsEngine::requestSwitchModel(ModelKind kind, CompletionFn completion)
+{
+    // Idempotent: switching to the active kind is a no-op success. UI
+    // doesn't need to special-case this — it just fires the request on
+    // dropdown changes.
+    const auto current = static_cast<ModelKind>(
+        current_model_kind_.load(std::memory_order_acquire));
+    if (current == kind
+        && load_phase_.load(std::memory_order_acquire) == LoadPhase::Loaded) {
+        if (completion) {
+            juce::DynamicObject::Ptr obj = new juce::DynamicObject();
+            obj->setProperty("ok", true);
+            completion(juce::var(obj.get()));
+        }
+        return true;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(job_mutex_);
+        if (busy_.load(std::memory_order_acquire) || pending_job_.has_value()) {
+            return false;
+        }
+        Job j;
+        j.kind        = JobKind::SwitchModel;
+        j.target_kind = kind;
+        j.completion  = std::move(completion);
+        pending_job_  = std::move(j);
         busy_.store(true, std::memory_order_release);
     }
     notify();
@@ -753,6 +832,20 @@ void VariationsEngine::run()
             result = doUploadSource(std::move(job->source_bytes), job->peaks_n);
         } else if (job->kind == JobKind::Generate) {
             result = doGenerate(std::move(*job->gen_req), job->peaks_n);
+        } else if (job->kind == JobKind::SwitchModel) {
+            // doSwitchModel publishes its own status / load-phase updates
+            // and stores the new kind into current_model_kind_ on success.
+            try {
+                doSwitchModel(job->target_kind);
+                juce::DynamicObject::Ptr obj = new juce::DynamicObject();
+                obj->setProperty("ok", true);
+                result = juce::var(obj.get());
+            } catch (const std::exception& ex) {
+                juce::DynamicObject::Ptr err = new juce::DynamicObject();
+                err->setProperty("ok", false);
+                err->setProperty("error", juce::String(ex.what()));
+                result = juce::var(err.get());
+            }
         }
 
         busy_.store(false, std::memory_order_release);
@@ -760,30 +853,73 @@ void VariationsEngine::run()
     }
 }
 
+// Build + load the pipeline for a specific model kind. Throws on any
+// missing file or load failure. Caller owns the load_phase_ transitions
+// (doLoad sets it Loading→Loaded; doSwitchModel does the same but also
+// updates current_model_kind_ on success).
+static std::unique_ptr<sa3::orch::Pipeline> buildPipeline(
+    const juce::File& models,
+    ModelKind kind)
+{
+    const auto files = modelFilesFor(kind);
+    const auto t5  = models.getChildFile(kT5GemmaFile).getFullPathName();
+    const auto dit = models.getChildFile(files.dit).getFullPathName();
+    const auto enc = models.getChildFile(files.encoder).getFullPathName();
+    const auto dec = models.getChildFile(files.decoder).getFullPathName();
+    for (const auto& p : { t5, dit, enc, dec }) {
+        if (! juce::File(p).existsAsFile())
+            throw std::runtime_error(
+                ("missing model file: " + p).toStdString());
+    }
+    return std::make_unique<sa3::orch::Pipeline>(
+        sa3::orch::load_pipeline(
+            t5.toStdString(), dit.toStdString(),
+            enc.toStdString(), dec.toStdString(),
+            mlx::core::float16,
+            static_cast<sa3::orch::ModelKind>(kind)));
+}
+
 void VariationsEngine::doLoad()
 {
     try {
-        const auto models = resolveModelsDir();
-        const auto t5  = models.getChildFile(kT5GemmaFile).getFullPathName();
-        const auto dit = models.getChildFile(kDitFile).getFullPathName();
-        const auto enc = models.getChildFile(kEncoderFile).getFullPathName();
-        const auto dec = models.getChildFile(kDecoderFile).getFullPathName();
-        for (const auto& p : { t5, dit, enc, dec }) {
-            if (! juce::File(p).existsAsFile())
-                throw std::runtime_error(
-                    ("missing model file: " + p).toStdString());
-        }
-        auto p = std::make_unique<sa3::orch::Pipeline>(
-            sa3::orch::load_pipeline(t5.toStdString(), dit.toStdString(),
-                                     enc.toStdString(), dec.toStdString(),
-                                     mlx::core::float16));
-        pipeline_ = std::move(p);
+        const auto kind = static_cast<ModelKind>(
+            current_model_kind_.load(std::memory_order_acquire));
+        writeStatus(juce::String("Loading ") + modelFilesFor(kind).display_name + "...");
+        pipeline_ = buildPipeline(resolveModelsDir(), kind);
         load_phase_.store(LoadPhase::Loaded, std::memory_order_release);
         writeStatus("Ready");
     }
     catch (const std::exception& ex) {
         load_phase_.store(LoadPhase::Error, std::memory_order_release);
         writeStatus(juce::String("Load failed: ") + ex.what());
+    }
+}
+
+void VariationsEngine::doSwitchModel(ModelKind kind)
+{
+    // Tear the current pipeline down BEFORE we try to load the new one —
+    // loading is the memory-heaviest part of the process and the small
+    // models live alongside the medium one, so freeing first lets us
+    // avoid a temporary 2× peak. The source/variation buffers and audio
+    // thread state are untouched; only pipeline_ changes.
+    const auto display = juce::String("Loading ") + modelFilesFor(kind).display_name + "...";
+    writeStatus(display);
+    load_phase_.store(LoadPhase::Loading, std::memory_order_release);
+    pipeline_.reset();
+
+    try {
+        pipeline_ = buildPipeline(resolveModelsDir(), kind);
+        current_model_kind_.store(static_cast<int>(kind), std::memory_order_release);
+        load_phase_.store(LoadPhase::Loaded, std::memory_order_release);
+        writeStatus("Ready");
+    }
+    catch (...) {
+        // On failure the engine is left without a pipeline; surface the
+        // error and rethrow so the worker turns it into the JS error
+        // shape via the SwitchModel branch's catch block.
+        load_phase_.store(LoadPhase::Error, std::memory_order_release);
+        writeStatus("Load failed");
+        throw;
     }
 }
 

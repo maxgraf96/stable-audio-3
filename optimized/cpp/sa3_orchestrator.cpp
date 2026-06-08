@@ -64,9 +64,9 @@ static mx::array encode_init_audio(
                     mx::Shape{1, a.channels, target_samples},
                     mx::float32);
 
-    // patch + encode at fp32 (SAME-L encoder is loaded as fp32).
+    // patch + encode at fp32 (autoencoder loaded as fp32 regardless of kind).
     mx::array patches = patch_audio(audio, /*patch_size=*/256);
-    mx::array init_latents = pipe.encoder(patches);
+    mx::array init_latents = pipe.encoder_forward(patches);
     mx::eval(init_latents);
     return mx::astype(init_latents, pipe.dit_dtype);
 }
@@ -84,10 +84,17 @@ mx::array Pipeline::generate(
     std::optional<InitAudio> init_audio,
     std::optional<std::pair<float, float>> inpaint_range_seconds) const
 {
-    // 1. T_lat from seconds. SAME-L has no even-T_lat constraint.
-    const int T_lat = std::max(1, static_cast<int>(
+    // 1. T_lat from seconds. SAME-L is unconstrained, but SAME-S requires
+    //    T_lat to be even — internal_T = T_lat * 17 must align to its chunk
+    //    size of 34, which collapses to T_lat % 2 == 0. Round up so the
+    //    user always gets at least the requested duration.
+    int T_lat = std::max(1, static_cast<int>(
         std::ceil(seconds * static_cast<float>(SAMPLE_RATE) /
                   static_cast<float>(SAMPLES_PER_LATENT))));
+    if ((kind == ModelKind::SMALL_MUSIC || kind == ModelKind::SMALL_SFX)
+        && (T_lat % 2 != 0)) {
+        T_lat += 1;
+    }
 
     // 2. T5Gemma encode → cross_attn (1, 257, 768) + global_cond (1, 768).
     auto enc = t5.encode({prompt}, /*max_len=*/256);
@@ -164,11 +171,12 @@ mx::array Pipeline::generate(
     }
 
     // 7. model_fn — wraps DiT call, with optional batched CFG + APG.
-    //    Matches optimized/mlx/scripts/sa3_mlx.py exactly.
-    const auto& dit_local = dit;
+    //    Matches optimized/mlx/scripts/sa3_mlx.py exactly. dit_forward()
+    //    dispatches on the active variant (medium vs small).
+    const Pipeline& pipe_local = *this;
     ModelFn model_fn = [&](const mx::array& x, const mx::array& t) -> mx::array {
         if (cfg == 1.0f) {
-            return dit_local(x, t, cross_attn, global_cond, local_add_cond);
+            return pipe_local.dit_forward(x, t, cross_attn, global_cond, local_add_cond);
         }
         // Batched cond + uncond forward in one DiT call. local_add_cond is
         // duplicated along batch dim to match (cf. sa3_mlx.py model_fn).
@@ -180,7 +188,7 @@ mx::array Pipeline::generate(
         mx::array t2     = mx::concatenate({t, t}, 0);
         mx::array cross2 = mx::concatenate({cross_attn, null_cross_attn}, 0);
         mx::array glob2  = mx::concatenate({global_cond, global_cond}, 0);
-        mx::array v_batched = dit_local(x2, t2, cross2, glob2, lac2);
+        mx::array v_batched = pipe_local.dit_forward(x2, t2, cross2, glob2, lac2);
         auto parts = mx::split(v_batched, 2, /*axis=*/0);
         mx::array cond_v   = parts[0];
         mx::array uncond_v = parts[1];
@@ -219,11 +227,10 @@ mx::array Pipeline::generate(
                                               /*seed=*/seed + 1, paste_back);
     mx::eval(latents);
 
-    // 7. Decode at fp32 (SAME-L is loaded as fp32).
+    // 7. Decode at fp32 (autoencoder loaded as fp32). decoder_decode_chunked
+    //    picks the right (chunk_size, overlap) pair per architecture.
     mx::array latents_fp32 = mx::astype(latents, mx::float32);
-    // chunked is safe for any size — falls through to single-shot when T_lat ≤ kernel.
-    mx::array patches = samel::decode_chunked(decoder, latents_fp32,
-                                              /*chunk_size=*/128, /*overlap=*/8);
+    mx::array patches = decoder_decode_chunked(latents_fp32);
     mx::eval(patches);
 
     // 8. Unpatch (B, 512, T_lat*16) → (B, 2, T_lat*4096).
@@ -246,41 +253,101 @@ mx::array Pipeline::generate(
     return audio;
 }
 
+// ── Pipeline dispatch helpers ────────────────────────────────────────
+mx::array Pipeline::dit_forward(
+    const mx::array& x,
+    const mx::array& t,
+    const mx::array& cross_attn_cond_raw,
+    const mx::array& global_cond_raw,
+    const std::optional<mx::array>& local_add_cond) const
+{
+    return std::visit(
+        [&](const auto& dit_model) {
+            return dit_model(x, t, cross_attn_cond_raw, global_cond_raw, local_add_cond);
+        },
+        dit_var);
+}
+
+mx::array Pipeline::encoder_forward(const mx::array& patches) const {
+    return std::visit(
+        [&](const auto& enc) { return enc(patches); },
+        encoder_var);
+}
+
+mx::array Pipeline::decoder_decode_chunked(const mx::array& latents) const {
+    // Match sa3_mlx.py SAME_DECODERS dispatch: same-l → (128, 8),
+    // same-s → (8, 2). The decoder variant determines the call target.
+    if (std::holds_alternative<samel::SAMELDecoder>(decoder_var)) {
+        return samel::decode_chunked(
+            std::get<samel::SAMELDecoder>(decoder_var),
+            latents,
+            /*chunk_size=*/128, /*overlap=*/8);
+    }
+    return sames::decode_chunked(
+        std::get<sames::SAMESDecoder>(decoder_var),
+        latents,
+        /*chunk_size=*/8, /*overlap=*/2);
+}
+
 // ── load_pipeline ────────────────────────────────────────────────────
 Pipeline load_pipeline(
     const std::string& t5gemma_path,
     const std::string& dit_path,
-    const std::string& samel_encoder_path,
-    const std::string& samel_decoder_path,
-    mx::Dtype dit_dtype)
+    const std::string& encoder_path,
+    const std::string& decoder_path,
+    mx::Dtype dit_dtype,
+    ModelKind kind)
 {
-    // T5Gemma (fp16 by Python default; encoder + SentencePiece in one go)
+    // T5Gemma (fp16 by Python default; encoder + SentencePiece in one go;
+    // shared across all three model kinds).
     auto t5_loaded = mx::load_safetensors(t5gemma_path);
     auto t5 = t5g::load_t5gemma(t5_loaded.first, mx::float16);
 
-    // DiT (+ conditioner baked into the same safetensors under "cond.*")
+    // DiT (+ conditioner baked into the same safetensors under "cond.*"
+    // for all kinds). The DiT C++ namespace differs per architecture; the
+    // conditioner loader is shared since cond.* keys/shapes match.
     auto dit_loaded = mx::load_safetensors(dit_path);
     auto& dit_tensors = dit_loaded.first;
     auto conditioner = load_conditioner(dit_tensors, /*prefix=*/"cond.");
-    auto dit = dit::load_dit(dit_tensors, /*T_lat=*/320, dit_dtype);
 
-    // SAME-L encoder (fp32, matches Python sa3_mlx.py defaults — used only
-    // for init_audio paths; text-to-audio runs ignore it).
-    auto enc_loaded = mx::load_safetensors(samel_encoder_path);
-    auto encoder = samel::load_samel_encoder(enc_loaded.first, mx::float32);
-
-    // SAME-L decoder (fp32, matches Python sa3_mlx.py defaults)
-    auto dec_loaded = mx::load_safetensors(samel_decoder_path);
-    auto decoder = samel::load_samel_decoder(dec_loaded.first, mx::float32);
-
-    return Pipeline{
-        std::move(t5),
-        std::move(conditioner),
-        std::move(dit),
-        std::move(encoder),
-        std::move(decoder),
-        dit_dtype,
+    // Build the variants in-branch: their alternatives hold mx::array members
+    // (no default constructor) so we can't declare-then-assign as we would
+    // for trivially-constructible types.
+    auto build = [&]() -> Pipeline {
+        if (kind == ModelKind::MEDIUM) {
+            auto dit_model  = dit::load_dit(dit_tensors, /*T_lat=*/320, dit_dtype);
+            auto enc_loaded = mx::load_safetensors(encoder_path);
+            auto encoder    = samel::load_samel_encoder(enc_loaded.first, mx::float32);
+            auto dec_loaded = mx::load_safetensors(decoder_path);
+            auto decoder    = samel::load_samel_decoder(dec_loaded.first, mx::float32);
+            return Pipeline{
+                kind,
+                std::move(t5),
+                std::move(conditioner),
+                DitVariant{std::move(dit_model)},
+                EncoderVariant{std::move(encoder)},
+                DecoderVariant{std::move(decoder)},
+                dit_dtype,
+            };
+        }
+        // SMALL_MUSIC and SMALL_SFX share the same C++ code paths; only the
+        // dit_path differs between them. The autoencoder pair is SAME-S.
+        auto dit_model  = dit_small::load_dit(dit_tensors, /*T_lat=*/320, dit_dtype);
+        auto enc_loaded = mx::load_safetensors(encoder_path);
+        auto encoder    = sames::load_sames_encoder(enc_loaded.first, mx::float32);
+        auto dec_loaded = mx::load_safetensors(decoder_path);
+        auto decoder    = sames::load_sames_decoder(dec_loaded.first, mx::float32);
+        return Pipeline{
+            kind,
+            std::move(t5),
+            std::move(conditioner),
+            DitVariant{std::move(dit_model)},
+            EncoderVariant{std::move(encoder)},
+            DecoderVariant{std::move(decoder)},
+            dit_dtype,
+        };
     };
+    return build();
 }
 
 // ── save_wav_pcm16 ───────────────────────────────────────────────────

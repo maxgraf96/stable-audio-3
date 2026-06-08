@@ -168,11 +168,53 @@ juce::WebBrowserComponent::Options buildOptions(SA3AudioProcessor& processor,
                     phase == sa3plugin::VariationsEngine::LoadPhase::Loading   ? "loading"    :
                     phase == sa3plugin::VariationsEngine::LoadPhase::Loaded    ? "loaded"     :
                                                                                  "error";
+                const auto kind = eng.getModelKind();
+                const char* kindStr =
+                    kind == sa3plugin::ModelKind::SMALL_MUSIC ? "sm-music" :
+                    kind == sa3plugin::ModelKind::SMALL_SFX   ? "sm-sfx"   :
+                                                                 "medium";
                 juce::DynamicObject::Ptr obj = new juce::DynamicObject();
-                obj->setProperty("status", eng.getStatus());
-                obj->setProperty("phase",  juce::String(phaseStr));
-                obj->setProperty("busy",   eng.isBusy());
+                obj->setProperty("status",    eng.getStatus());
+                obj->setProperty("phase",     juce::String(phaseStr));
+                obj->setProperty("busy",      eng.isBusy());
+                obj->setProperty("modelKind", juce::String(kindStr));
                 complete(juce::var(obj.get()));
+            })
+        // switchModel("medium" | "sm-music" | "sm-sfx") — tear down the
+        // current pipeline and load the requested one. Idempotent (no-op
+        // if already on the requested kind). Resolves to { ok, error? }.
+        .withNativeFunction(
+            "switchModel",
+            [&processor](const juce::Array<juce::var>& args,
+                         juce::WebBrowserComponent::NativeFunctionCompletion complete) {
+                if (args.isEmpty()) {
+                    juce::DynamicObject::Ptr err = new juce::DynamicObject();
+                    err->setProperty("ok",    false);
+                    err->setProperty("error", "switchModel(): no arguments");
+                    complete(juce::var(err.get()));
+                    return;
+                }
+                const juce::String name = args[0].toString();
+                sa3plugin::ModelKind kind;
+                if      (name == "sm-music") kind = sa3plugin::ModelKind::SMALL_MUSIC;
+                else if (name == "sm-sfx")   kind = sa3plugin::ModelKind::SMALL_SFX;
+                else if (name == "medium")   kind = sa3plugin::ModelKind::MEDIUM;
+                else {
+                    juce::DynamicObject::Ptr err = new juce::DynamicObject();
+                    err->setProperty("ok",    false);
+                    err->setProperty("error", "unknown model kind: " + name);
+                    complete(juce::var(err.get()));
+                    return;
+                }
+                const bool accepted = processor.getVariationsEngine().requestSwitchModel(
+                    kind,
+                    [complete](juce::var result) { complete(result); });
+                if (! accepted) {
+                    juce::DynamicObject::Ptr busy = new juce::DynamicObject();
+                    busy->setProperty("ok",    false);
+                    busy->setProperty("error", "engine busy");
+                    complete(juce::var(busy.get()));
+                }
             })
         .withNativeFunction(
             "getUiState",

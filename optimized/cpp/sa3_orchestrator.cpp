@@ -4,9 +4,13 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
+
+#include <sys/sysctl.h>
+#include <sys/types.h>
 
 #include <mlx/mlx.h>
 
@@ -14,6 +18,59 @@
 
 namespace sa3 {
 namespace orch {
+
+// ── Host memory policy ───────────────────────────────────────────────
+
+MemoryProfile probe_memory() {
+    MemoryProfile p;
+
+    // hw.memsize is the authoritative unified-memory figure on macOS — it's
+    // the whole pool the GPU, the OS and the host DAW share.
+    uint64_t memsize = 0;
+    size_t   len     = sizeof(memsize);
+    if (sysctlbyname("hw.memsize", &memsize, &len, nullptr, 0) == 0) {
+        p.total_bytes = static_cast<size_t>(memsize);
+    }
+
+    // SA3_SIMULATE_RAM_GB pretends the machine has less memory than it does,
+    // so the constrained code paths can be exercised (and a user's bug report
+    // reproduced) without borrowing their laptop. Only ever lowers the figure.
+    if (const char* sim = std::getenv("SA3_SIMULATE_RAM_GB"); sim && *sim) {
+        const double gb = std::atof(sim);
+        if (gb > 0.0) {
+            const size_t simulated = static_cast<size_t>(gb * 1'000'000'000.0);
+            if (p.total_bytes == 0 || simulated < p.total_bytes) {
+                p.total_bytes = simulated;
+                p.simulated   = true;
+            }
+        }
+    }
+
+    if (p.total_bytes == 0) p.total_bytes = 8'000'000'000ull;  // pessimistic
+
+    // Estimate rather than query. Metal's recommendedMaxWorkingSetSize is
+    // the exact figure, but reading it means touching the GPU device, and
+    // this function is called from the plugin's message thread before the
+    // MLX worker exists. Every decision below keys off total_bytes anyway;
+    // this is for display. Measured ~0.75 on both an M4 Max and the fallback
+    // Apple uses across the range.
+    p.working_set_bytes = p.total_bytes * 3 / 4;
+
+    // Cache bound: ~1/16 of RAM, clamped. 1 GB measured as the point past
+    // which a larger pool buys no speed, and 256 MB as the point below which
+    // buffer churn starts showing up in system time.
+    p.cache_limit_bytes = std::clamp<size_t>(
+        p.total_bytes / 16, 256'000'000ull, 1'000'000'000ull);
+
+    p.medium_supported   = p.total_bytes >= MEDIUM_PEAK_BYTES + HOST_RESERVE_MIN_BYTES;
+    p.medium_comfortable = p.total_bytes >= MEDIUM_PEAK_BYTES + HOST_RESERVE_GOOD_BYTES;
+    p.default_kind = p.medium_comfortable ? ModelKind::MEDIUM : ModelKind::SMALL_MUSIC;
+    return p;
+}
+
+void apply_memory_policy(const MemoryProfile& profile) {
+    mx::set_cache_limit(profile.cache_limit_bytes);
+}
 
 // ── patch_audio (free helper) ────────────────────────────────────────
 // rearrange("b c (l h) -> b (c h) l", h=patch_size) — the inverse of
@@ -71,18 +128,20 @@ static mx::array encode_init_audio(
     return mx::astype(init_latents, pipe.dit_dtype);
 }
 
-// ── Pipeline::generate ───────────────────────────────────────────────
-mx::array Pipeline::generate(
-    const std::string& prompt,
+// ── BatchContext ─────────────────────────────────────────────────────
+const mx::array& BatchContext::cross_attn_for(const std::string& prompt) const {
+    for (const auto& [key, arr] : cross_attn_by_prompt) {
+        if (key == prompt) return arr;
+    }
+    throw std::runtime_error(
+        "BatchContext: prompt was not encoded in begin_batch: '" + prompt + "'");
+}
+
+// ── Pipeline::begin_batch ────────────────────────────────────────────
+BatchContext Pipeline::begin_batch(
+    const std::optional<InitAudio>& init_audio,
     float seconds,
-    int   steps,
-    uint64_t seed,
-    float cfg,
-    float apg,
-    const std::string& negative_prompt,
-    float sigma_max,
-    std::optional<InitAudio> init_audio,
-    std::optional<std::pair<float, float>> inpaint_range_seconds) const
+    const std::vector<std::string>& prompts)
 {
     // 1. T_lat from seconds. SAME-L is unconstrained, but SAME-S requires
     //    T_lat to be even — internal_T = T_lat * 17 must align to its chunk
@@ -96,34 +155,82 @@ mx::array Pipeline::generate(
         T_lat += 1;
     }
 
-    // 2. T5Gemma encode → cross_attn (1, 257, 768) + global_cond (1, 768).
-    auto enc = t5.encode({prompt}, /*max_len=*/256);
-    mx::array embeds = mx::astype(enc.first,  dit_dtype);
-    mx::array mask   = enc.second;
-    mx::array embeds_padded = apply_prompt_padding(
-        embeds, mask, mx::astype(conditioner.padding_embedding, dit_dtype));
+    // The two prologue models are used strictly in sequence, so they're
+    // faulted in and dropped one at a time — on a constrained machine the
+    // second batch onward runs this while the DiT and decoder are already
+    // resident, and holding both at once would add ~0.6 GB to the peak for
+    // no reason.
+    ensure_text_encoder();
+
+    // 2. T5Gemma encode, once per DISTINCT prompt → cross_attn (1, 257, 768).
+    //    seconds_embed and therefore global_cond depend only on `seconds`,
+    //    so they're computed once for the whole batch.
     mx::array seconds_embed = mx::astype(conditioner.seconds_embedder(seconds), dit_dtype);  // (1, 1, 768)
-    mx::array cross_attn = mx::concatenate({embeds_padded, seconds_embed}, /*axis=*/1);       // (1, 257, 768)
     // global_cond = seconds_embed[:, 0, :]  →  (1, 768).
     mx::array global_cond = mx::reshape(seconds_embed, {seconds_embed.shape()[0], dit::COND_TOKEN_DIM});
 
-    // 3. CFG branch: build null_cross_attn for the uncond pass.
-    mx::array null_cross_attn = mx::zeros_like(cross_attn);  // default zeros
-    if (cfg != 1.0f && !negative_prompt.empty()) {
-        auto neg_enc = t5.encode({negative_prompt}, /*max_len=*/256);
-        mx::array neg_embeds = mx::astype(neg_enc.first, dit_dtype);
-        mx::array neg_padded = apply_prompt_padding(
-            neg_embeds, neg_enc.second,
-            mx::astype(conditioner.padding_embedding, dit_dtype));
-        null_cross_attn = mx::concatenate({neg_padded, seconds_embed}, /*axis=*/1);
+    std::vector<std::pair<std::string, mx::array>> cross_attn_by_prompt;
+    for (const auto& prompt : prompts) {
+        const bool seen = std::any_of(
+            cross_attn_by_prompt.begin(), cross_attn_by_prompt.end(),
+            [&](const auto& kv) { return kv.first == prompt; });
+        if (seen) continue;
+        auto enc = t5->encode({prompt}, /*max_len=*/256);
+        mx::array embeds = mx::astype(enc.first,  dit_dtype);
+        mx::array mask   = enc.second;
+        mx::array embeds_padded = apply_prompt_padding(
+            embeds, mask, mx::astype(conditioner.padding_embedding, dit_dtype));
+        mx::array cross_attn = mx::concatenate({embeds_padded, seconds_embed}, /*axis=*/1);  // (1, 257, 768)
+        mx::eval(cross_attn);
+        cross_attn_by_prompt.emplace_back(prompt, std::move(cross_attn));
     }
-    mx::eval(cross_attn, global_cond, null_cross_attn);
+    mx::eval(global_cond);
+    release_text_encoder();
 
-    // 4. (Optional) Encode init audio → init_latents at dit_dtype.
+    // 3. (Optional) Encode init audio → init_latents at dit_dtype. Once for
+    //    the batch: every candidate shares the same source and duration.
     std::optional<mx::array> init_latents;
     if (init_audio.has_value()) {
+        ensure_audio_encoder();
         init_latents = encode_init_audio(*this, *init_audio, T_lat);
     }
+
+    // 4. Neither prologue model has further work this batch — hand their
+    //    memory back before the DiT starts allocating.
+    release_prologue_models();
+
+    return BatchContext{
+        T_lat,
+        seconds,
+        std::move(global_cond),
+        std::move(init_latents),
+        std::move(cross_attn_by_prompt),
+    };
+}
+
+// ── Pipeline::generate_from ──────────────────────────────────────────
+mx::array Pipeline::generate_from(
+    const BatchContext& ctx,
+    const std::string& prompt,
+    int   steps,
+    uint64_t seed,
+    float cfg,
+    float apg,
+    const std::string& negative_prompt,
+    float sigma_max,
+    std::optional<std::pair<float, float>> inpaint_range_seconds) const
+{
+    const int   T_lat   = ctx.T_lat;
+    const float seconds = ctx.seconds;
+    const mx::array& cross_attn  = ctx.cross_attn_for(prompt);
+    const mx::array& global_cond = ctx.global_cond;
+    const std::optional<mx::array>& init_latents = ctx.init_latents;
+
+    // 3. CFG branch: build null_cross_attn for the uncond pass.
+    mx::array null_cross_attn = (cfg != 1.0f && !negative_prompt.empty())
+        ? ctx.cross_attn_for(negative_prompt)
+        : mx::zeros_like(cross_attn);
+    mx::eval(null_cross_attn);
 
     // 5. Pingpong schedule + initial noise (optionally mixed with init_latents).
     mx::array sigmas = build_pingpong_schedule(steps, sigma_max, /*use_logsnr_shift=*/true);
@@ -253,6 +360,76 @@ mx::array Pipeline::generate(
     return audio;
 }
 
+// ── Pipeline::generate (single-shot convenience) ─────────────────────
+mx::array Pipeline::generate(
+    const std::string& prompt,
+    float seconds,
+    int   steps,
+    uint64_t seed,
+    float cfg,
+    float apg,
+    const std::string& negative_prompt,
+    float sigma_max,
+    std::optional<InitAudio> init_audio,
+    std::optional<std::pair<float, float>> inpaint_range_seconds)
+{
+    std::vector<std::string> prompts{prompt};
+    if (cfg != 1.0f && !negative_prompt.empty()) prompts.push_back(negative_prompt);
+    BatchContext ctx = begin_batch(init_audio, seconds, prompts);
+    return generate_from(ctx, prompt, steps, seed, cfg, apg, negative_prompt,
+                         sigma_max, inpaint_range_seconds);
+}
+
+// ── Prologue model lifecycle ─────────────────────────────────────────
+//
+// T5Gemma and the audio encoder are only touched by begin_batch. Between
+// batches they're dead weight — 2.3 GB for medium, of which T5Gemma alone
+// is 0.57 GB — competing with the DiT and decoder for the same unified
+// memory the OS and host DAW are using. Dropping them costs a lazy reload
+// per batch (page-cache warm, ~0.3 s amortized over five candidates).
+void Pipeline::ensure_text_encoder() {
+    if (t5.has_value()) return;
+    auto loaded = mx::load_safetensors(t5gemma_path);
+    t5 = t5g::load_t5gemma(loaded.first, mx::float16);
+}
+
+void Pipeline::ensure_audio_encoder() {
+    if (encoder_var.has_value()) return;
+    auto loaded = mx::load_safetensors(encoder_path);
+    if (kind == ModelKind::MEDIUM) {
+        encoder_var = EncoderVariant{
+            samel::load_samel_encoder(loaded.first, mx::float32)};
+    } else {
+        encoder_var = EncoderVariant{
+            sames::load_sames_encoder(loaded.first, mx::float32)};
+    }
+}
+
+void Pipeline::ensure_prologue_models() {
+    ensure_text_encoder();
+    ensure_audio_encoder();
+}
+
+// Dropping the arrays hands their buffers straight back to MLX's pool, which
+// is what takes them out of the active-memory peak. Returning that pool to
+// the OS is a separate, more expensive step (mx::clear_cache) that begin_batch
+// does once at the end of the prologue rather than after each model — two
+// clear_cache calls per batch measured ~2 s slower than one, because
+// everything the sampler then allocates has to come from Metal afresh.
+void Pipeline::release_text_encoder() {
+    t5.reset();
+}
+
+void Pipeline::release_audio_encoder() {
+    encoder_var.reset();
+}
+
+void Pipeline::release_prologue_models() {
+    release_text_encoder();
+    release_audio_encoder();
+    mx::clear_cache();
+}
+
 // ── Pipeline dispatch helpers ────────────────────────────────────────
 mx::array Pipeline::dit_forward(
     const mx::array& x,
@@ -269,9 +446,14 @@ mx::array Pipeline::dit_forward(
 }
 
 mx::array Pipeline::encoder_forward(const mx::array& patches) const {
+    if (!encoder_var.has_value()) {
+        throw std::runtime_error(
+            "encoder_forward: audio encoder not loaded — call begin_batch() "
+            "(or ensure_prologue_models()) first");
+    }
     return std::visit(
         [&](const auto& enc) { return enc(patches); },
-        encoder_var);
+        *encoder_var);
 }
 
 mx::array Pipeline::decoder_decode_chunked(const mx::array& latents) const {
@@ -298,10 +480,14 @@ Pipeline load_pipeline(
     mx::Dtype dit_dtype,
     ModelKind kind)
 {
+    const MemoryProfile profile = probe_memory();
+    apply_memory_policy(profile);
+
     // T5Gemma (fp16 by Python default; encoder + SentencePiece in one go;
-    // shared across all three model kinds).
-    auto t5_loaded = mx::load_safetensors(t5gemma_path);
-    auto t5 = t5g::load_t5gemma(t5_loaded.first, mx::float16);
+    // shared across all three model kinds) and the audio encoder are loaded
+    // lazily by ensure_prologue_models() at the start of the first batch —
+    // holding them from construction would peak memory before the DiT even
+    // starts. `load_safetensors` is itself lazy, so this costs nothing here.
 
     // DiT (+ conditioner baked into the same safetensors under "cond.*"
     // for all kinds). The DiT C++ namespace differs per architecture; the
@@ -316,35 +502,35 @@ Pipeline load_pipeline(
     auto build = [&]() -> Pipeline {
         if (kind == ModelKind::MEDIUM) {
             auto dit_model  = dit::load_dit(dit_tensors, /*T_lat=*/320, dit_dtype);
-            auto enc_loaded = mx::load_safetensors(encoder_path);
-            auto encoder    = samel::load_samel_encoder(enc_loaded.first, mx::float32);
             auto dec_loaded = mx::load_safetensors(decoder_path);
             auto decoder    = samel::load_samel_decoder(dec_loaded.first, mx::float32);
             return Pipeline{
                 kind,
-                std::move(t5),
+                std::nullopt,
                 std::move(conditioner),
                 DitVariant{std::move(dit_model)},
-                EncoderVariant{std::move(encoder)},
+                std::nullopt,
                 DecoderVariant{std::move(decoder)},
                 dit_dtype,
+                t5gemma_path,
+                encoder_path,
             };
         }
         // SMALL_MUSIC and SMALL_SFX share the same C++ code paths; only the
         // dit_path differs between them. The autoencoder pair is SAME-S.
         auto dit_model  = dit_small::load_dit(dit_tensors, /*T_lat=*/320, dit_dtype);
-        auto enc_loaded = mx::load_safetensors(encoder_path);
-        auto encoder    = sames::load_sames_encoder(enc_loaded.first, mx::float32);
         auto dec_loaded = mx::load_safetensors(decoder_path);
         auto decoder    = sames::load_sames_decoder(dec_loaded.first, mx::float32);
         return Pipeline{
             kind,
-            std::move(t5),
+            std::nullopt,
             std::move(conditioner),
             DitVariant{std::move(dit_model)},
-            EncoderVariant{std::move(encoder)},
+            std::nullopt,
             DecoderVariant{std::move(decoder)},
             dit_dtype,
+            t5gemma_path,
+            encoder_path,
         };
     };
     return build();
@@ -676,26 +862,39 @@ std::vector<CandidateSpec> build_app_preset(
     return out;
 }
 
-std::vector<VariationOutput> run_variations(
-    const Pipeline&                   pipe,
+void run_variations(
+    Pipeline&                         pipe,
     const InitAudio&                  source_audio,
     const std::vector<CandidateSpec>& specs,
     float                             duration_seconds,
-    int                               steps)
+    int                               steps,
+    const std::function<void(const VariationOutput&)>& on_candidate)
 {
-    std::vector<VariationOutput> out;
-    out.reserve(specs.size());
+    // Every string the batch will need encoded: each candidate's prompt,
+    // plus each negative prompt that the CFG branch will actually use.
+    // begin_batch collapses duplicates — for `free` that's five candidates
+    // sharing one empty prompt, for `app` five steers sharing one negative.
+    std::vector<std::string> prompts;
+    prompts.reserve(specs.size() * 2);
     for (const auto& spec : specs) {
-        mx::array audio = pipe.generate(
+        prompts.push_back(spec.prompt);
+        if (spec.cfg != 1.0f && !spec.negative_prompt.empty()) {
+            prompts.push_back(spec.negative_prompt);
+        }
+    }
+
+    BatchContext ctx = pipe.begin_batch(source_audio, duration_seconds, prompts);
+
+    for (const auto& spec : specs) {
+        mx::array audio = pipe.generate_from(
+            ctx,
             spec.prompt,
-            duration_seconds,
             steps,
             spec.seed,
             spec.cfg,
             spec.apg,
             spec.negative_prompt,
             spec.noise,
-            source_audio,
             spec.inpaint_range_seconds);
         // (channels=2, samples) fp32, copy into a planar std::vector<float>
         // so callers don't need MLX in their headers.
@@ -712,8 +911,21 @@ std::vector<VariationOutput> run_variations(
         v.channels = channels;
         v.samples  = samples;
         v.audio.assign(src, src + static_cast<size_t>(channels) * samples);
-        out.push_back(std::move(v));
+        if (on_candidate) on_candidate(v);
     }
+}
+
+std::vector<VariationOutput> run_variations(
+    Pipeline&                         pipe,
+    const InitAudio&                  source_audio,
+    const std::vector<CandidateSpec>& specs,
+    float                             duration_seconds,
+    int                               steps)
+{
+    std::vector<VariationOutput> out;
+    out.reserve(specs.size());
+    run_variations(pipe, source_audio, specs, duration_seconds, steps,
+                   [&out](const VariationOutput& v) { out.push_back(v); });
     return out;
 }
 

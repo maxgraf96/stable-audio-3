@@ -30,6 +30,15 @@
               aria-label="Dismiss">×</button>
     </div>
 
+    <!-- Notice banner: advisory, not a failure. Used for memory guidance
+         (e.g. running SA3 Medium on a machine with just enough RAM), so it
+         reads in the accent colour rather than the error red. -->
+    <div class="notice-banner" id="notice-banner" hidden>
+      <span class="notice-text" id="notice-text"></span>
+      <button type="button" class="notice-dismiss" id="notice-dismiss"
+              aria-label="Dismiss">×</button>
+    </div>
+
     <!-- Single persistent file picker. WKWebView won't fire `change` on a
          dynamically-created-and-clicked input unless it's actually in the
          DOM, so we keep one node around hidden. -->

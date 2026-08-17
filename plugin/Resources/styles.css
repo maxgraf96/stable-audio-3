@@ -87,6 +87,31 @@ body {
 }
 .error-dismiss:hover { color: var(--fg); }
 
+/* ── Notice banner ────────────────────────────────────────────────── */
+/* Same shape as the error banner but in the accent colour — this is
+   advice (memory headroom, model choice), not a failure. */
+.notice-banner {
+  margin-top: 10px;
+  display: flex; align-items: flex-start; gap: 8px;
+  padding: 7px 4px 7px 10px;
+  border-bottom: 1px solid var(--accent-dim);
+  background: var(--accent-tint);
+  color: var(--accent);
+  font-size: 11px;
+  letter-spacing: 0.01em;
+}
+.notice-text { flex: 1; word-break: break-word; line-height: 1.45; }
+.notice-dismiss {
+  background: transparent; border: none;
+  color: var(--accent); font-size: 16px; line-height: 1;
+  cursor: pointer; padding: 2px 8px;
+}
+.notice-dismiss:hover { color: var(--fg); }
+
+/* Model options the machine can't run stay visible but inert, so it's
+   clear the model exists and why it isn't available. */
+.model-select option:disabled { color: var(--faint); }
+
 /* ── Source ───────────────────────────────────────────────────────── */
 .source {
   padding: 18px 0 16px;

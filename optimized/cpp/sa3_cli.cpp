@@ -46,6 +46,9 @@ struct Args {
     std::string decoder_path;
     std::string out_path         = "out.wav";
     std::string dit_dtype        = "fp16";
+    // Which model bundle the four paths belong to. The DiT and autoencoder
+    // architectures differ per kind, so this has to match the files given.
+    std::string model            = "medium";
     std::string init_audio_path;
     std::string inpaint_range_str;
     // --init-noise-level is an alias for --sigma-max when --init-audio is
@@ -79,6 +82,8 @@ void usage(const char* argv0) {
         "  --init-noise-level F    σmax when --init-audio is set (alias for --sigma-max)\n"
         "  --inpaint-range S,E     inpaint seconds range (requires --init-audio)\n"
         "  --dit-dtype fp16|fp32   DiT compute dtype (default fp16)\n"
+        "  --model KIND            medium|sm-music|sm-sfx — must match the\n"
+        "                          --dit/--encoder/--decoder files (default medium)\n"
         "  --t5gemma PATH          path to t5gemma_f16.safetensors\n"
         "  --dit PATH              path to dit_medium_f16.safetensors\n"
         "  --encoder PATH          path to same_l_encoder_f32.safetensors\n"
@@ -119,6 +124,7 @@ bool parse_args(int argc, char** argv, Args& args) {
         else if (a == "--init-audio")       args.init_audio_path = next();
         else if (a == "--inpaint-range")    args.inpaint_range_str = next();
         else if (a == "--dit-dtype")        args.dit_dtype       = next();
+        else if (a == "--model")            args.model           = next();
         else if (a == "--t5gemma")          args.t5gemma_path    = next();
         else if (a == "--dit")              args.dit_path        = next();
         else if (a == "--encoder")          args.encoder_path    = next();
@@ -170,6 +176,14 @@ std::optional<std::pair<float, float>> parse_inpaint_range(const std::string& s)
     return std::make_pair(std::stof(s.substr(0, comma)), std::stof(s.substr(comma + 1)));
 }
 
+sa3::orch::ModelKind parse_model_kind(const std::string& s) {
+    if (s == "medium")   return sa3::orch::ModelKind::MEDIUM;
+    if (s == "sm-music") return sa3::orch::ModelKind::SMALL_MUSIC;
+    if (s == "sm-sfx")   return sa3::orch::ModelKind::SMALL_SFX;
+    std::cerr << "error: --model must be medium|sm-music|sm-sfx (got " << s << ")\n";
+    std::exit(2);
+}
+
 mx::Dtype parse_dtype(const std::string& s) {
     if (s == "fp16") return mx::float16;
     if (s == "fp32") return mx::float32;
@@ -196,7 +210,7 @@ int main(int argc, char** argv) {
     auto t_load_0 = std::chrono::steady_clock::now();
     auto pipe = sa3::orch::load_pipeline(
         args.t5gemma_path, args.dit_path, args.encoder_path, args.decoder_path,
-        dit_dtype);
+        dit_dtype, parse_model_kind(args.model));
     std::cerr << "[sa3] models loaded in " << elapsed_seconds(t_load_0) << "s\n";
 
     // Optionally read init audio. read_wav_pcm16 returns planar (channels,

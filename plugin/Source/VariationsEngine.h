@@ -51,6 +51,19 @@ enum class ModelKind {
     SMALL_SFX   = 2,    // sa3-sm-sfx      (DiT-Small  + SAME-S)
 };
 
+// What the engine learned about this Mac's unified memory, surfaced to the
+// UI so it can pick a sensible default model and warn before someone loads
+// one that won't fit. Mirrors sa3::orch::MemoryProfile; kept free of
+// orchestrator headers so the WebView bridge can include just this file.
+struct MemoryInfo {
+    double    totalGB          = 0.0;
+    double    workingSetGB     = 0.0;
+    bool      mediumSupported   = false;   // sa3-medium fits at all
+    bool      mediumComfortable = false;   // ...with room for a real session
+    bool      simulated         = false;   // SA3_SIMULATE_RAM_GB in effect
+    ModelKind defaultKind       = ModelKind::SMALL_MUSIC;
+};
+
 struct GenerateRequest {
     std::string preset;
     float       seconds       = 5.0f;
@@ -103,6 +116,17 @@ public:
     juce::String getStatus()    const;
     ModelKind    getModelKind() const {
         return static_cast<ModelKind>(current_model_kind_.load(std::memory_order_acquire));
+    }
+
+    // Unified-memory profile for this Mac. Probed once in the constructor —
+    // it doesn't change at runtime, and the UI needs it before the pipeline
+    // has finished loading in order to pick the right default model.
+    const MemoryInfo& getMemoryInfo() const { return memory_info_; }
+
+    // Whether `kind` can run here. Only sa3-medium is ever refused; the
+    // small models fit on every Apple Silicon Mac we support.
+    bool isModelKindSupported(ModelKind kind) const {
+        return kind != ModelKind::MEDIUM || memory_info_.mediumSupported;
     }
 
     // Tear down the current pipeline and load a new one for the requested
@@ -246,14 +270,18 @@ private:
     // Status string (uses peaks_mutex_).
     juce::String                             status_{"Not loaded"};
 
+    // Probed once at construction; immutable thereafter, so it's read
+    // without a lock from any thread.
+    MemoryInfo                               memory_info_;
+
     std::atomic<LoadPhase> load_phase_{LoadPhase::NotLoaded};
     std::atomic<bool>      busy_{false};
     std::atomic<bool>      shutdown_{false};
     std::atomic<bool>      load_pending_{false};
     // Tracks the kind currently held by pipeline_. Stored as int so getters
-    // can be lock-free; the .cpp casts to/from ModelKind. Defaults to
-    // MEDIUM — initial doLoad() honours this value.
-    std::atomic<int>       current_model_kind_{static_cast<int>(ModelKind::MEDIUM)};
+    // can be lock-free; the .cpp casts to/from ModelKind. Seeded from the
+    // memory profile in the constructor — initial doLoad() honours it.
+    std::atomic<int>       current_model_kind_{static_cast<int>(ModelKind::SMALL_MUSIC)};
 
     JUCE_LEAK_DETECTOR(VariationsEngine)
 };

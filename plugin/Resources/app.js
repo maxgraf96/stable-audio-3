@@ -43,6 +43,7 @@ const getPlayState = getNativeFunction("getPlayState");
 const setOneShotMode           = getNativeFunction("setOneShotMode");
 const copyVariationToClipboard = getNativeFunction("copyVariationToClipboard");
 const switchModel              = getNativeFunction("switchModel");
+const getMemoryInfo            = getNativeFunction("getMemoryInfo");
 
 // Fire a JUCE event (vs a native-function call). emitEvent is
 // fire-and-forget and dispatches the listener on the C++ message thread
@@ -92,6 +93,9 @@ const statusText = $("status-text");
 const errorBanner = $("error-banner");
 const errorText = $("error-text");
 const errorDismiss = $("error-dismiss");
+const noticeBanner = $("notice-banner");
+const noticeText = $("notice-text");
+const noticeDismiss = $("notice-dismiss");
 
 const sourceEl = $("source");
 const sourceEmpty = $("source-empty");
@@ -160,6 +164,13 @@ const state = {
     // bounce the dropdown back to the old value before completion fires.
     modelKind: "medium",
     modelSwitchInFlight: false,
+    // Unified-memory profile from the native side (see getMemoryInfo).
+    // Null until the first poll resolves; every consumer treats null as
+    // "no constraint known yet" and stays quiet.
+    memory: null,
+    // Notice keys already dismissed this session, so a warning that the
+    // user has acknowledged doesn't reappear on every generate.
+    dismissedNotices: new Set(),
 };
 
 // Heuristic: filename keywords first (strong signal), then duration (short
@@ -693,7 +704,62 @@ function updateButton() {
 // ── Error banner ─────────────────────────────────────────────────────
 function showError(msg) { errorText.textContent = msg; errorBanner.hidden = false; }
 function clearError() { errorBanner.hidden = true; errorText.textContent = ""; }
+
+// Advisory banner. `key` dedupes: once the user dismisses a given notice we
+// don't show that one again this session (but a different one still shows).
+function showNotice(msg, key) {
+    if (key && state.dismissedNotices.has(key)) return;
+    noticeText.textContent = msg;
+    noticeBanner.dataset.key = key || "";
+    noticeBanner.hidden = false;
+}
+function clearNotice() {
+    noticeBanner.hidden = true;
+    noticeText.textContent = "";
+}
+
+// ── Memory guidance ──────────────────────────────────────────────────
+// Two situations worth telling the user about, both about sa3-medium:
+//   - It can't run here at all (≈8 GB Macs). The option is disabled and we
+//     say why, because "the model I picked silently didn't load" is worse
+//     than a sentence of explanation.
+//   - It fits, but only just (≈16 GB Macs). It'll work; it'll also be slow
+//     and will compete with the DAW for RAM. Warn once, don't block.
+const MEDIUM_MIN_GB = 11;
+
+function mediumNoticeText() {
+    const m = state.memory;
+    if (!m) return "";
+    const have = m.totalGB.toFixed(0);
+    if (!m.mediumSupported) {
+        return `SA3 Medium needs about ${MEDIUM_MIN_GB} GB of unified memory and this Mac has `
+             + `${have} GB. Use SA3 Small Music or SA3 Small SFX — about 3 GB, and faster.`;
+    }
+    return `SA3 Medium fits in ${have} GB but leaves little headroom — expect it to be slow, `
+         + `and slower still with a large project open. SA3 Small Music is the lighter choice.`;
+}
+
+// Reflect the memory profile in the model dropdown: disable what won't run,
+// and label the tight-fit case so the trade-off is visible before selecting.
+function applyMemoryToModelSelect() {
+    const m = state.memory;
+    if (!m) return;
+    const opt = modelSelectEl.querySelector('option[value="medium"]');
+    if (!opt) return;
+    if (!m.mediumSupported) {
+        opt.disabled = true;
+        opt.textContent = `SA3 Medium · needs ~${MEDIUM_MIN_GB} GB RAM`;
+    } else if (!m.mediumComfortable) {
+        opt.disabled = false;
+        opt.textContent = "SA3 Medium · best quality, heavy on RAM";
+    }
+}
 errorDismiss.addEventListener("click", clearError);
+noticeDismiss.addEventListener("click", () => {
+    const key = noticeBanner.dataset.key;
+    if (key) state.dismissedNotices.add(key);
+    clearNotice();
+});
 
 // ── Preset dropdown ──────────────────────────────────────────────────
 function renderPreset() {
@@ -732,6 +798,21 @@ function renderPreset() {
 modelSelectEl.addEventListener("change", async () => {
     const target = modelSelectEl.value;
     if (target === state.modelKind) return;
+    // Medium on a machine that can't hold it: refuse before tearing down a
+    // working pipeline, so the user isn't left with nothing loaded.
+    if (target === "medium" && state.memory && !state.memory.mediumSupported) {
+        modelSelectEl.value = state.modelKind;
+        state.dismissedNotices.delete("medium-unsupported");
+        showNotice(mediumNoticeText(), "medium-unsupported");
+        return;
+    }
+    // Fits, but tightly — proceed, and say what to expect.
+    if (target === "medium" && state.memory && !state.memory.mediumComfortable) {
+        state.dismissedNotices.delete("medium-tight");
+        showNotice(mediumNoticeText(), "medium-tight");
+    } else if (target !== "medium") {
+        clearNotice();
+    }
     state.modelSwitchInFlight = true;
     modelSelectEl.disabled = true;
     // Variations stop being meaningful when the model changes — clear
@@ -1048,6 +1129,13 @@ async function rehydrateUi() {
 generateBtn.addEventListener("click", async () => {
     if (!state.hasSource) return;
     if (state.inFlight || state.busy) return;     // reentry guard
+    // Generating with medium on a machine where it only just fits is the
+    // moment the cost actually lands, so surface it here too — the model may
+    // have been restored from saved UI state rather than picked just now.
+    if (state.modelKind === "medium" && state.memory
+        && !state.memory.mediumComfortable) {
+        showNotice(mediumNoticeText(), "medium-tight");
+    }
     state.inFlight = true;
     updateButton();                               // disables immediately
 
@@ -1132,11 +1220,34 @@ async function pollPlayState() {
     try { applyPlayState(await getPlayState()); } catch (e) { }
 }
 
+// Fetch the unified-memory profile once. It can't change at runtime, so
+// there's no need to poll it — but everything that depends on it (the model
+// dropdown's disabled state, the default selection) waits on this landing.
+async function loadMemoryInfo() {
+    try {
+        const m = await getMemoryInfo();
+        if (!m || typeof m.totalGB !== "number") return;
+        state.memory = m;
+        applyMemoryToModelSelect();
+        // The native side already defaults `current_model_kind_` from the
+        // same profile; mirror it so the dropdown matches before the first
+        // status poll lands.
+        if (typeof m.defaultModel === "string" && !state.modelSwitchInFlight) {
+            state.modelKind = m.defaultModel;
+            modelSelectEl.value = m.defaultModel;
+        }
+        if (!m.mediumSupported) {
+            showNotice(mediumNoticeText(), "medium-unsupported");
+        }
+    } catch (e) { }
+}
+
 // ── Boot ─────────────────────────────────────────────────────────────
 renderPreset();
 renderSource();
 renderResults();
 rehydrateUi();
+loadMemoryInfo();
 pollStatus();
 setInterval(pollStatus, 250);
 setInterval(pollPlayState, 60);   // ~16fps playhead — enough for 10s clips

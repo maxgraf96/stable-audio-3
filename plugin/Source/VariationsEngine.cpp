@@ -198,6 +198,17 @@ std::vector<float> VariationsEngine::extractPeaks(
 VariationsEngine::VariationsEngine()
     : juce::Thread("SA3 MLX Worker")
 {
+    // Probe unified memory before anything else: it decides which model we
+    // default to, and the UI asks for it while the pipeline is still loading.
+    const auto profile = sa3::orch::probe_memory();
+    memory_info_.totalGB           = profile.total_bytes / 1e9;
+    memory_info_.workingSetGB      = profile.working_set_bytes / 1e9;
+    memory_info_.mediumSupported   = profile.medium_supported;
+    memory_info_.mediumComfortable = profile.medium_comfortable;
+    memory_info_.simulated         = profile.simulated;
+    memory_info_.defaultKind       = static_cast<ModelKind>(profile.default_kind);
+    current_model_kind_.store(static_cast<int>(memory_info_.defaultKind),
+                              std::memory_order_release);
     startThread();
 }
 
@@ -859,8 +870,19 @@ void VariationsEngine::run()
 // updates current_model_kind_ on success).
 static std::unique_ptr<sa3::orch::Pipeline> buildPipeline(
     const juce::File& models,
-    ModelKind kind)
+    ModelKind kind,
+    const MemoryInfo& mem)
 {
+    // Refuse rather than thrash. On a machine that can't hold sa3-medium the
+    // run doesn't fail — it swaps, and a generation that should take seconds
+    // takes minutes with no indication of why. A clear error is kinder.
+    if (kind == ModelKind::MEDIUM && ! mem.mediumSupported) {
+        throw std::runtime_error(
+            "SA3 Medium needs about 11 GB of unified memory; this Mac has "
+            + juce::String(mem.totalGB, 1).toStdString()
+            + " GB. Use SA3 Small Music or SA3 Small SFX instead — they need "
+              "about 3 GB and run faster.");
+    }
     const auto files = modelFilesFor(kind);
     const auto t5  = models.getChildFile(kT5GemmaFile).getFullPathName();
     const auto dit = models.getChildFile(files.dit).getFullPathName();
@@ -885,7 +907,7 @@ void VariationsEngine::doLoad()
         const auto kind = static_cast<ModelKind>(
             current_model_kind_.load(std::memory_order_acquire));
         writeStatus(juce::String("Loading ") + modelFilesFor(kind).display_name + "...");
-        pipeline_ = buildPipeline(resolveModelsDir(), kind);
+        pipeline_ = buildPipeline(resolveModelsDir(), kind, memory_info_);
         load_phase_.store(LoadPhase::Loaded, std::memory_order_release);
         writeStatus("Ready");
     }
@@ -908,7 +930,7 @@ void VariationsEngine::doSwitchModel(ModelKind kind)
     pipeline_.reset();
 
     try {
-        pipeline_ = buildPipeline(resolveModelsDir(), kind);
+        pipeline_ = buildPipeline(resolveModelsDir(), kind, memory_info_);
         current_model_kind_.store(static_cast<int>(kind), std::memory_order_release);
         load_phase_.store(LoadPhase::Loaded, std::memory_order_release);
         writeStatus("Ready");
@@ -1030,47 +1052,52 @@ juce::var VariationsEngine::doGenerate(GenerateRequest req, int peaks_n)
             variation_peaks_.assign(total, std::vector<float>{});
         }
 
+        // One call for the whole batch: the source is encoded once rather
+        // than once per candidate, and the callback still lands each result
+        // as it finishes so the UI fills slots progressively. On a slow
+        // machine that matters more, not less — first audition at 1/5 of the
+        // total beats waiting for all five.
         juce::Array<juce::var> slots;
-        for (int i = 0; i < total; ++i) {
-            writeStatus(juce::String::formatted("Generating %d/%d...", i + 1, total));
-            auto outs = sa3::orch::run_variations(
-                *pipeline_, init_audio, {specs[static_cast<size_t>(i)]},
-                seconds, req.steps);
-            if (outs.size() != 1) {
-                throw std::runtime_error("run_variations returned unexpected count");
-            }
-            const auto& v = outs[0];
+        int i = 0;
+        writeStatus(juce::String::formatted("Generating 1/%d...", total));
+        sa3::orch::run_variations(
+            *pipeline_, init_audio, specs, seconds, req.steps,
+            [&](const sa3::orch::VariationOutput& v) {
+                // Build an AudioBuffer<float> from the planar fp32 output.
+                juce::AudioBuffer<float> ab(2, v.samples);
+                ab.clear();
+                for (int c = 0; c < 2; ++c) {
+                    const int srcCh = std::min(c, v.channels - 1);
+                    std::copy(v.audio.data() + srcCh * v.samples,
+                              v.audio.data() + srcCh * v.samples + v.samples,
+                              ab.getWritePointer(c));
+                }
+                auto peaks = extractPeaks(ab, peaks_n);
+                const double dur = static_cast<double>(v.samples) /
+                                   static_cast<double>(kSampleRate);
 
-            // Build an AudioBuffer<float> from the planar fp32 output.
-            juce::AudioBuffer<float> ab(2, v.samples);
-            ab.clear();
-            for (int c = 0; c < 2; ++c) {
-                const int srcCh = std::min(c, v.channels - 1);
-                std::copy(v.audio.data() + srcCh * v.samples,
-                          v.audio.data() + srcCh * v.samples + v.samples,
-                          ab.getWritePointer(c));
-            }
-            auto peaks = extractPeaks(ab, peaks_n);
-            const double dur = static_cast<double>(v.samples) /
-                               static_cast<double>(kSampleRate);
+                {
+                    std::lock_guard<std::mutex> lk(play_mutex_);
+                    variation_bufs_[static_cast<size_t>(i)] = std::move(ab);
+                }
+                {
+                    std::lock_guard<std::mutex> lk(peaks_mutex_);
+                    variation_peaks_[static_cast<size_t>(i)] = peaks;
+                }
 
-            {
-                std::lock_guard<std::mutex> lk(play_mutex_);
-                variation_bufs_[static_cast<size_t>(i)] = std::move(ab);
-            }
-            {
-                std::lock_guard<std::mutex> lk(peaks_mutex_);
-                variation_peaks_[static_cast<size_t>(i)] = peaks;
-            }
+                juce::DynamicObject::Ptr slot = new juce::DynamicObject();
+                slot->setProperty("idx",      i);
+                slot->setProperty("steer",    juce::String(v.spec.steer));
+                slot->setProperty("mode",     juce::String(v.spec.mode));
+                slot->setProperty("duration", dur);
+                slot->setProperty("peaks",    peaksToVar(peaks));
+                slots.add(juce::var(slot.get()));
 
-            juce::DynamicObject::Ptr slot = new juce::DynamicObject();
-            slot->setProperty("idx",      i);
-            slot->setProperty("steer",    juce::String(v.spec.steer));
-            slot->setProperty("mode",     juce::String(v.spec.mode));
-            slot->setProperty("duration", dur);
-            slot->setProperty("peaks",    peaksToVar(peaks));
-            slots.add(juce::var(slot.get()));
-        }
+                if (++i < total) {
+                    writeStatus(juce::String::formatted(
+                        "Generating %d/%d...", i + 1, total));
+                }
+            });
         writeStatus("Ready");
 
         juce::DynamicObject::Ptr obj = new juce::DynamicObject();

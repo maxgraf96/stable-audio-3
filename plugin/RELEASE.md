@@ -36,15 +36,30 @@ Required keys (`.env.example` has details on what each one is + where to get it)
 ## End-user prerequisites
 
 - Apple Silicon (arm64) Mac on **macOS 13.5+**. We deliberately drop x86_64 because MLX is Apple Silicon-only.
+- Enough unified memory for the model they want to run. `sa3-medium` peaks around
+  8.6 GB for a 30 s clip and the plugin refuses to load it below ~11 GB of RAM;
+  the small models peak around 2.8 GB and run anywhere. On a Mac under ~18.6 GB
+  the plugin defaults to `sa3-sm-music` rather than medium.
 - The model files placed in `~/Library/Application Support/SA3 Variations/models/`:
   ```
   ~/Library/Application Support/SA3 Variations/models/
-    t5gemma_f16.safetensors            (~540 MB)
+    t5gemma_f16.safetensors            (~540 MB)   shared by every model kind
+    # sa3-sm-music / sa3-sm-sfx  — ~2.2 GB
+    dit_sm-music_f16.safetensors       (~877 MB)
+    dit_sm-sfx_f16.safetensors         (~877 MB)
+    same_s_encoder_f32.safetensors     (~205 MB)
+    same_s_decoder_f32.safetensors     (~208 MB)
+    # sa3-medium — ~5.9 GB
     dit_medium_f16.safetensors         (~2.7 GB)
     same_l_encoder_f32.safetensors     (~1.6 GB)
     same_l_decoder_f32.safetensors     (~1.6 GB)
   ```
-  Total ~6.4 GB. Ship these as a separate download (zip or `.tar.gz`); the plugin bundles themselves stay around **150 MB each** without them.
+  Everything is ~8.6 GB. `install_models.sh` defaults to `SA3_MODEL_SET=auto`,
+  which downloads the shared encoder plus the small bundle always, and adds the
+  medium bundle only on machines with ≥10.6 GB of RAM — so an 8 GB Mac pulls
+  ~2.7 GB instead of 5.9 GB of files it could never load. Override with
+  `SA3_MODEL_SET=all|small|medium`. The plugin bundles themselves stay around
+  **150 MB each** without any models.
 
 ## Build the release artefacts
 
@@ -95,19 +110,22 @@ We ship a DMG rather than a ZIP because `mlx.metallib` is not a Mach-O — its c
 
 ## Hosting the safetensors on HuggingFace
 
-The four model files are hosted at <https://huggingface.co/maxgraf/sa3-variations-models> — `install_models.sh` is hardcoded to point at that repo (`DEFAULT_REPO`).
+All eight model files are hosted at <https://huggingface.co/maxgraf/sa3-variations-models> — `install_models.sh` is hardcoded to point at that repo (`DEFAULT_REPO`).
+
+Anything the plugin's model dropdown offers has to exist in that repo, or picking
+it fails at load with `missing model file: …`. When you add a model kind to
+`modelFilesFor()` in `VariationsEngine.cpp`, upload its weights and add them to
+the `FILES` list in `install_models.sh` in the same change.
 
 For new versions, just re-upload over the existing files via the HF web UI or:
 
 ```bash
-huggingface-cli upload maxgraf/sa3-variations-models \
-    optimized/mlx/models/mlx/t5gemma_f16.safetensors           t5gemma_f16.safetensors
-huggingface-cli upload maxgraf/sa3-variations-models \
-    optimized/mlx/models/mlx/dit_medium_f16.safetensors        dit_medium_f16.safetensors
-huggingface-cli upload maxgraf/sa3-variations-models \
-    optimized/mlx/models/mlx/same_l_encoder_f32.safetensors    same_l_encoder_f32.safetensors
-huggingface-cli upload maxgraf/sa3-variations-models \
-    optimized/mlx/models/mlx/same_l_decoder_f32.safetensors    same_l_decoder_f32.safetensors
+M=~/Library/Application\ Support/SA3\ Variations/models
+for f in t5gemma_f16 \
+         dit_sm-music_f16 dit_sm-sfx_f16 same_s_encoder_f32 same_s_decoder_f32 \
+         dit_medium_f16 same_l_encoder_f32 same_l_decoder_f32; do
+    hf upload maxgraf/sa3-variations-models "$M/$f.safetensors" "$f.safetensors"
+done
 ```
 
 `install_models.sh` resolves at runtime from the `main` revision, so users always get the latest upload. To pin a release to a specific snapshot, pass a commit SHA as the second arg to the script, or set `DEFAULT_REV` in the script before running `prepare_release_assets.sh`.

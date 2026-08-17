@@ -180,6 +180,27 @@ juce::WebBrowserComponent::Options buildOptions(SA3AudioProcessor& processor,
                 obj->setProperty("modelKind", juce::String(kindStr));
                 complete(juce::var(obj.get()));
             })
+        // getMemoryInfo() → what this Mac can actually run. Static for the
+        // lifetime of the process, but the UI calls it on startup to choose
+        // the default model and to decide whether to warn about sa3-medium.
+        .withNativeFunction(
+            "getMemoryInfo",
+            [&processor](const juce::Array<juce::var>& /*args*/,
+                         juce::WebBrowserComponent::NativeFunctionCompletion complete) {
+                const auto& m = processor.getVariationsEngine().getMemoryInfo();
+                const char* defStr =
+                    m.defaultKind == sa3plugin::ModelKind::SMALL_MUSIC ? "sm-music" :
+                    m.defaultKind == sa3plugin::ModelKind::SMALL_SFX   ? "sm-sfx"   :
+                                                                         "medium";
+                juce::DynamicObject::Ptr obj = new juce::DynamicObject();
+                obj->setProperty("totalGB",           m.totalGB);
+                obj->setProperty("workingSetGB",      m.workingSetGB);
+                obj->setProperty("mediumSupported",   m.mediumSupported);
+                obj->setProperty("mediumComfortable", m.mediumComfortable);
+                obj->setProperty("simulated",         m.simulated);
+                obj->setProperty("defaultModel",      juce::String(defStr));
+                complete(juce::var(obj.get()));
+            })
         // switchModel("medium" | "sm-music" | "sm-sfx") — tear down the
         // current pipeline and load the requested one. Idempotent (no-op
         // if already on the requested kind). Resolves to { ok, error? }.
@@ -203,6 +224,20 @@ juce::WebBrowserComponent::Options buildOptions(SA3AudioProcessor& processor,
                     juce::DynamicObject::Ptr err = new juce::DynamicObject();
                     err->setProperty("ok",    false);
                     err->setProperty("error", "unknown model kind: " + name);
+                    complete(juce::var(err.get()));
+                    return;
+                }
+                // Reject here as well as in buildPipeline: the UI should
+                // never offer an unsupported model, but a stale persisted UI
+                // state can still ask for one after a project moves machines.
+                auto& eng = processor.getVariationsEngine();
+                if (! eng.isModelKindSupported(kind)) {
+                    juce::DynamicObject::Ptr err = new juce::DynamicObject();
+                    err->setProperty("ok",           false);
+                    err->setProperty("unsupported",  true);
+                    err->setProperty("error",
+                        "SA3 Medium needs about 11 GB of unified memory; this Mac has "
+                        + juce::String(eng.getMemoryInfo().totalGB, 1) + " GB.");
                     complete(juce::var(err.get()));
                     return;
                 }

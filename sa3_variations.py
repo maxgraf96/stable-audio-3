@@ -656,10 +656,10 @@ def build_app_preset(
     cfg_a2a: float,
     cfg_inpaint: float,
     apg: float,
-    noise_a2a: float = 0.45,
+    noise_a2a: float = 0.68,
 ) -> list[CandidateSpec]:
     """Five-shot preset matching the product shape:
-      3 × a2a (global reharmonization) at n=noise_a2a (default 0.45)
+      3 × a2a (global reharmonization) at n=noise_a2a (default 0.68)
       2 × inpaint (sectional rewrite) at n=0.85, middle-bar and first-2-bars
 
     Melodic only — drum/oneshot/sfx have not been validated with the same
@@ -681,7 +681,7 @@ def build_app_preset(
         first_2_bars = clamp_range(0.0, duration * 0.5, duration)
 
     slots: list[tuple[str, Optional[tuple[float, float]], float, str]] = [
-        # a2a slots all share noise_a2a (default 0.45, slider-controllable from
+        # a2a slots all share noise_a2a (default 0.68, slider-controllable from
         # the studio) paired with cfg=4.0. The three steers vary the musical
         # direction while noise/CFG stay constant within a run.
         ("a2a", None, noise_a2a, "extra passing notes and ornaments"),
@@ -729,14 +729,17 @@ def build_free_preset(
     decoder: str,
     outdir: Path,
     steps: int,
-    noise_a2a: float = 0.45,
+    noise_a2a: float = 0.68,
 ) -> list[CandidateSpec]:
     """Five-shot 'free variation' preset — the unconditional / no-prompt regime.
 
-    All a2a, empty prompt, cfg=1.0, seeds vary; noise_a2a defaults to 0.45
-    (tighter than the friend's 0.52 — empirically a better balance of
-    variation and preserved feel on melodic loops) and is slider-controllable
-    from the studio."""
+    All a2a, empty prompt, cfg=1.0, seeds vary; noise_a2a defaults to 0.68
+    and is slider-controllable from the studio.
+
+    0.68 is the recalibrated equivalent of the 0.45 this preset shipped with
+    before the schedule fix: the old schedule silently ran ~1.5x hotter than
+    the number said (see README_VARIATIONS, "the sigma slider under-delivered"),
+    so preserving the tuned character means asking for more now."""
     candidates: list[CandidateSpec] = []
     for i in range(5):
         cand_seed = seed + i * 1009
@@ -968,7 +971,7 @@ def parse_args() -> argparse.Namespace:
         "--preset",
         choices=["grid", "app", "free", "diagnose"],
         default="free",
-        help="free (default): 5-shot unconditional a2a at n=0.45, seeds vary "
+        help="free (default): 5-shot unconditional a2a at n=0.68, seeds vary "
              "— keeps harmonic context and feel, lets timbre/instrument drift. "
              "app: 5-shot 'preserve sound' preset (3 a2a + 2 inpaint with steers, melodic only). "
              "grid: exploration sweep of --count candidates. "
@@ -988,9 +991,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--noise-a2a",
         type=float,
-        default=0.45,
+        default=0.68,
         help="Noise level (σmax) for audio-to-audio candidates in --preset free "
-             "and --preset app. Default 0.45 (slightly tighter than the friend's "
+             "and --preset app. Default 0.68 (the recalibrated equivalent of the "
              "0.52 setup — empirically keeps harmonic context with less "
              "timbre/instrument drift on melodic loops). Lower values (0.25-0.35) "
              "preserve timbre more tightly; higher values (>0.65) drift further "
@@ -1049,7 +1052,7 @@ def make_default_args(**overrides) -> argparse.Namespace:
         quality="good",
         steps=None,
         dit="auto",
-        noise_a2a=0.45,
+        noise_a2a=0.68,
         cfg_a2a=4.0,
         cfg_inpaint=4.0,
         apg=1.0,

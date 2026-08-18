@@ -278,7 +278,16 @@ class Pipeline:
             cfg_v = (x.astype(mx.float32) - cfg_d) / sigma
             return cfg_v.astype(x.dtype)
 
-        sigmas = build_pingpong_schedule(steps, sigma_max=sigma_max, use_logsnr_shift=True)
+        # Build the schedule in normalised t, then scale into [0, sigma_max].
+        #
+        # Passing sigma_max straight to build_pingpong_schedule warps an
+        # already-scaled ramp: logsnr_shift assumes its input spans [0,1], so
+        # linspace(0.10, 0) comes back as [0.12 .. 0.217] — every interior step
+        # sits ABOVE the sigma that was asked for, and only t[0] is re-anchored.
+        # The slider then under-delivers badly (0.45 actually peaks at 0.77).
+        # Shifting the unit ramp first keeps the curve's shape but confines it
+        # to [0, sigma_max]. Identical to shift(t/sigma_max) * sigma_max.
+        sigmas = build_pingpong_schedule(steps, sigma_max=1.0, use_logsnr_shift=True) * sigma_max
         latents = sample_flow_pingpong(
             model_fn, noise, sigmas, seed=seed + 1, paste_back=paste_back
         )

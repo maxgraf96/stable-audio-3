@@ -60,7 +60,7 @@ struct MemoryInfo {
 struct GenerateRequest {
     std::string preset;
     float       seconds       = 5.0f;
-    float       noise         = 0.45f;
+    float       noise         = 0.68f;
     std::optional<float> bpm;
     std::string key;
     std::string user_prompt;
@@ -90,10 +90,9 @@ public:
     // inside load()/runVariations() — in practice the engine's worker thread.
     //
     // This exists because a backend can spend a long time somewhere the engine
-    // can't see. The Python worker keeps one pipeline sized to a specific loop
-    // length, so the first generate after a differently-sized source is dropped
-    // rebuilds it (~12 s) *inside* runVariations. Without this the UI sits on
-    // "Generating 1/5..." and the model load reads as a very slow generation.
+    // can't see — the Python worker takes ~13 s to bring a model up, and a
+    // model switch does that mid-session. Without this the UI would sit on
+    // whatever it last said and the load would read as a very slow generation.
     using StatusFn = std::function<void(const std::string&)>;
     void setStatusCallback(StatusFn fn) { status_ = std::move(fn); }
 

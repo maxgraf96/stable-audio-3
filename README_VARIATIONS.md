@@ -70,7 +70,7 @@ The variation problem has two valid framings that lead to very different paramet
 | Timbre | can drift | must survive |
 | Instrument | may change | must stay |
 | Harmonic context | preserved | varies subtly |
-| Noise level | a2a 0.45 (slider-controllable in studio) | a2a 0.45 (slider-controllable), inpaint 0.85 |
+| Noise level | a2a 0.68 (slider-controllable in studio) | a2a 0.68 (slider-controllable), inpaint 0.85 |
 | Guidance | cfg=1.0 (unconditional) | cfg=4 for a2a, cfg=4 for inpaint |
 | Per-candidate steers | none, empty prompt | yes (musical directions) |
 
@@ -107,7 +107,7 @@ optimized/mlx/.venv/bin/python sa3_variations.py \
 
 (Windows: `.venv\Scripts\python.exe sa3_variations.py --sa3-root . --input <some.wav> --kind melodic --outdir .\runs\<name>`)
 
-Defaults to `--preset free` (unconditional a2a at n=0.45, varied seeds). Add `--preset app` for the prompt-anchored "preserve sound" regime. Use `--noise-a2a` to override the noise level (mirrors the studio slider). Filename-based BPM/key auto-detection runs by default for `app` (which uses BPM for bar-aware inpaint masks); `--bpm` / `--key` override. `free` ignores both since it sends an empty prompt and has no inpaint candidates.
+Defaults to `--preset free` (unconditional a2a at n=0.68, varied seeds). Add `--preset app` for the prompt-anchored "preserve sound" regime. Use `--noise-a2a` to override the noise level (mirrors the studio slider). Filename-based BPM/key auto-detection runs by default for `app` (which uses BPM for bar-aware inpaint masks); `--bpm` / `--key` override. `free` ignores both since it sends an empty prompt and has no inpaint candidates.
 
 ## What we learned about SA3 for variation
 
@@ -121,17 +121,24 @@ In **a2a mode**, every sample is regenerated. The init_audio is mixed into the s
 
 This asymmetry is the single most important architectural fact when designing a variation product on SA3.
 
-### 2. The productive a2a noise band for tonal melodic content is 0.25–0.35.
+### 2. The productive a2a noise band for tonal melodic content is 0.35–0.51.
 
 The MLX runner's help says "0.4–0.8 typical for variation." That's correct for text-to-audio. For init_audio-driven variation of a tonal melodic loop *without an instrument-naming prompt*, the band collapses:
 
-| σmax (cfg=2, no prompt) | Result |
-|---|---|
-| 0.25 | timbre almost identical, very small variation |
-| 0.30 | timbre preserved, light variation |
-| 0.35 | timbre preserved, real musical flourish — sweet spot |
-| 0.45 | timbre starts drifting |
-| 0.50+ | drifts to neighbouring tonal instruments (guitar / vibraphone / etc) |
+| σmax (cfg=2, no prompt) | old σ | Result |
+|---|---|---|
+| 0.35 | 0.25 | timbre almost identical, very small variation |
+| 0.43 | 0.30 | timbre preserved, light variation |
+| 0.51 | 0.35 | timbre preserved, real musical flourish — sweet spot |
+| 0.68 | 0.45 | timbre starts drifting |
+| 0.76+ | 0.50+ | drifts to neighbouring tonal instruments (guitar / vibraphone / etc) |
+
+**The "old σ" column exists because these numbers moved.** The listening tests
+behind this table were run against a schedule bug (see §9) that made every
+variation run ~1.5× hotter than the σ you asked for. Fixing it made σ mean what
+it says, so each tuned value had to be restated at the level that reproduces the
+same result. The right-hand column is what you would have typed before the fix;
+the left is what to type now. The *sounds* are unchanged.
 
 **Why:** SA3 was trained as text→audio. At σ=0.5 the denoising trajectory has too much room and lands somewhere in the tonal-instrument neighbourhood of latent space. Without a text anchor naming the instrument, the trajectory is undisambiguated. Piano, electric piano, guitar, and vibraphone are all close cousins in this space.
 
@@ -187,6 +194,42 @@ That's the realisation that motivated the two-preset design. `--preset free` shi
 
 The "matched to the duration" phrasing in their post likely just means they set `--seconds` equal to the input length. There's a weaker mechanism by which longer clips might tolerate higher noise (more `T_lat` positions → more attention context), but it's a secondary effect; the 0.52 value isn't derived from the duration by any formula we know of.
 
+### 9. The σ slider used to under-deliver by ~1.5×. Fixed.
+
+`logsnr_shift` maps t∈[0,1] through log-SNR space, and it assumes its input spans that whole range. Every backend was handing it a ramp that had *already* been scaled to σ:
+
+```python
+t = linspace(sigma_max, 0, steps + 1)
+t = logsnr_shift(t)          # <- assumes t spans [0,1]
+t[0] = sigma_max             # re-anchor only the first point
+```
+
+For σ=0.10 that returns `[0.100, 0.217, 0.200, 0.184, ...]` — every interior step sits *above* the σ that was asked for, and only `t[0]` is corrected. Asking for 0.45 actually peaked at **0.774**. The bug is invisible at σ=1.0 (the input already spans [0,1]), which is why plain text-to-audio was always right and only variations were affected.
+
+The fix builds the schedule in normalised t and scales afterwards — same curve shape, confined to [0, σ]:
+
+```python
+t = build_pingpong_schedule(steps, sigma_max=1.0) * sigma_max
+```
+
+Measured on an 8s melodic loop, correlation-with-source (autoencoder round-trip ceiling is 0.998):
+
+| σ | before | after |
+|---|---|---|
+| 0.05 | 0.938 | **0.987** |
+| 0.10 | 0.921 | **0.967** |
+| 0.25 | 0.859 | **0.900** |
+| 0.45 | 0.632 | **0.824** |
+
+Applied in all three backends so they stay in lockstep: `sa3_pipeline_mlx.py`, `optimized/cpp/sa3_orchestrator.cpp`, and `sa3_pipeline_torch.py` (as a `dist_shift` shim, since torch builds its schedule inside `sample_diffusion`).
+
+**Every tuned σ in this document was restated** to the value that reproduces the same sound — matched on measured correlation, not by scaling the peak, because the corrected schedule *holds* near σ for every step where the old one only grazed its peak before decaying. Peak-matching overshoots: it maps 0.45 → 0.774, which lands at correlation 0.491 against the old 0.632.
+
+Two things this does **not** cover, both wanting your ears:
+
+- **Inpaint noise (0.85) was left alone.** At that level correlation saturates near zero and can't discriminate, yet §6's listening test cleanly separated 0.85 / 0.95 / 1.00 — so the metric used for the a2a values is blind exactly where it would be needed. 0.85 now runs gentler than it did; re-listen before trusting it.
+- **The `grid` and `diagnose` presets keep their original σ values.** They're exploration sweeps rather than shipped defaults, so they now span a gentler band than the numbers suggest.
+
 ## Filename heuristic
 
 Both the CLI and the studio derive BPM and key from the filename when not provided explicitly. Recognised patterns:
@@ -202,10 +245,10 @@ BPM is constrained to the 40–240 range to avoid false matches like `kick_440Hz
 
 | Preset | Slots | Mode mix | Noise | CFG | Prompt | Use |
 |---|---|---|---|---|---|---|
-| `app` | 5 | 3 a2a + 2 inpaint | a2a 0.45*, inpaint 0.85 | a2a 4.0, inpaint 4.0 | per-candidate steer | "preserve sound" product |
-| `free` | 5 | 5 a2a | 0.45* | 1.0 | empty | "free variation" product (default) |
+| `app` | 5 | 3 a2a + 2 inpaint | a2a 0.68*, inpaint 0.85 | a2a 4.0, inpaint 4.0 | per-candidate steer | "preserve sound" product |
+| `free` | 5 | 5 a2a | 0.68* | 1.0 | empty | "free variation" product (default) |
 
-\* a2a noise is `--noise-a2a` on the CLI / the slider in the studio. 0.45 is the default; the original friend's setup used 0.52 (see §8).
+\* a2a noise is `--noise-a2a` on the CLI / the slider in the studio. 0.68 is the default (0.45 before the §9 schedule fix).
 | `diagnose` | 4 | 4 a2a | 0.50 / 0.25 / 0.35 / 0.45 | 1.0 / 2.0 / 2.0 / 2.0 | neutral steer | isolate cfg vs noise as drift source |
 | `grid` | `--count` | inpaint-dominant | melodic a2a 0.25–0.35, inpaint 0.85 | per-mode | per-candidate steer | exploration sweep |
 

@@ -32,6 +32,39 @@ from stable_audio_3 import StableAudioModel
 SAMPLE_RATE = 44100
 MIN_SIGMA = 0.01
 
+
+class _NormalisedShift:
+    """Applies the model's timestep shift in normalised t, then rescales.
+
+    `build_schedule` warps an already-sigma-scaled ramp: the shift assumes its
+    input spans [0,1], so linspace(0.10, 0) comes back as [0.12 .. 0.217] —
+    every interior step lands ABOVE the requested sigma, and only t[0] is
+    re-anchored. Asking for 0.45 actually peaks at 0.774.
+
+    Normalising first keeps the curve's shape while confining it to
+    [0, sigma_max], so the noise level means what it says. At sigma_max=1.0
+    this is a no-op, which is why full text-to-audio generation never showed
+    the problem — it only ever bit variations.
+
+    Mirrors the `* sigma_max` form used in sa3_pipeline_mlx.py; kept as a shim
+    here because the torch schedule is built deep inside sample_diffusion and
+    `dist_shift` is the only seam into it.
+    """
+
+    def __init__(self, base, sigma_max: float):
+        self.base = base
+        self.sigma_max = float(sigma_max)
+
+    def shift(self, t, seq_len):
+        if self.base is None:
+            return t
+        if self.sigma_max <= 0.0:
+            return self.base.shift(t, seq_len)
+        import torch as _torch
+
+        normalised = _torch.clamp(t / self.sigma_max, 0.0, 1.0)
+        return self.base.shift(normalised, seq_len) * self.sigma_max
+
 # The variation harness speaks the MLX runner's model names; map them onto the
 # torch checkpoint names. The decoder isn't separately selectable here — each
 # checkpoint bundles its own SAME autoencoder — so it is validated, not chosen.
@@ -143,6 +176,18 @@ class Pipeline:
                 file=sys.stderr,
             )
 
+    def set_duration(self, seconds: float) -> None:
+        """Retarget the resident pipeline at a new loop length.
+
+        Free here: nothing in the torch model is sized to the duration —
+        `seconds` only picks the latent length inside each generate() call, and
+        StableAudioModel.generate() derives that per call anyway. The MLX
+        backend deliberately has no equivalent, because its DiT allocates
+        `_local_zeros_1` against T_lat at construction; callers that must
+        support both should treat a missing set_duration as "rebuild instead".
+        """
+        self.seconds = float(seconds)
+
     def _validate_inpaint_range(self, inpaint_seconds: tuple[float, float]) -> tuple[float, float]:
         s, e = (float(x) for x in inpaint_seconds)
         if not (0 <= s < e <= self.seconds + 1e-6):
@@ -219,6 +264,13 @@ class Pipeline:
         elif init_t is not None:
             kwargs["init_audio"] = (SAMPLE_RATE, init_t)
             kwargs["init_noise_level"] = sigma_max
+
+        # Only variations need the correction — at sigma_max 1.0 the shift is
+        # already operating on a unit ramp. Skip it if a caller supplied its own
+        # dist_shift, since that's an explicit override.
+        if sigma_max < 1.0 and "dist_shift" not in generate_kwargs:
+            kwargs["dist_shift"] = _NormalisedShift(
+                self.model.model.sampling_dist_shift, sigma_max)
 
         kwargs.update(generate_kwargs)
         audio = self.model.generate(**kwargs)

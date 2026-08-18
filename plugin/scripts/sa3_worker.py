@@ -157,27 +157,39 @@ class Worker:
         self._ensure_pipeline(model, seconds)
         _emit({"event": "ready", "loadSeconds": self._last_load_seconds})
 
+    def _retarget(self, seconds: float) -> bool:
+        """True if the resident pipeline can serve `seconds` without a rebuild."""
+        p = self.pipeline
+        if abs(float(p.seconds) - float(seconds)) < 1e-3:
+            return True
+        setter = getattr(p, "set_duration", None)
+        if setter is None:
+            return False        # MLX sizes its DiT buffers to T_lat — must rebuild.
+        setter(seconds)
+        return True
+
     def _ensure_pipeline(self, model: str, seconds: float) -> None:
         """Build the pipeline, reusing the resident one when it already matches.
 
-        The torch backend keys on (dit, decoder, seconds) exactly as
-        sa3_variations does, so a new loop length rebuilds but a new click on
-        the same length is free.
+        Keyed on (dit, decoder) only. The duration is deliberately *not* part
+        of the key: on torch it costs nothing to retarget (see
+        Pipeline.set_duration), and keying on it meant the plugin — which loads
+        at a default 8s before any source exists — rebuilt the whole model
+        (~23s) the first time it saw a loop of any other length.
         """
         from sa3_pipeline import Pipeline
 
         dit, decoder = _MODEL_TO_DIT[model]
-        key = (dit, decoder, round(float(seconds), 3))
-        if self.pipeline is not None and self.pipeline_key == key:
+        key = (dit, decoder)
+        if self.pipeline is not None and self.pipeline_key == key and self._retarget(seconds):
             self._last_load_seconds = 0.0
             return
-        # Announce before building, not after: this is the one place the
-        # plugin can stall for ~12 s inside a generate — the pipeline is sized
-        # to the loop length, so the first run after a differently-sized source
-        # rebuilds it. Silence here reads as "generation is very slow".
+        # Announce before building, not after. Reaching here costs ~13 s, and
+        # a model switch does it mid-session; silence reads as a very slow
+        # generation. (A new loop length no longer lands here — see _retarget.)
         _emit({
             "event": "status",
-            "message": "Loading %s (%.1fs loop)..." % (_DISPLAY_NAME[model], seconds),
+            "message": "Loading %s..." % _DISPLAY_NAME[model],
         })
         t0 = time.time()
         # Drop the old one first: loading is the memory-heaviest moment and

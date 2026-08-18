@@ -1066,8 +1066,10 @@ window.addEventListener("mouseup", () => {
 function updateNoiseHint() {
     const v = Number(noiseInput.value);
     let text = "";
-    if (v <= 0.30) text = "Results likely very similar to original";
-    else if (v >= 0.61) text = "Results likely deviate significantly from original";
+    // Thresholds are on the corrected sigma scale (see README_VARIATIONS):
+    // 0.45 here is what 0.30 meant before the schedule fix.
+    if (v <= 0.45) text = "Results likely very similar to original";
+    else if (v >= 0.90) text = "Results likely deviate significantly from original";
     noiseHintEl.textContent = text;
     noiseHintEl.classList.toggle("visible", text !== "");
 }
@@ -1086,7 +1088,7 @@ userPrompt.addEventListener("input", saveUiSoon);
 // ── State persistence ────────────────────────────────────────────────
 function snapshotUi() {
     // Noise σ is intentionally not persisted — each new session starts at
-    // the HTML default (0.45) so the user re-decides per session.
+    // the HTML default (0.68) so the user re-decides per session.
     return {
         preset: state.preset,
         bpm: bpmInput.value,

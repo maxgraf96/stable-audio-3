@@ -233,7 +233,17 @@ mx::array Pipeline::generate_from(
     mx::eval(null_cross_attn);
 
     // 5. Pingpong schedule + initial noise (optionally mixed with init_latents).
-    mx::array sigmas = build_pingpong_schedule(steps, sigma_max, /*use_logsnr_shift=*/true);
+    //
+    // Build the schedule in normalised t, then scale into [0, sigma_max].
+    // Passing sigma_max straight in warps an already-scaled ramp: logsnr_shift
+    // assumes its input spans [0,1], so linspace(0.10, 0) returns
+    // [0.12 .. 0.217] — every interior step sits ABOVE the requested sigma and
+    // only t[0] is re-anchored, so the noise level silently under-delivers
+    // (0.45 actually peaks at 0.774). Shifting the unit ramp first preserves
+    // the curve's shape while confining it to [0, sigma_max]. No-op at
+    // sigma_max = 1.0, which is why only variations were affected.
+    mx::array sigmas =
+        build_pingpong_schedule(steps, 1.0f, /*use_logsnr_shift=*/true) * sigma_max;
     mx::array key = mx::random::key(seed);
     mx::array pure_noise = mx::random::normal(
         {1, dit::IO_CHANNELS, T_lat}, dit_dtype, key);

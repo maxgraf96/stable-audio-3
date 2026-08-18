@@ -3,8 +3,10 @@
 
 Open in a browser, drop a WAV, get 5 variations to listen to. Calls
 `sa3_variations.run_variations()` in-process and keeps a long-lived backend
-Pipeline resident across clicks (rebuilt only when the audio duration
-changes, since the DiT's `_local_zeros_1` buffer is sized to T_lat).
+Pipeline resident across clicks. A new audio duration rebuilds it, because
+MLX sizes the DiT's `_local_zeros_1` buffer to T_lat at construction. (The
+torch backend can retarget for free — see Pipeline.set_duration — which is
+what the plugin's worker uses; the studio still takes the simple path.)
 
 Usage:
   optimized/mlx/.venv/bin/python sa3_studio.py   # macOS (MLX)
@@ -155,10 +157,10 @@ HTML = """<!doctype html>
     </div>
     <label class="app-only">BPM <input type="number" id="bpm" step="0.1" placeholder="optional"></label>
     <label class="app-only">Key <input type="text" id="key" placeholder="optional"></label>
-    <label title="Noise level for a2a candidates. 0.45 = default. Lower preserves timbre, higher drifts further.">Noise <input type="range" id="noise" min="0.10" max="1.00" step="0.01" value="0.45"><span class="noise-val" id="noise-val">0.45</span></label>
+    <label title="Noise level for a2a candidates. 0.68 = default. Lower preserves timbre, higher drifts further.">Noise <input type="range" id="noise" min="0.10" max="1.00" step="0.01" value="0.68"><span class="noise-val" id="noise-val">0.68</span></label>
     <button id="gen" disabled>Generate</button>
   </div>
-  <div class="preset-hint" id="preset-hint">5 unconditional a2a samples at n=0.45. Preserves harmonic context, lets timbre/instrument drift.</div>
+  <div class="preset-hint" id="preset-hint">5 unconditional a2a samples at n=0.68. Preserves harmonic context, lets timbre/instrument drift.</div>
 
   <div class="status" id="status"></div>
 

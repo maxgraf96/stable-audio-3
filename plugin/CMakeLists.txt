@@ -161,11 +161,37 @@ target_link_libraries(SA3 PRIVATE
     juce::juce_gui_extra            # WebBrowserComponent + native bridge
     SA3Resources                    # baked HTML/CSS/JS (BinaryData.h)
     $<$<BOOL:${APPLE}>:sa3_orchestrator>
+    # WorkerBackend reads dedicated VRAM straight from DXGI. Asking the Python
+    # worker instead would mean spawning it and importing torch (~10 s) inside
+    # the engine constructor, stalling app startup just to draw a memory notice.
+    $<$<BOOL:${WIN32}>:dxgi>
     PUBLIC
     juce::juce_recommended_config_flags
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags
 )
+
+# ── Smoke test for the Python-worker backend ──────────────────────────
+# Exercises WorkerBackend end to end (spawn, handshake, generate, decode)
+# without the GUI, which is otherwise only reachable by dropping a file by
+# hand. Compiles WorkerBackend.cpp a second time rather than linking the
+# plugin's SharedCode, so it stays independent of the audio-plugin glue.
+if(NOT APPLE)
+    juce_add_console_app(sa3_worker_smoke PRODUCT_NAME "sa3_worker_smoke")
+    target_sources(sa3_worker_smoke PRIVATE
+        tests/worker_backend_smoke.cpp
+        Source/WorkerBackend.cpp)
+    target_compile_definitions(sa3_worker_smoke PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=0
+        JUCE_STANDALONE_APPLICATION=1)
+    target_link_libraries(sa3_worker_smoke PRIVATE
+        juce::juce_core
+        juce::juce_audio_formats
+        $<$<BOOL:${WIN32}>:dxgi>
+        PUBLIC
+        juce::juce_recommended_config_flags)
+endif()
 
 # ── macOS bundle plumbing ─────────────────────────────────────────────
 # rpaths, dylib vendoring and codesigning are all Mach-O concerns. The

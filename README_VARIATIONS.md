@@ -30,11 +30,34 @@ The MLX backend pastes the unmasked region back into the latent at *every* sampl
 
 If it turns out to matter, the fix is to reproduce MLX's paste-back — either by generating with `return_latents=True` and running the sampling loop locally, or by mutating `denoised` in place from `sample_flow_pingpong`'s callback (it is consumed on the line after the callback fires).
 
+### Only one thing may hold the GPU at a time
+
+On a discrete GPU the model does not share nicely. A resident sa3-medium is ~9.3 GB of a 12 GB card, so a second process wanting the same weights doesn't fail — Windows spills to system memory and everything crawls. Measured on a 5070 Ti: 5 candidates take **6.3 s** with the GPU free and **46.8 s** with the studio server still running in the background. Same code, same seeds, 7× slower.
+
+So run *either* `sa3_studio.py` *or* the plugin, not both. If a run is inexplicably slow, check `nvidia-smi` for a leftover Python holding VRAM before looking anywhere else. (This is not a concern on Apple Silicon, where there is one unified pool and no spill.)
+
 ### Windows notes
 
 - PyPI's Windows `torch` wheel is built against CUDA 12.6, which has no `sm_120` kernels — Blackwell cards (RTX 50-series) fail at runtime. `pyproject.toml` therefore routes `sys_platform == 'win32'` to the `cu128` index at the same pinned version.
 - `flash_attn` has no Windows wheels; the DiT falls back to PyTorch SDPA and prints a startup notice. That's expected, not an error.
-- SA3 checkpoints and `google/t5gemma-b-b-ul2` are gated on Hugging Face — accept both licences and authenticate (`hf auth login`, or export `HF_TOKEN`) before the first run.
+- SA3 checkpoints and `google/t5gemma-b-b-ul2` are gated on Hugging Face — accept both licences and authenticate (`hf auth login`, or export `HF_TOKEN`) before the first run. Once the weights are cached, later runs need no token.
+
+## JUCE plugin on Windows
+
+Standalone only for now (`cmake -S plugin -B plugin/build -G "Visual Studio 17 2022" -A x64` then `cmake --build plugin/build --config Release`). Needs VS 2022 Build Tools with the C++ workload, CMake ≥ 3.22, and the `Microsoft.Web.WebView2` NuGet package unpacked where JUCE looks for it (`%LOCALAPPDATA%\PackageManagement\NuGet\Packages`) — JUCE prints the exact install command if it's missing.
+
+Inference runs through `plugin/scripts/sa3_worker.py`, a resident Python process the plugin spawns and keeps warm, speaking newline-delimited JSON over stdio. It finds the repo by walking up from the executable; `SA3_REPO` and `SA3_PYTHON` override that. Worker stderr — model load progress, tracebacks — goes to `%APPDATA%\SA3 Variations\worker.log`, which is the first place to look when a generation fails.
+
+`sa3_worker_smoke.exe <source.wav>` drives the same backend without the GUI and exits non-zero on failure:
+
+```
+probe   : 12.52 GB | mediumSupported=1 comfortable=0 default=SA3-medium
+load    : SA3-medium in 14.7s
+  cand 0: 352800 samples (8.00s) rms=0.2538 mode=a2a +2.65s
+  cand 1: 352800 samples (8.00s) rms=0.2607 mode=a2a +0.91s
+  ...
+generate: 5 candidates in 6.4s
+```
 
 ## Two product targets
 

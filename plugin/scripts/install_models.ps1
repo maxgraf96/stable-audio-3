@@ -15,7 +15,7 @@
 # Which models get downloaded (SA3_MODEL_SET):
 #   auto    (default) everything this GPU can actually run - see below
 #   all     every model
-#   small   sa3-sm-music + sa3-sm-sfx only
+#   small   sa3-sm-music only (sa3-sm-sfx is not published yet)
 #   medium  sa3-medium only
 #
 # `auto` exists because sa3-medium needs ~10.5 GB of VRAM and the app refuses
@@ -82,7 +82,10 @@ switch ($ModelSet) {
 }
 
 $files = @()
-if ($wantSmall)  { $files += ModelFiles "small-music"; $files += ModelFiles "small-sfx" }
+# small-sfx is intentionally not published yet - see RELEASE_WINDOWS.md.
+# Listing it here would 404 every auto/all install, so it is added back
+# only when its weights land in the repo.
+if ($wantSmall)  { $files += ModelFiles "small-music" }
 if ($wantMedium) { $files += ModelFiles "medium" }
 if (-not $files) { throw "nothing selected to download" }
 

@@ -253,6 +253,16 @@ class Pipeline:
         if local_dir is not None:
             self.model = load_local_model(local_dir, device, self.model_half)
             source = f"local {local_dir}"
+        elif models_root() is not None:
+            # An installed app: the models directory exists but doesn't hold
+            # this one. Falling through to the Hub here would try a gated
+            # download and surface a raw 401 to someone who has no Hugging Face
+            # account and shouldn't need one. Say what's actually wrong.
+            raise RuntimeError(
+                f"{model_name} is not installed. Run install_models.ps1 to fetch it "
+                f"(expected {models_root() / model_name}). Some models are not "
+                f"published for this platform yet — try SA3 Medium or SA3 Small Music."
+            )
         else:
             self.model = StableAudioModel.from_pretrained(
                 model_name, device=device, model_half=self.model_half

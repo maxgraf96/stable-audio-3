@@ -170,13 +170,18 @@ def prompt_user_if_missing(args):
     return args
 
 
-def load_dit(dit_name: str, T_lat: int, dtype):
+def load_dit(dit_name: str, T_lat: int, dtype, lora_specs=None, num_steps=None):
     cfg = DIT_CHOICES[dit_name]
     ckpt = ensure_local(cfg["ckpt"])
     import importlib, io, contextlib
     mod = importlib.import_module(cfg["loader"])
+    # The loader's own chatter is swallowed, but the LoRA merge summary is routed
+    # to stderr (not redirected) so it stays visible to callers that capture it.
+    lora_log = lambda m: print(m, file=sys.stderr)
     with contextlib.redirect_stdout(io.StringIO()):
-        model = mod.load_dit(str(ckpt), T_lat=T_lat, dtype=dtype, compile_=False)
+        model = mod.load_dit(str(ckpt), T_lat=T_lat, dtype=dtype, compile_=False,
+                             lora_specs=lora_specs, num_steps=num_steps,
+                             lora_log=lora_log)
     return model, str(ckpt)
 
 
@@ -238,26 +243,40 @@ def save_wav(path: str, audio: np.ndarray, sample_rate: int = SAMPLE_RATE):
 
 
 def read_wav(path: str) -> np.ndarray:
-    """Read a 16-bit PCM WAV at 44.1 kHz. Returns (2, T) float32 in [-1, 1].
+    """Read a WAV file. Returns (2, T) float32 in [-1, 1].
 
-    Mono input is duplicated to stereo. Other sample rates / bit-depths error out
-    with a hint to ffmpeg-resample first — keeps this script dependency-free.
+    Handles 16-bit PCM at 44.1 kHz natively. Falls back to ffmpeg for any
+    other format (24-bit, 32-bit float, 48 kHz, etc.)
+    Mono input is duplicated to stereo.
     """
-    with wave.open(path, "rb") as w:
-        nch, sw, sr, nframes = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
-        if sr != SAMPLE_RATE:
-            raise ValueError(
-                f"{path}: sample rate {sr} Hz; need {SAMPLE_RATE}. "
-                f"Resample first: ffmpeg -i {path} -ar {SAMPLE_RATE} -ac 2 -sample_fmt s16 out.wav"
-            )
-        if sw != 2:
-            raise ValueError(f"{path}: {sw*8}-bit WAV; need 16-bit PCM. Convert with ffmpeg.")
-        raw = np.frombuffer(w.readframes(nframes), dtype=np.int16).astype(np.float32) / 32767.0
-    if nch == 1:
-        audio = np.stack([raw, raw], axis=0)            # (2, T)
-    else:
-        audio = raw.reshape(-1, nch).T[:2]              # (2, T)
-    return audio
+    try:
+        with wave.open(path, "rb") as w:
+            nch, sw, sr, nframes = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
+            if sr == SAMPLE_RATE and sw == 2:
+                raw = np.frombuffer(w.readframes(nframes), dtype=np.int16).astype(np.float32) / 32767.0
+                if nch == 1:
+                    return np.stack([raw, raw], axis=0)   # (2, T)
+                return raw.reshape(-1, nch).T[:2]          # (2, T)
+    except wave.Error:
+        pass  # unsupported format (32-bit float, 24-bit PCM, etc.)
+
+    # Fallback: decode via ffmpeg — handles any sample rate, bit depth, or format
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", path,
+             "-f", "s16le", "-ar", str(SAMPLE_RATE), "-ac", "2", "-"],
+            capture_output=True, check=True,
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            f"{path}: unsupported WAV format. Install ffmpeg to handle 24-bit/32-bit/48kHz audio:\n"
+            f"  brew install ffmpeg\n"
+            f"Or convert manually: ffmpeg -i \"{path}\" -ar {SAMPLE_RATE} -ac 2 -sample_fmt s16 resampled.wav"
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"{path}: ffmpeg failed — {e.stderr.decode().strip()}")
+    raw = np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32) / 32767.0
+    return raw.reshape(-1, 2).T  
 
 
 def load_encoder(decoder_name: str, dtype):
@@ -373,13 +392,32 @@ def main():
                     help="Path to the bundled T5Gemma FP16 .npz (weights + tokenizer). "
                          "Default points at models/mlx/t5gemma_f16.npz next to this script; "
                          "auto-downloaded from HuggingFace if not present.")
+    ap.add_argument("--lora", action="append", nargs="+", default=None,
+                    metavar=("ADAPTER", "KEY=VAL"),
+                    help="A LoRA adapter to apply to the DiT — repeat the flag for several. "
+                         "Each --lora takes the adapter path followed by optional key=value "
+                         "options: strength=S (default --lora-strength) and steps=RANGE, a "
+                         "1-based inclusive sampling-step range: 2-8, 2- (2..last), -4 (1..4) "
+                         "or 3 (just step 3; default: all steps). Example: "
+                         "--lora plini.safetensors strength=0.8 steps=2- . Adapters covering "
+                         "every step are merged at load; step-gated ones are re-merged in "
+                         "place at the (few) step boundaries — ~80 ms each on medium, no "
+                         "extra memory, every step runs at full speed. The adapter is a "
+                         ".safetensors file (SA3-native train_lora.py / underfit output) or "
+                         "a PEFT adapter directory (with its adapter_config.json). ONLY "
+                         ".safetensors is accepted — a pickle .ckpt/.pt is refused (it would "
+                         "execute code on load). The adapter's base must match --dit.")
+    ap.add_argument("--lora-strength", type=float, default=1.0,
+                    help="Default strength for --lora adapters without their own strength= "
+                         "(default 1.0). 0 disables (bit-identical to no LoRA); >1 amplifies.")
 
     # ── Sampling ──────────────────────────────────────────────────────────────
     ap.add_argument("--seconds", type=float, default=30.0,
                     help="Output audio length in seconds. T_lat (latent positions) is derived as "
-                         "ceil(seconds * 44100 / 4096), then bumped to even when --decoder=same-s "
-                         "(encoder modulo-32 padding requirement). Final WAV is trimmed to exactly "
-                         "--seconds.")
+                         "ceil(seconds * 44100 / 4096) — a natural ceil that depends ONLY on "
+                         "--seconds (and --seed via the DiT), never on --decoder. This keeps the "
+                         "sampled latent (and hence the music) identical across decoders for a "
+                         "given prompt/seed. Final WAV is trimmed to exactly --seconds.")
     ap.add_argument("--steps", type=int, default=8,
                     help="Number of pingpong sampling steps. Minimum 1 (single forward pass — fastest, "
                          "lowest quality). rf_denoiser is distilled for 8 (default — sweet spot). "
@@ -420,11 +458,11 @@ def main():
                          "script doesn't). Default: on.")
 
     # ── Output ────────────────────────────────────────────────────────────────
-    ap.add_argument("--out", default="out.wav",
+    ap.add_argument("--out", default=None,
                     help="Output WAV path. Relative paths land in the project's output/ "
                          "directory (auto-created); absolute paths are used as-is. "
                          "Always written as 16-bit PCM stereo at 44.1 kHz, trimmed to "
-                         "exactly --seconds.")
+                         "exactly --seconds. If omitted, auto-named from the prompt and seed.")
     ap.add_argument("--play", action="store_true",
                     help="After writing the WAV, play it through the default output device "
                          "via the macOS `afplay` binary. Blocking — the script exits when "
@@ -434,24 +472,42 @@ def main():
     if args.steps < 1:
         ap.error(f"--steps must be ≥ 1 (got {args.steps})")
 
-    # Relative --out paths land in the project's output/ folder; absolute paths
-    # are honoured as-is so users can still write anywhere on disk.
+    # Parse --lora groups into specs (fail fast, before any model loads).
+    args.lora_specs = None
+    if args.lora:
+        from models.defs.lora_merge import parse_lora_spec, LoraError
+        try:
+            args.lora_specs = [parse_lora_spec(toks, args.lora_strength)
+                               for toks in args.lora]
+        except LoraError as e:
+            ap.error(str(e))
+
+    args = prompt_user_if_missing(args)
+    if args.prompt is None:
+        args.prompt = input("Prompt: ").strip()
+
+    # Resolve output path — auto-name from prompt+seed when --out is not given.
+    if args.out is None:
+        import re as _re
+        slug = _re.sub(r'[^a-z0-9]+', '_', args.prompt.lower()).strip('_')[:48]
+        args.out = f"{slug}_{args.seed}.wav" if slug else f"out_{args.seed}.wav"
     out_path = Path(args.out)
     if not out_path.is_absolute():
         out_path = REPO / "output" / out_path
     out_path.parent.mkdir(parents=True, exist_ok=True)
     args.out = str(out_path)
-
-    args = prompt_user_if_missing(args)
-    if args.prompt is None:
-        args.prompt = input("Prompt: ").strip()
     # Empty prompt is allowed — T5Gemma will produce padding-only embeddings,
     # which (with the learned padding_embedding) is the unconditional case.
     dtype = mx.float32 if args.dit_dtype == "fp32" else mx.float16
+    # T_lat is a DECODER-INDEPENDENT function of --seconds only (natural ceil, no
+    # even-bump). This matches the TensorRT pipeline (sa3_trt.py::resolve_T_lat) so
+    # the same prompt/seed/seconds yields the SAME latent — and hence the same music —
+    # regardless of --decoder. The old code bumped T_lat to even for same-s, which made
+    # make_noise(T_lat, seed) draw a different noise tensor and thus sample a completely
+    # different latent just by switching decoder. SAME-S's internal-length constraint
+    # (T_lat*17 must align to 34, i.e. even) is satisfied by the decode dispatch below:
+    # odd T_lat is routed through decode_chunked, whose every window is an even kernel.
     T_lat = max(1, math.ceil(args.seconds * SAMPLE_RATE / SAMPLES_PER_LATENT))
-    # SAME-S requires T_audio_patches divisible by 32 → T_lat must be even (T_aud=T_lat*16).
-    if args.decoder == "same-s" and T_lat % 2 != 0:
-        T_lat += 1
     target_dur = T_lat * SAMPLES_PER_LATENT / SAMPLE_RATE
 
     # Inpaint validation + parameter mapping
@@ -540,6 +596,16 @@ def main():
     t0 = time.time()
     padding_emb, secs_embedder = load_conditioner_from_npz(
         str(ensure_local(DIT_CHOICES[args.dit]["ckpt"])), prefix="cond.")
+    if args.lora_specs:
+        # The conditioner is loaded straight from the npz, so the DiT-side merge
+        # never reaches it — apply any seconds-conditioner deltas (underfit
+        # adapters carry one) to the live embedder here. Whole-generation:
+        # conditioning runs once, before sampling, so steps= cannot gate it.
+        from models.defs.lora_merge import apply_conditioner_lora
+        secs_embedder.W, _n_cond = apply_conditioner_lora(secs_embedder.W,
+                                                          args.lora_specs)
+        if _n_cond:
+            sub(f"lora  conditioner delta applied ({_n_cond} adapter(s), whole generation)")
     embeds = embeds.astype(dtype)
     embeds_padded = apply_prompt_padding(embeds, mask, padding_emb.astype(dtype))
     seconds_embed = secs_embedder(args.seconds).astype(dtype)              # (1, 1, 768)
@@ -579,8 +645,15 @@ def main():
         sub(f"encoder load {(time.time()-t0)*1000:.0f} ms")
 
         t0 = time.time()
+        # The ENCODER (SAME-S) needs T_audio_patches divisible by `pad_mod` (32) → an
+        # even latent length. T_lat itself stays the natural-ceil (decoder-independent)
+        # value; we only round the encode grid UP to the modulo, then trim the latent
+        # back to T_lat. This keeps the DiT/noise path identical across decoders.
+        enc_T_lat = T_lat
+        if (T_lat * 16) % pad_mod != 0:
+            enc_T_lat = math.ceil((T_lat * 16) / pad_mod) * pad_mod // 16
+        target_samples = enc_T_lat * SAMPLES_PER_LATENT
         audio_np = read_wav(args.init_audio)                                  # (2, T_audio_in)
-        target_samples = T_lat * SAMPLES_PER_LATENT
         if audio_np.shape[-1] >= target_samples:
             audio_np = audio_np[:, :target_samples]
             init_action = f"trimmed to {target_samples} samples"
@@ -593,13 +666,13 @@ def main():
 
         # Patch + encode (encoder always runs FP32 — softnorm-bottleneck-sensitive)
         t0 = time.time()
-        patches_np = patch_audio(audio_np, patch_size=256)                     # (1, 512, T_lat*16)
+        patches_np = patch_audio(audio_np, patch_size=256)                     # (1, 512, enc_T_lat*16)
         # Sanity: T_audio_patches must be divisible by encoder's required modulo
         assert patches_np.shape[-1] % pad_mod == 0, (
             f"T_audio_patches={patches_np.shape[-1]} not divisible by {pad_mod} "
             f"(decoder={args.decoder})"
         )
-        init_latents = enc_model(mx.array(patches_np))
+        init_latents = enc_model(mx.array(patches_np))[..., :T_lat]            # trim to natural T_lat
         mx.eval(init_latents)
         _stage_peak_b('Init audio encode')
         sub(f"encode  {(time.time()-t0)*1000:.0f} ms   latents {init_latents.shape}")
@@ -608,7 +681,15 @@ def main():
 
     # ── 3b. DiT pingpong sampling ──
     stage("[3/5]", f"DiT — load + sample ({args.steps} steps, σmax={sigma_max:.2f})")
-    t0 = time.time(); dit_model, _ = load_dit(args.dit, T_lat=T_lat, dtype=dtype)
+    if args.lora_specs:
+        for s in args.lora_specs:
+            rng = s["steps"]
+            rng_str = ("all steps" if rng is None else
+                       f"steps {rng[0] or 1}-{rng[1] if rng[1] is not None else args.steps}")
+            sub(f"lora  {os.path.basename(s['path'].rstrip('/'))}  "
+                f"(strength {s['strength']:g}, {rng_str})")
+    t0 = time.time(); dit_model, _ = load_dit(args.dit, T_lat=T_lat, dtype=dtype,
+                                              lora_specs=args.lora_specs, num_steps=args.steps)
     _stage_peak_b('DiT load')
     sub(f"load {time.time()-t0:.1f}s")
 
@@ -697,8 +778,10 @@ def main():
         sys.stdout.flush()
 
     t0 = time.time()
+    _lora_plan = getattr(dit_model, "_lora_plan", None)
     latents = sample_flow_pingpong(model_fn, noise, sigmas, seed=args.seed + 1,
-                                    paste_back=paste_back, on_step=_on_step)
+                                    paste_back=paste_back, on_step=_on_step,
+                                    before_step=_lora_plan.sync if _lora_plan else None)
     mx.eval(latents)
     sample_ms = (time.time()-t0)*1000
     # Clear the progress line, then print the final summary in its place.
@@ -725,14 +808,25 @@ def main():
     t0 = time.time()
     kernel = chunk + 2 * ovl
     if T_lat > kernel:
+        # Natural-ceil T_lat may be odd; decode_chunked windows are all even kernels,
+        # so odd T_lat decodes correctly here (this is the common path, incl. 30s→323).
         patches = chunk_fn(decoder, latents_fp32, chunk, ovl)
         decode_mode = f"chunked (chunk={chunk}, ovl={ovl})"
     elif T_lat % 2 == 0:
         patches = decoder(latents_fp32)
         decode_mode = "un-chunked"
-    else:
+    elif T_lat > 6:
+        # Odd T_lat in (6, kernel]: a chunk=2,ovl=2 kernel (=6 < T_lat) keeps every
+        # window even for SAME-S while never zero-padding real latents.
         patches = chunk_fn(decoder, latents_fp32, 2, 2)
         decode_mode = "chunked (chunk=2, ovl=2)"
+    else:
+        # Tiny odd T_lat ≤ 6 (sub-0.5s): no even chunk kernel fits. Reflect-pad one
+        # latent to make T even, un-chunked decode, then trim the extra 16 patches.
+        # SAME-L has no even constraint and takes this path only for symmetry.
+        latents_even = mx.concatenate([latents_fp32, latents_fp32[..., -1:]], axis=-1)
+        patches = decoder(latents_even)[..., : T_lat * 16]
+        decode_mode = "un-chunked (odd-pad→trim)"
     mx.eval(patches)
     _stage_peak_b('Decode')
     sub(f"decode {decode_mode}  →  {(time.time()-t0)*1000:.0f} ms   patches {patches.shape}")

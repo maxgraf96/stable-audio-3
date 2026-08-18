@@ -161,6 +161,7 @@ cython_debug/
 
 *.ckpt
 *.wav
+*.asd
 wandb/*
 *.out
 
@@ -178,3 +179,6 @@ wandb/*
 # JUCE plugin build artifacts (CMake out-of-source build dir; first configure
 # also vendors JUCE source under _deps/, ~500 MB)
 /plugin/build/
+
+# LoRA-merged DiT cache (patched copies; regenerated on demand)
+optimized/tflite/models/tflite/lora_cache/

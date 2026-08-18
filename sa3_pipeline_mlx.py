@@ -41,7 +41,6 @@ from weights import ensure_local  # noqa: E402
 from sa3_mlx import (  # noqa: E402
     DECODER_CHOICES,
     DIT_CHOICES,
-    ENCODER_CHOICES,
     SAMPLE_RATE,
     SAMPLES_PER_LATENT,
     T5GEMMA_NPZ_REL,

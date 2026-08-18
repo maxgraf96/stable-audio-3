@@ -2,12 +2,13 @@
 """SA3 Studio — local drag-and-drop web UI for the variation harness.
 
 Open in a browser, drop a WAV, get 5 variations to listen to. Calls
-`sa3_variations.run_variations()` in-process and keeps a long-lived MLX
+`sa3_variations.run_variations()` in-process and keeps a long-lived backend
 Pipeline resident across clicks (rebuilt only when the audio duration
 changes, since the DiT's `_local_zeros_1` buffer is sized to T_lat).
 
 Usage:
-  optimized/mlx/.venv/bin/python sa3_studio.py
+  optimized/mlx/.venv/bin/python sa3_studio.py   # macOS (MLX)
+  .venv\Scripts\python.exe sa3_studio.py         # Windows / Linux (PyTorch)
   # then open http://localhost:8765 (auto-opens by default)
 """
 from __future__ import annotations
@@ -29,12 +30,36 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 SA3_ROOT = SCRIPT_DIR
 RUNS_DIR = SCRIPT_DIR / "runs"
 
-# Pipeline state shared across requests. The HTTP server is multi-threaded,
-# but the MLX pipeline isn't thread-safe (single mx context), so we serialize
-# generate() calls behind a lock. A generation crash takes down the studio —
-# that's the tradeoff for not paying ~1.3s of model load on every click.
+# Pipeline state shared across requests. The HTTP server is multi-threaded, but
+# neither backend is thread-safe (MLX has a single mx context; the torch DiT
+# holds per-call buffers), so we serialize generate() calls behind a lock. A
+# generation crash takes down the studio — that's the tradeoff for not paying
+# the model load on every click.
 _pipeline_lock = threading.Lock()
 _pipeline = None  # type: ignore[var-annotated]  # sa3_pipeline.Pipeline | None
+
+
+def _backend_label() -> str:
+    """Human-readable runtime for the page header, resolved lazily.
+
+    Importing sa3_pipeline pulls in mlx or torch, so this runs on first request
+    rather than at module import — a broken backend should surface as a page
+    that says so, not a studio that won't start.
+    """
+    try:
+        from sa3_pipeline import BACKEND
+    except Exception as exc:  # noqa: BLE001 - label only, never fatal
+        return f"an unavailable backend ({type(exc).__name__})"
+    if BACKEND == "mlx":
+        return "Apple Silicon via MLX"
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return f"CUDA via PyTorch ({torch.cuda.get_device_name(0)})"
+        return "CPU via PyTorch"
+    except Exception:  # noqa: BLE001
+        return "PyTorch"
 
 HTML = """<!doctype html>
 <html lang="en">
@@ -117,7 +142,7 @@ HTML = """<!doctype html>
 </head>
 <body>
   <h1>SA3 Studio</h1>
-  <div class="sub">Drop a WAV, get 5 variations. Apple-Silicon-native via MLX.</div>
+  <div class="sub">Drop a WAV, get 5 variations. Running on __BACKEND__.</div>
 
   <div class="drop" id="drop">
     <p><strong>Drop a WAV here</strong>, or <label style="cursor:pointer; text-decoration: underline;"><input type="file" id="file" accept="audio/*" style="display:none">browse</label></p>
@@ -399,7 +424,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path in ("/", "/index.html"):
-            body = HTML.encode("utf-8")
+            body = HTML.replace("__BACKEND__", _backend_label()).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -534,8 +559,10 @@ def main() -> int:
         import sa3_variations  # noqa: F401
     except ImportError as exc:
         sys.exit(
-            f"error: cannot import sa3_variations ({exc}). Run with the MLX venv:\n"
-            f"  optimized/mlx/.venv/bin/python {Path(__file__).name}"
+            f"error: cannot import sa3_variations ({exc}). Run with a project venv:\n"
+            f"  macOS:           optimized/mlx/.venv/bin/python {Path(__file__).name}\n"
+            f"  Windows:         .venv\\Scripts\\python.exe {Path(__file__).name}\n"
+            f"  Linux:           .venv/bin/python {Path(__file__).name}"
         )
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
 

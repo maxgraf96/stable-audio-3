@@ -1,11 +1,40 @@
 # SA3 Sample Variations
 
-Inference-only variation harness for Stable Audio 3 on Apple Silicon. Wraps the official `optimized/mlx/sa3` runner with a candidate-grid sweeper, two 5-shot product presets, a diagnostic preset, and a local drag-and-drop web UI.
+Inference-only variation harness for Stable Audio 3. Wraps SA3 inference with a candidate-grid sweeper, two 5-shot product presets, a diagnostic preset, and a local drag-and-drop web UI.
 
 Two scripts:
 
 - `sa3_variations.py` — CLI harness
 - `sa3_studio.py` — local web UI
+
+## Backends
+
+The harness runs on Apple Silicon and on CUDA. `sa3_pipeline.py` picks the runtime; neither script knows which one it got.
+
+| | `sa3_pipeline_mlx.py` | `sa3_pipeline_torch.py` |
+|---|---|---|
+| Hardware | Apple Silicon | NVIDIA CUDA (or CPU) |
+| Runs on | the `optimized/mlx/` model defs | the upstream `stable_audio_3` package |
+| Venv | `optimized/mlx/.venv` | `.venv` (`uv sync --extra ui`) |
+| Weights | converted `.npz` under `optimized/mlx/models/` | HF `safetensors`, cached by `huggingface_hub` |
+
+MLX wins whenever it imports, since it's the faster Apple path and the presets were tuned against it. Force either one with `SA3_BACKEND=mlx|torch`.
+
+The two backends agree on the parts that matter — same distilled ping-pong sampler, same `latent*(1-σ) + noise*σ` init mixing, same CFG/APG semantics.
+
+### Known gap: inpaint paste-back on the torch backend
+
+**Status: open, deliberately deferred.** `--preset free` (the default) is pure a2a and behaves identically on both backends. This only affects `--preset app`, whose inpaint candidates have not been listening-tested on CUDA.
+
+The MLX backend pastes the unmasked region back into the latent at *every* sampling step, so the untouched bars are exact by construction — that's the structural timbre preservation described in finding 1 below. `stable_audio_3`'s sampler has no paste-back hook: it relies purely on the mask conditioning (`inpaint_mask` + `inpaint_masked_input`) the model was trained with. The torch backend compensates by passing `init_audio` alongside `inpaint_audio` so noise levels below 1.0 are honoured at all (`sample_diffusion` only reads `sigma_max` when `init_data` is present), which mixes a `(1-σ)` trace of the source into the starting latent. Net effect: the unmasked region is *approximately* preserved rather than bit-exact.
+
+If it turns out to matter, the fix is to reproduce MLX's paste-back — either by generating with `return_latents=True` and running the sampling loop locally, or by mutating `denoised` in place from `sample_flow_pingpong`'s callback (it is consumed on the line after the callback fires).
+
+### Windows notes
+
+- PyPI's Windows `torch` wheel is built against CUDA 12.6, which has no `sm_120` kernels — Blackwell cards (RTX 50-series) fail at runtime. `pyproject.toml` therefore routes `sys_platform == 'win32'` to the `cu128` index at the same pinned version.
+- `flash_attn` has no Windows wheels; the DiT falls back to PyTorch SDPA and prints a startup notice. That's expected, not an error.
+- SA3 checkpoints and `google/t5gemma-b-b-ul2` are gated on Hugging Face — accept both licences and authenticate (`hf auth login`, or export `HF_TOKEN`) before the first run.
 
 ## Two product targets
 
@@ -29,7 +58,9 @@ Both produce 5 candidates per run from the same input. Neither is "wrong" — th
 ### Studio (recommended)
 
 ```bash
-optimized/mlx/.venv/bin/python sa3_studio.py
+optimized/mlx/.venv/bin/python sa3_studio.py   # macOS (MLX)
+.venv\Scripts\python.exe sa3_studio.py         # Windows (PyTorch / CUDA)
+.venv/bin/python sa3_studio.py                 # Linux (PyTorch / CUDA)
 ```
 
 Opens `http://localhost:8765`. Drop a WAV and click Generate — **Free variation** is the default-on preset; toggle to **Preserve sound** if you need to lock timbre instead. ~7.7s for 5 candidates on M4 Max once the pipeline is warm (10s loop, medium + same-l, 8 steps), ~9.8s on the first click while the pipeline loads. The pipeline stays resident across clicks for the same audio duration; a new duration triggers a ~1.3s rebuild.
@@ -50,6 +81,8 @@ optimized/mlx/.venv/bin/python sa3_variations.py \
   --kind melodic \
   --outdir ./runs/<name>
 ```
+
+(Windows: `.venv\Scripts\python.exe sa3_variations.py --sa3-root . --input <some.wav> --kind melodic --outdir .\runs\<name>`)
 
 Defaults to `--preset free` (unconditional a2a at n=0.45, varied seeds). Add `--preset app` for the prompt-anchored "preserve sound" regime. Use `--noise-a2a` to override the noise level (mirrors the studio slider). Filename-based BPM/key auto-detection runs by default for `app` (which uses BPM for bar-aware inpaint masks); `--bpm` / `--key` override. `free` ignores both since it sends an empty prompt and has no inpaint candidates.
 

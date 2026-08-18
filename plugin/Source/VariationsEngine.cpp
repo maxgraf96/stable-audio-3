@@ -6,95 +6,10 @@
 #include <cstdlib>
 #include <stdexcept>
 
-#include "sa3_orchestrator.h"
-
 namespace sa3plugin {
-
-// Keep our public enum in lock-step with the orchestrator's so the
-// static_cast in doSwitchModel / doLoad below is well-defined.
-static_assert(static_cast<int>(ModelKind::MEDIUM)
-              == static_cast<int>(sa3::orch::ModelKind::MEDIUM),
-              "ModelKind::MEDIUM must mirror sa3::orch::ModelKind::MEDIUM");
-static_assert(static_cast<int>(ModelKind::SMALL_MUSIC)
-              == static_cast<int>(sa3::orch::ModelKind::SMALL_MUSIC),
-              "ModelKind::SMALL_MUSIC must mirror sa3::orch::ModelKind::SMALL_MUSIC");
-static_assert(static_cast<int>(ModelKind::SMALL_SFX)
-              == static_cast<int>(sa3::orch::ModelKind::SMALL_SFX),
-              "ModelKind::SMALL_SFX must mirror sa3::orch::ModelKind::SMALL_SFX");
 
 namespace {
 
-// All three model kinds share the same T5Gemma encoder; only the DiT +
-// autoencoder pair differs. End-users keep all candidate files in the
-// same models directory and the engine picks the right four at load time.
-constexpr const char* kT5GemmaFile = "t5gemma_f16.safetensors";
-
-struct ModelFiles {
-    const char* dit;
-    const char* encoder;
-    const char* decoder;
-    const char* display_name;
-};
-
-constexpr ModelFiles modelFilesFor(ModelKind kind) {
-    switch (kind) {
-        case ModelKind::SMALL_MUSIC:
-            return {
-                "dit_sm-music_f16.safetensors",
-                "same_s_encoder_f32.safetensors",
-                "same_s_decoder_f32.safetensors",
-                "SA3-sm-music",
-            };
-        case ModelKind::SMALL_SFX:
-            return {
-                "dit_sm-sfx_f16.safetensors",
-                "same_s_encoder_f32.safetensors",
-                "same_s_decoder_f32.safetensors",
-                "SA3-sm-sfx",
-            };
-        case ModelKind::MEDIUM:
-        default:
-            return {
-                "dit_medium_f16.safetensors",
-                "same_l_encoder_f32.safetensors",
-                "same_l_decoder_f32.safetensors",
-                "SA3-medium",
-            };
-    }
-}
-
-// Where the four safetensors files live for the currently-running plugin.
-// Resolution order:
-//   1. $SA3_MODELS_DIR — dev override; lets us run the build-tree binary
-//      against a freshly downloaded model snapshot without rebuilding.
-//   2. <bundle>/Contents/Resources/models — self-contained bundle layout
-//      (CMake's SA3_VENDOR_MODELS=ON path; off by default because each
-//      bundle would otherwise weigh ~7 GB).
-//   3. ~/Library/Application Support/SA3 Variations/models — production
-//      default. End-users download the models once and drop them here;
-//      all three plugin formats share the single copy.
-juce::File resolveModelsDir()
-{
-    if (const char* env = std::getenv("SA3_MODELS_DIR"); env && *env) {
-        juce::File f(juce::String::fromUTF8(env));
-        if (f.isDirectory()) return f;
-    }
-    auto exe = juce::File::getSpecialLocation(juce::File::currentExecutableFile);
-    auto bundled = exe.getParentDirectory()        // Contents/MacOS
-                      .getParentDirectory()         // Contents
-                      .getChildFile("Resources")
-                      .getChildFile("models");
-    if (bundled.isDirectory()) return bundled;
-    // juce::userApplicationDataDirectory on macOS is `~/Library`, *not*
-    // `~/Library/Application Support` — Apple bundles that into the path
-    // and JUCE doesn't expose it as its own special location.
-    return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
-        .getChildFile("Application Support")
-        .getChildFile("SA3 Variations")
-        .getChildFile("models");
-}
-
-constexpr int kSampleRate = sa3::orch::SAMPLE_RATE;   // 44100
 
 // ~5.8 ms at 44.1 k / ~5.3 ms at 48 k — long enough to kill the click at
 // start/stop, short enough to feel instant. Doubles as a warm-up runway
@@ -196,17 +111,12 @@ std::vector<float> VariationsEngine::extractPeaks(
 // ── VariationsEngine ─────────────────────────────────────────────────
 
 VariationsEngine::VariationsEngine()
-    : juce::Thread("SA3 MLX Worker")
+    : juce::Thread("SA3 Inference Worker")
 {
-    // Probe unified memory before anything else: it decides which model we
-    // default to, and the UI asks for it while the pipeline is still loading.
-    const auto profile = sa3::orch::probe_memory();
-    memory_info_.totalGB           = profile.total_bytes / 1e9;
-    memory_info_.workingSetGB      = profile.working_set_bytes / 1e9;
-    memory_info_.mediumSupported   = profile.medium_supported;
-    memory_info_.mediumComfortable = profile.medium_comfortable;
-    memory_info_.simulated         = profile.simulated;
-    memory_info_.defaultKind       = static_cast<ModelKind>(profile.default_kind);
+    backend_ = InferenceBackend::create();
+    // Probe memory before anything else: it decides which model we default
+    // to, and the UI asks for it while the pipeline is still loading.
+    memory_info_ = backend_->probeMemory();
     current_model_kind_.store(static_cast<int>(memory_info_.defaultKind),
                               std::memory_order_release);
     startThread();
@@ -864,50 +774,13 @@ void VariationsEngine::run()
     }
 }
 
-// Build + load the pipeline for a specific model kind. Throws on any
-// missing file or load failure. Caller owns the load_phase_ transitions
-// (doLoad sets it Loading→Loaded; doSwitchModel does the same but also
-// updates current_model_kind_ on success).
-static std::unique_ptr<sa3::orch::Pipeline> buildPipeline(
-    const juce::File& models,
-    ModelKind kind,
-    const MemoryInfo& mem)
-{
-    // Refuse rather than thrash. On a machine that can't hold sa3-medium the
-    // run doesn't fail — it swaps, and a generation that should take seconds
-    // takes minutes with no indication of why. A clear error is kinder.
-    if (kind == ModelKind::MEDIUM && ! mem.mediumSupported) {
-        throw std::runtime_error(
-            "SA3 Medium needs about 11 GB of unified memory; this Mac has "
-            + juce::String(mem.totalGB, 1).toStdString()
-            + " GB. Use SA3 Small Music or SA3 Small SFX instead — they need "
-              "about 3 GB and run faster.");
-    }
-    const auto files = modelFilesFor(kind);
-    const auto t5  = models.getChildFile(kT5GemmaFile).getFullPathName();
-    const auto dit = models.getChildFile(files.dit).getFullPathName();
-    const auto enc = models.getChildFile(files.encoder).getFullPathName();
-    const auto dec = models.getChildFile(files.decoder).getFullPathName();
-    for (const auto& p : { t5, dit, enc, dec }) {
-        if (! juce::File(p).existsAsFile())
-            throw std::runtime_error(
-                ("missing model file: " + p).toStdString());
-    }
-    return std::make_unique<sa3::orch::Pipeline>(
-        sa3::orch::load_pipeline(
-            t5.toStdString(), dit.toStdString(),
-            enc.toStdString(), dec.toStdString(),
-            mlx::core::float16,
-            static_cast<sa3::orch::ModelKind>(kind)));
-}
-
 void VariationsEngine::doLoad()
 {
     try {
         const auto kind = static_cast<ModelKind>(
             current_model_kind_.load(std::memory_order_acquire));
-        writeStatus(juce::String("Loading ") + modelFilesFor(kind).display_name + "...");
-        pipeline_ = buildPipeline(resolveModelsDir(), kind, memory_info_);
+        writeStatus(juce::String("Loading ") + modelDisplayName(kind) + "...");
+        backend_->load(kind, memory_info_);
         load_phase_.store(LoadPhase::Loaded, std::memory_order_release);
         writeStatus("Ready");
     }
@@ -924,13 +797,13 @@ void VariationsEngine::doSwitchModel(ModelKind kind)
     // models live alongside the medium one, so freeing first lets us
     // avoid a temporary 2× peak. The source/variation buffers and audio
     // thread state are untouched; only pipeline_ changes.
-    const auto display = juce::String("Loading ") + modelFilesFor(kind).display_name + "...";
+    const auto display = juce::String("Loading ") + modelDisplayName(kind) + "...";
     writeStatus(display);
     load_phase_.store(LoadPhase::Loading, std::memory_order_release);
-    pipeline_.reset();
+    backend_->unload();
 
     try {
-        pipeline_ = buildPipeline(resolveModelsDir(), kind, memory_info_);
+        backend_->load(kind, memory_info_);
         current_model_kind_.store(static_cast<int>(kind), std::memory_order_release);
         load_phase_.store(LoadPhase::Loaded, std::memory_order_release);
         writeStatus("Ready");
@@ -994,7 +867,7 @@ juce::var VariationsEngine::doUploadSource(juce::MemoryBlock bytes, int peaks_n)
 juce::var VariationsEngine::doGenerate(GenerateRequest req, int peaks_n)
 {
     try {
-        if (! pipeline_) throw std::runtime_error("pipeline not loaded");
+        if (! backend_->isLoaded()) throw std::runtime_error("pipeline not loaded");
 
         // Snapshot the source buffer for use as init_audio (planar fp32
         // pointer + sample count — the orchestrator copies it internally).
@@ -1018,22 +891,11 @@ juce::var VariationsEngine::doGenerate(GenerateRequest req, int peaks_n)
         float seconds = req.seconds > 0.0f ? req.seconds : static_cast<float>(src_seconds);
         seconds = std::clamp(seconds, 1.0f, 30.0f);
 
-        sa3::orch::InitAudio init_audio{
-            src_planar.data(), 2, src_samples,
-        };
-
-        std::vector<sa3::orch::CandidateSpec> specs;
-        if (req.preset == "free") {
-            specs = sa3::orch::build_free_preset(seconds, req.seed, req.noise);
-        } else if (req.preset == "app") {
-            specs = sa3::orch::build_app_preset(
-                seconds, req.seed, req.user_prompt, req.bpm, req.key,
-                req.beats_per_bar, req.noise, req.cfg_a2a, req.cfg_inpaint, req.apg);
-        } else {
-            throw std::runtime_error("unknown preset '" + req.preset + "' (expected free|app)");
-        }
-
-        const int total = static_cast<int>(specs.size());
+        // Every preset produces five candidates; the backend owns the spec
+        // list itself (sa3::orch on Apple, sa3_variations.py under the
+        // Python worker) since the preset definitions live beside the
+        // inference code they were tuned against.
+        const int total = 5;
 
         // Clear previous variation buffers + peaks atomically.
         {
@@ -1060,9 +922,9 @@ juce::var VariationsEngine::doGenerate(GenerateRequest req, int peaks_n)
         juce::Array<juce::var> slots;
         int i = 0;
         writeStatus(juce::String::formatted("Generating 1/%d...", total));
-        sa3::orch::run_variations(
-            *pipeline_, init_audio, specs, seconds, req.steps,
-            [&](const sa3::orch::VariationOutput& v) {
+        backend_->runVariations(
+            src_planar.data(), 2, src_samples, req, seconds,
+            [&](const BackendVariation& v) {
                 // Build an AudioBuffer<float> from the planar fp32 output.
                 juce::AudioBuffer<float> ab(2, v.samples);
                 ab.clear();
@@ -1087,8 +949,8 @@ juce::var VariationsEngine::doGenerate(GenerateRequest req, int peaks_n)
 
                 juce::DynamicObject::Ptr slot = new juce::DynamicObject();
                 slot->setProperty("idx",      i);
-                slot->setProperty("steer",    juce::String(v.spec.steer));
-                slot->setProperty("mode",     juce::String(v.spec.mode));
+                slot->setProperty("steer",    juce::String(v.steer));
+                slot->setProperty("mode",     juce::String(v.mode));
                 slot->setProperty("duration", dur);
                 slot->setProperty("peaks",    peaksToVar(peaks));
                 slots.add(juce::var(slot.get()));

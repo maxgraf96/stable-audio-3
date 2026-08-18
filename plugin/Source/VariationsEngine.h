@@ -38,46 +38,14 @@
 
 #include <JuceHeader.h>
 
-namespace sa3 { namespace orch { struct Pipeline; } }
+#include "InferenceBackend.h"
 
 namespace sa3plugin {
 
-// Mirrors sa3::orch::ModelKind (kept in sync by static_assert in the .cpp)
-// so the public API stays free of orchestrator headers. Same integer
-// values, so the engine just static_cast<> when calling load_pipeline.
-enum class ModelKind {
-    MEDIUM      = 0,    // sa3-medium      (DiT-Medium + SAME-L)
-    SMALL_MUSIC = 1,    // sa3-sm-music    (DiT-Small  + SAME-S)
-    SMALL_SFX   = 2,    // sa3-sm-sfx      (DiT-Small  + SAME-S)
-};
-
-// What the engine learned about this Mac's unified memory, surfaced to the
-// UI so it can pick a sensible default model and warn before someone loads
-// one that won't fit. Mirrors sa3::orch::MemoryProfile; kept free of
-// orchestrator headers so the WebView bridge can include just this file.
-struct MemoryInfo {
-    double    totalGB          = 0.0;
-    double    workingSetGB     = 0.0;
-    bool      mediumSupported   = false;   // sa3-medium fits at all
-    bool      mediumComfortable = false;   // ...with room for a real session
-    bool      simulated         = false;   // SA3_SIMULATE_RAM_GB in effect
-    ModelKind defaultKind       = ModelKind::SMALL_MUSIC;
-};
-
-struct GenerateRequest {
-    std::string preset;
-    float       seconds       = 5.0f;
-    float       noise         = 0.45f;
-    std::optional<float> bpm;
-    std::string key;
-    std::string user_prompt;
-    int         beats_per_bar = 4;
-    float       cfg_a2a       = 4.0f;
-    float       cfg_inpaint   = 4.0f;
-    float       apg           = 1.0f;
-    uint64_t    seed          = 1234;
-    int         steps         = 8;
-};
+// ModelKind, MemoryInfo, GenerateRequest and the InferenceBackend interface
+// itself live in InferenceBackend.h — they are the vocabulary the engine and
+// its backends share, and a backend .cpp needs them without dragging in the
+// engine's audio internals.
 
 // Snapshot of which buffer is active + how far through it the audio thread
 // is. Returned by getPlayState() — consumed by the UI poll.
@@ -225,8 +193,10 @@ private:
     std::mutex             job_mutex_;
     std::optional<Job>     pending_job_;
 
-    // ── Pipeline (worker-thread owned once loaded) ───────────────────
-    std::unique_ptr<sa3::orch::Pipeline> pipeline_;
+    // ── Inference backend (worker-thread owned once loaded) ──────────
+    // Built in the ctor, but only ever *used* from the worker thread:
+    // the MLX impl binds streams to whichever thread touches them first.
+    std::unique_ptr<InferenceBackend> backend_;
 
     // ── Decoded audio + peaks ────────────────────────────────────────
     // play_mutex_ protects source_buf_, variation_bufs_, active_idx_,

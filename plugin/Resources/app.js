@@ -732,7 +732,9 @@ function mediumNoticeText() {
     if (!m) return "";
     const have = m.totalGB.toFixed(0);
     if (!m.mediumSupported) {
-        return `SA3 Medium needs about ${MEDIUM_MIN_GB} GB of unified memory and this Mac has `
+        // "unified memory" / "this Mac" only describes Apple Silicon; the same
+        // notice shows on Windows, where the number is device memory.
+        return `SA3 Medium needs about ${MEDIUM_MIN_GB} GB of memory and this machine reports `
              + `${have} GB. Use SA3 Small Music or SA3 Small SFX — about 3 GB, and faster.`;
     }
     return `SA3 Medium fits in ${have} GB but leaves little headroom — expect it to be slow, `

@@ -13,12 +13,15 @@
 
 namespace {
 
-// JUCE 8 registers a custom URL scheme handler for `juce://` on WKWebView —
-// standard schemes (http/https) can't be intercepted in WKWebView, so the
-// resource provider is only invoked for `juce://` URLs. The provider receives
-// just the path portion of the URL (e.g. "/index.html"), not the full URL.
-constexpr const char* kOrigin   = "juce://sa3.local";
-constexpr const char* kIndexURL = "juce://sa3.local/index.html";
+// The resource provider is reachable at exactly one URL, and JUCE picks it per
+// platform: `juce://juce.backend/` on macOS/iOS/Linux, but `https://juce.backend/`
+// on Windows and Android (WebView2 can't intercept a custom scheme without
+// registering it at environment-creation time, so JUCE tunnels an https origin
+// instead). Hardcoding the macOS form loads nothing on Windows — the navigation
+// fails and the view stays blank. Ask JUCE rather than guessing.
+juce::String indexURL() {
+    return juce::WebBrowserComponent::getResourceProviderRoot() + "index.html";
+}
 
 juce::String mimeFor(const juce::String& path) {
     if (path.endsWithIgnoreCase(".html")) return "text/html";
@@ -153,9 +156,30 @@ juce::WebBrowserComponent::Options buildOptions(SA3AudioProcessor& processor,
         };
 
     return juce::WebBrowserComponent::Options{}
+       #if JUCE_WINDOWS
+        // Must be spelled out on Windows: defaultBackend resolves to the legacy
+        // IE control (see createAndInitPlatformDependentPart), which supports
+        // neither the juce:// resource provider nor the native function bridge
+        // — the window comes up blank with no error. WebView2 is only selected
+        // when asked for by name.
+        .withBackend(juce::WebBrowserComponent::Options::Backend::webview2)
+        // WebView2 writes a cache/profile directory and defaults it to the
+        // executable's own folder — fine in the build tree, denied once the app
+        // is installed somewhere read-only. Pin it under the user's AppData so
+        // it works in both places.
+        .withWinWebView2Options(
+            juce::WebBrowserComponent::Options::WinWebView2{}
+                .withUserDataFolder(
+                    juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+                        .getChildFile("SA3 Variations")
+                        .getChildFile("WebView2")))
+       #else
+        // macOS/iOS → WKWebView, Linux → WebKit. Both already support the
+        // resource provider, so the default is the right one there.
         .withBackend(juce::WebBrowserComponent::Options::Backend::defaultBackend)
+       #endif
         .withNativeIntegrationEnabled(true)
-        .withResourceProvider(resourceProvider, juce::String(kOrigin))
+        .withResourceProvider(resourceProvider)
         // ── Status / persistence ──────────────────────────────────────
         .withNativeFunction(
             "getStatus",
@@ -467,7 +491,7 @@ SA3AudioProcessorEditor::SA3AudioProcessorEditor(SA3AudioProcessor& p)
     // variations rendered.
     setSize(500, 820);
     addAndMakeVisible(webView);
-    webView.goToURL(kIndexURL);
+    webView.goToURL(indexURL());
 }
 
 SA3AudioProcessorEditor::~SA3AudioProcessorEditor() = default;

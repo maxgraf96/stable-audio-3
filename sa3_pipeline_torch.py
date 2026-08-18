@@ -268,6 +268,17 @@ class Pipeline:
                 model_name, device=device, model_half=self.model_half
             )
             source = "hub"
+        # Match the Apple backends' dtype policy exactly. Both sa3_pipeline_mlx
+        # and the C++ orchestrator load the DiT at fp16 but the SAME
+        # autoencoder at fp32 (load_samel_decoder(..., mx::float32)), whereas
+        # model_half=True casts the whole model including the pretransform.
+        #
+        # Measured on a real loop the difference is ~0.1 dB, so this is about
+        # removing a divergence rather than fixing an audible fault — at low
+        # sigma the output IS essentially the autoencoder round-trip, so it is
+        # the one place worth being bit-faithful to the tuned platform.
+        if self.model_half and self.model.model.pretransform is not None:
+            self.model.model.pretransform.to(torch.float32)
         if verbose:
             dtype = "fp16" if self.model_half else "fp32"
             print(

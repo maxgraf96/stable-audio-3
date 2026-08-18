@@ -46,7 +46,9 @@ So run *either* `sa3_studio.py` *or* the plugin, not both. If a run is inexplica
 
 Standalone only for now (`cmake -S plugin -B plugin/build -G "Visual Studio 17 2022" -A x64` then `cmake --build plugin/build --config Release`). Needs VS 2022 Build Tools with the C++ workload, CMake ≥ 3.22, and the `Microsoft.Web.WebView2` NuGet package unpacked where JUCE looks for it (`%LOCALAPPDATA%\PackageManagement\NuGet\Packages`) — JUCE prints the exact install command if it's missing.
 
-Inference runs through `plugin/scripts/sa3_worker.py`, a resident Python process the plugin spawns and keeps warm, speaking newline-delimited JSON over stdio. It finds the repo by walking up from the executable; `SA3_REPO` and `SA3_PYTHON` override that. Worker stderr — model load progress, tracebacks — goes to `%APPDATA%\SA3 Variations\worker.log`, which is the first place to look when a generation fails.
+Inference runs through `plugin/scripts/sa3_worker.py`, a resident Python process the plugin spawns and keeps warm, speaking newline-delimited JSON over stdio. It prefers an installed layout (`<exe>\app\`, `<exe>\runtime\`) and falls back to walking up for a dev checkout; `SA3_REPO` and `SA3_PYTHON` override either. Worker stderr — model load progress, tracebacks — goes to `%LOCALAPPDATA%\SA3 Variations\worker.log`, which is the first place to look when a generation fails.
+
+To ship this to someone who doesn't have the repo, see [plugin/RELEASE_WINDOWS.md](plugin/RELEASE_WINDOWS.md): it builds a ~16 MB installer that bootstraps the Python runtime and downloads fp16 weights on the target machine.
 
 `sa3_worker_smoke.exe <source.wav>` drives the same backend without the GUI and exits non-zero on failure:
 

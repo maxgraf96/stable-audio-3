@@ -1,4 +1,4 @@
-# install_models.ps1 — download SA3 Variations model weights into the place
+# install_models.ps1 - download SA3 Variations model weights into the place
 # the app looks at runtime:
 #   %LOCALAPPDATA%\SA3 Variations\models\
 #
@@ -13,7 +13,7 @@
 #   $env:SA3_MODEL_SET="small"; ... \install_models.ps1
 #
 # Which models get downloaded (SA3_MODEL_SET):
-#   auto    (default) everything this GPU can actually run — see below
+#   auto    (default) everything this GPU can actually run - see below
 #   all     every model
 #   small   sa3-sm-music + sa3-sm-sfx only
 #   medium  sa3-medium only
@@ -21,7 +21,7 @@
 # `auto` exists because sa3-medium needs ~10.5 GB of VRAM and the app refuses
 # to load it below that. On an 8 GB card the medium files are gigabytes that
 # can never be used. The threshold mirrors kMediumMinGB in
-# plugin/Source/WorkerBackend.cpp and MEDIUM_MIN_GB in sa3_worker.py — keep
+# plugin/Source/WorkerBackend.cpp and MEDIUM_MIN_GB in sa3_worker.py - keep
 # the three in step.
 [CmdletBinding()]
 param(
@@ -56,7 +56,7 @@ function ModelFiles([string]$name) {
     )
 }
 
-# ── decide what to fetch ─────────────────────────────────────────────
+# -- decide what to fetch ---------------------------------------------
 $wantSmall = $false
 $wantMedium = $false
 switch ($ModelSet) {
@@ -72,9 +72,9 @@ switch ($ModelSet) {
         } catch { $vram = 0 }
         if ($vram -ge $MediumMinVramMB) {
             $wantMedium = $true
-            Write-Host "GPU reports $vram MiB of VRAM — including SA3 Medium."
+            Write-Host "GPU reports $vram MiB of VRAM - including SA3 Medium."
         } else {
-            Write-Host "GPU reports $vram MiB of VRAM (< $MediumMinVramMB) — skipping SA3 Medium."
+            Write-Host "GPU reports $vram MiB of VRAM (< $MediumMinVramMB) - skipping SA3 Medium."
             Write-Host "Override with: `$env:SA3_MODEL_SET='all'"
         }
     }
@@ -86,13 +86,13 @@ if ($wantSmall)  { $files += ModelFiles "small-music"; $files += ModelFiles "sma
 if ($wantMedium) { $files += ModelFiles "medium" }
 if (-not $files) { throw "nothing selected to download" }
 
-Write-Host "SA3 Variations — model download" -ForegroundColor White
+Write-Host "SA3 Variations - model download" -ForegroundColor White
 Write-Host "repo:        $Repo@$Revision"
 Write-Host "destination: $Dest"
 
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 
-# ── download ─────────────────────────────────────────────────────────
+# -- download ---------------------------------------------------------
 # Skip anything already present at the size the server reports, so a
 # re-run after an interrupted download resumes rather than starting over.
 $downloaded = 0
@@ -106,7 +106,7 @@ foreach ($rel in $files) {
         $head = Invoke-WebRequest -Uri $url -Method Head -UseBasicParsing -MaximumRedirection 5 -TimeoutSec 60
         $remoteSize = [int64]$head.Headers['Content-Length'][0]
     } catch {
-        throw "cannot reach $url — check the network, or that the repo/revision exists.`n$($_.Exception.Message)"
+        throw "cannot reach $url - check the network, or that the repo/revision exists.`n$($_.Exception.Message)"
     }
 
     if ((Test-Path $out) -and ((Get-Item $out).Length -eq $remoteSize)) {
@@ -116,7 +116,7 @@ foreach ($rel in $files) {
 
     Step ("{0}  ({1:N0} MB)" -f $rel, ($remoteSize/1MB))
     # Invoke-WebRequest buffers whole responses in memory on Windows PowerShell
-    # 5.1, which is fatal for a 4 GB file — BITS streams to disk and shows
+    # 5.1, which is fatal for a 4 GB file - BITS streams to disk and shows
     # native progress. Fall back to a direct stream copy if BITS is unavailable
     # (it is disabled in some managed environments).
     try {
@@ -131,5 +131,5 @@ foreach ($rel in $files) {
 }
 
 $total = (Get-ChildItem $Dest -Recurse -File | Measure-Object Length -Sum).Sum
-Write-Host ("`nModels ready — {0:N1} GB in {1}" -f ($total/1GB), $Dest) -ForegroundColor Green
+Write-Host ("`nModels ready - {0:N1} GB in {1}" -f ($total/1GB), $Dest) -ForegroundColor Green
 if ($downloaded -eq 0) { Write-Host "(everything was already present)" }

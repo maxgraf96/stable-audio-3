@@ -1,4 +1,4 @@
-# setup_runtime.ps1 — build the Python runtime SA3 Variations needs.
+# setup_runtime.ps1 - build the Python runtime SA3 Variations needs.
 #
 # The app itself is a 6 MB executable; inference runs in a Python worker
 # (app\sa3_worker.py) driving PyTorch. That runtime is ~5.6 GB installed, well
@@ -21,16 +21,16 @@ $ErrorActionPreference = "Stop"
 $Root    = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $Runtime = Join-Path $Root "runtime"
 $Uv      = Join-Path $Root "tools\uv.exe"
-$Reqs    = Join-Path $Root "app\requirements.txt"
+$AppDir  = Join-Path $Root "app"
 
 function Step($m) { Write-Host "`n-> $m" -ForegroundColor Cyan }
 function Ok($m)   { Write-Host "   OK $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "   !! $m" -ForegroundColor Yellow }
 
-Write-Host "SA3 Variations — runtime setup" -ForegroundColor White
+Write-Host "SA3 Variations - runtime setup" -ForegroundColor White
 Write-Host "install folder: $Root"
 
-# ── preflight ────────────────────────────────────────────────────────
+# -- preflight --------------------------------------------------------
 # Check the things that make this fail slowly and confusingly if unmet, and
 # say so now rather than 2 GB into a download.
 
@@ -38,7 +38,7 @@ Step "Checking disk space"
 $drive = (Get-Item $Root).PSDrive
 $freeGB = [math]::Round($drive.Free / 1GB, 1)
 if ($freeGB -lt 16) {
-    throw "only $freeGB GB free on $($drive.Name): — the runtime needs ~6 GB and the models ~5 GB. Free up space and re-run."
+    throw "only $freeGB GB free on $($drive.Name): - the runtime needs ~6 GB and the models ~5 GB. Free up space and re-run."
 }
 Ok "$freeGB GB free on $($drive.Name):"
 
@@ -56,7 +56,7 @@ if (-not $smi) {
         $drv = ($info -split ",")[2].Trim()
         $major = [int](($drv -split "\.")[0])
         if ($major -lt 570) {
-            Warn "driver $drv is older than 570 — CUDA 12.8 needs 570+. Update the NVIDIA driver before running the app."
+            Warn "driver $drv is older than 570 - CUDA 12.8 needs 570+. Update the NVIDIA driver before running the app."
         }
         $vram = [double](($info -split ",")[1] -replace "[^0-9.]", "")
         if ($vram -lt 10500) {
@@ -65,10 +65,10 @@ if (-not $smi) {
     }
 }
 
-if (-not (Test-Path $Uv))  { throw "missing $Uv — the install looks incomplete, please reinstall." }
-if (-not (Test-Path $Reqs)) { throw "missing $Reqs — the install looks incomplete, please reinstall." }
+if (-not (Test-Path $Uv))  { throw "missing $Uv - the install looks incomplete, please reinstall." }
+if (-not (Test-Path (Join-Path $AppDir "uv.lock"))) { throw "missing uv.lock in $AppDir - the install looks incomplete, please reinstall." }
 
-# ── build the venv ───────────────────────────────────────────────────
+# -- build the venv ---------------------------------------------------
 if ($Force -and (Test-Path $Runtime)) {
     Step "Removing existing runtime\ (-Force)"
     Remove-Item $Runtime -Recurse -Force
@@ -83,16 +83,22 @@ if ($LASTEXITCODE -ne 0) { throw "uv venv failed ($LASTEXITCODE)" }
 Ok "runtime\ created"
 
 Step "Installing PyTorch + dependencies (~2.5 GB download, several minutes)"
-$env:VIRTUAL_ENV = $Runtime
-& $Uv pip install --python $Runtime -r $Reqs
+# `uv sync` against the shipped lock rather than a requirements file: the lock
+# carries the [[tool.uv.index]] entry routing torch to the CUDA 12.8 index,
+# which a flat requirements.txt cannot express - PyPI only has plain 2.7.1.
+# UV_PROJECT_ENVIRONMENT points uv at runtime\ instead of creating app\.venv, and
+# --no-install-project skips building stable-audio-3 itself: its source ships
+# in app\ and the worker puts that directory on sys.path.
+$env:UV_PROJECT_ENVIRONMENT = $Runtime
+& $Uv sync --project $AppDir --no-dev --no-install-project
 if ($LASTEXITCODE -ne 0) {
     throw "dependency install failed ($LASTEXITCODE). If this machine is behind a proxy, note that the CUDA wheels come from https://download.pytorch.org/whl/cu128 and the rest from https://pypi.org."
 }
 Ok "dependencies installed"
 
-# ── prove it actually works ──────────────────────────────────────────
+# -- prove it actually works ------------------------------------------
 # Importing torch and asking for the device is the cheapest end-to-end check
-# that the wheel matches the driver — a mismatch here is much easier to read
+# that the wheel matches the driver - a mismatch here is much easier to read
 # than the same failure surfacing inside the audio app later.
 Step "Verifying CUDA"
 $py = Join-Path $Runtime "Scripts\python.exe"

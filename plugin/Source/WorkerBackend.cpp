@@ -511,8 +511,19 @@ private:
     }
    #endif
 
+    // Local, not roaming. JUCE's userApplicationDataDirectory maps to %APPDATA%
+    // on Windows, which is the *roaming* profile — on a domain-joined machine
+    // that gets synced to the server at logon/logoff. Scratch WAVs and a log
+    // full of tqdm bars must never be part of that, and this is also where
+    // install_models.ps1 and models_root() put the multi-GB weights, so
+    // everything the app writes stays under one local root.
     static juce::File appDataDir()
     {
+       #if JUCE_WINDOWS
+        auto local = juce::File::getSpecialLocation(juce::File::windowsLocalAppData);
+        if (local != juce::File{})
+            return local.getChildFile("SA3 Variations");
+       #endif
         return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
             .getChildFile("SA3 Variations");
     }

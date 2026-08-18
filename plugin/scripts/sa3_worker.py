@@ -46,9 +46,17 @@ import traceback
 from pathlib import Path
 from typing import Any, Optional
 
-_REPO = Path(__file__).resolve().parents[2]
-if str(_REPO) not in sys.path:
-    sys.path.insert(0, str(_REPO))
+# Two layouts have to import sa3_variations / sa3_pipeline*:
+#
+#   dev       <repo>/plugin/scripts/sa3_worker.py  — siblings live at parents[1]
+#   installed <app>/app/sa3_worker.py              — siblings live right here
+#
+# Adding both covers each without having to detect which one we're in. The
+# entry that doesn't apply is simply a directory with nothing to import.
+_HERE = Path(__file__).resolve().parent
+for _p in (_HERE, _HERE.parents[1]):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 # Bind the real stdout before anything else can grab it, then point sys.stdout
 # at stderr. Every protocol write goes through _emit and the fd it captured.

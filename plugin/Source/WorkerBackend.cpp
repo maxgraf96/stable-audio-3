@@ -44,34 +44,71 @@ constexpr double kMediumComfortableGB = 14.0;
 constexpr int kLoadTimeoutMs     = 600000;   // 10 min
 constexpr int kGenerateTimeoutMs = 900000;   // 15 min
 
-// The repo root holds both the worker script and the .venv that can run it.
-// SA3_REPO overrides for odd layouts; otherwise walk up from the executable
-// looking for the worker itself, which is what actually has to exist.
-juce::File resolveRepoRoot()
+// Where the worker script and the interpreter that can run it live.
+//
+// Two layouts have to work. An installed app has no repo at all:
+//
+//   <exe dir>\app\sa3_worker.py          runtime\Scripts\python.exe
+//
+// while a dev checkout runs straight out of the tree:
+//
+//   <repo>\plugin\scripts\sa3_worker.py  <repo>\.venv\Scripts\python.exe
+//
+// Installed wins, because a developer who has also installed the app would
+// otherwise get whichever the walk-up happened to reach first. SA3_REPO and
+// SA3_PYTHON override either, and are what the smoke test uses.
+struct WorkerPaths {
+    juce::File script;
+    juce::File python;
+    bool resolved() const { return script.existsAsFile() && python.existsAsFile(); }
+};
+
+juce::File venvPython(const juce::File& root, const juce::String& venvName)
 {
-    if (auto env = juce::SystemStats::getEnvironmentVariable("SA3_REPO", {}); env.isNotEmpty()) {
-        juce::File f(env);
-        if (f.isDirectory()) return f;
-    }
-    auto dir = juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory();
-    for (int i = 0; i < 8 && dir.exists(); ++i) {
-        if (dir.getChildFile("plugin/scripts/sa3_worker.py").existsAsFile()) return dir;
-        dir = dir.getParentDirectory();
-    }
-    return {};
+   #if JUCE_WINDOWS
+    return root.getChildFile(venvName).getChildFile("Scripts/python.exe");
+   #else
+    return root.getChildFile(venvName).getChildFile("bin/python");
+   #endif
 }
 
-juce::File resolvePython(const juce::File& repo)
+WorkerPaths resolveWorkerPaths()
 {
+    WorkerPaths p;
+
+    // Installed layout, relative to the executable.
+    const auto exeDir =
+        juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory();
+    p.script = exeDir.getChildFile("app/sa3_worker.py");
+    p.python = venvPython(exeDir, "runtime");
+
+    // Dev checkout: walk up looking for the worker itself, which is the thing
+    // that actually has to exist.
+    if (! p.resolved()) {
+        juce::File repo;
+        if (auto env = juce::SystemStats::getEnvironmentVariable("SA3_REPO", {}); env.isNotEmpty()) {
+            juce::File f(env);
+            if (f.isDirectory()) repo = f;
+        }
+        if (repo == juce::File{}) {
+            auto dir = exeDir;
+            for (int i = 0; i < 8 && dir.exists(); ++i) {
+                if (dir.getChildFile("plugin/scripts/sa3_worker.py").existsAsFile()) { repo = dir; break; }
+                dir = dir.getParentDirectory();
+            }
+        }
+        if (repo != juce::File{}) {
+            p.script = repo.getChildFile("plugin/scripts/sa3_worker.py");
+            p.python = venvPython(repo, ".venv");
+        }
+    }
+
+    // Explicit overrides win over whatever the search found.
     if (auto env = juce::SystemStats::getEnvironmentVariable("SA3_PYTHON", {}); env.isNotEmpty()) {
         juce::File f(env);
-        if (f.existsAsFile()) return f;
+        if (f.existsAsFile()) p.python = f;
     }
-   #if JUCE_WINDOWS
-    return repo.getChildFile(".venv/Scripts/python.exe");
-   #else
-    return repo.getChildFile(".venv/bin/python");
-   #endif
+    return p;
 }
 
 #if JUCE_WINDOWS
@@ -337,20 +374,20 @@ public:
             "the Python inference worker is only wired up on Windows so far "
             "(the pipe setup in WorkerBackend.cpp is Win32-specific)");
        #else
-        const auto repo = resolveRepoRoot();
-        if (repo == juce::File{})
+        const auto paths = resolveWorkerPaths();
+        if (! paths.script.existsAsFile())
             throw std::runtime_error(
-                "could not locate the stable-audio-3 checkout. Set SA3_REPO to it.");
-        const auto script = repo.getChildFile("plugin/scripts/sa3_worker.py");
-        const auto python = resolvePython(repo);
-        if (! python.existsAsFile())
+                "could not find the inference worker (app\\sa3_worker.py). The install "
+                "looks incomplete — reinstall, or set SA3_REPO to a stable-audio-3 checkout.");
+        if (! paths.python.existsAsFile())
             throw std::runtime_error(
-                ("no Python environment at " + python.getFullPathName()
-                 + ". Run `uv sync --extra ui` in the repo, or set SA3_PYTHON.").toStdString());
+                ("no Python runtime at " + paths.python.getFullPathName()
+                 + ". Run scripts\\setup_runtime.ps1 from the install folder "
+                   "(or `uv sync` in a dev checkout), or set SA3_PYTHON.").toStdString());
 
         if (proc_ == nullptr || ! proc_->isRunning()) {
             proc_ = std::make_unique<WorkerProcess>();
-            proc_->launch(python, script, logFile());
+            proc_->launch(paths.python, paths.script, logFile());
         }
 
         juce::DynamicObject::Ptr req = new juce::DynamicObject();

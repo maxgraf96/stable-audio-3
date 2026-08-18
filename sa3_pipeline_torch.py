@@ -18,6 +18,8 @@ Usage:
 """
 from __future__ import annotations
 
+import json
+import os
 import sys
 import time
 import wave
@@ -118,6 +120,88 @@ def save_wav(path: str, audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> No
         w.writeframes(pcm.tobytes())
 
 
+def models_root() -> Optional[Path]:
+    """Where an installed app keeps its weights, or None on a dev machine.
+
+    Mirrors resolveModelsDir() in the MLX backend's VariationsEngine, including
+    the SA3_MODELS_DIR dev override, so both platforms answer "where are the
+    models" the same way:
+
+      1. $SA3_MODELS_DIR                              — dev override
+      2. %LOCALAPPDATA%\\SA3 Variations\\models         — Windows install
+      3. ~/.local/share/SA3 Variations/models         — Linux install
+    """
+    env = os.environ.get("SA3_MODELS_DIR", "").strip()
+    if env:
+        p = Path(env)
+        return p if p.is_dir() else None
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            p = Path(base) / "SA3 Variations" / "models"
+            return p if p.is_dir() else None
+        return None
+    p = Path.home() / ".local" / "share" / "SA3 Variations" / "models"
+    return p if p.is_dir() else None
+
+
+def find_local_model_dir(model_name: str) -> Optional[Path]:
+    """The installed directory holding `model_name`, if it's fully present.
+
+    A partial download (interrupted install) must not look like a usable model,
+    or the failure surfaces much later as a confusing safetensors error — so
+    both the config and the checkpoint have to exist before we claim it.
+    """
+    root = models_root()
+    if root is None:
+        return None
+    d = root / model_name
+    if (d / "model_config.json").is_file() and (d / "model.safetensors").is_file():
+        return d
+    return None
+
+
+def load_local_model(model_dir: Path, device: str, model_half: bool) -> StableAudioModel:
+    """Load a model from disk, with no network access at any point.
+
+    Reuses upstream's own loader rather than reimplementing it: everything here
+    is what StableAudioModel.from_pretrained does, minus the hub round-trip.
+
+    The one rewrite is the text encoder. The shipped config points it at the
+    gated repo it was published in:
+
+        {"repo_id": "stabilityai/stable-audio-3-medium",
+         "subfolder": "t5gemma-b-b-ul2"}
+
+    which would send transformers to the Hub — and fail without a token. The
+    conditioner resolves `load_from = model_path or repo_id or model_name`
+    (stable_audio_3/models/conditioners.py), so pointing `model_path` at the
+    copy sitting next to the checkpoint makes the load fully local. It's done
+    here rather than baked into the published config because the absolute path
+    differs on every machine.
+    """
+    from stable_audio_3.loading_utils import load_diffusion_cond
+
+    with open(model_dir / "model_config.json") as f:
+        model_config = json.load(f)
+
+    t5_dir = model_dir / "t5gemma-b-b-ul2"
+    for cond in model_config.get("model", {}).get("conditioning", {}).get("configs", []):
+        if cond.get("type") == "t5gemma":
+            cfg = cond.setdefault("config", {})
+            cfg.pop("repo_id", None)
+            cfg.pop("subfolder", None)
+            cfg["model_path"] = str(t5_dir)
+
+    model = load_diffusion_cond(
+        model_config, str(model_dir / "model.safetensors"),
+        device=device, model_half=model_half,
+    )
+    model.use_lora = False
+    model.lora_names = []
+    return StableAudioModel(model, model_config, device, model_half)
+
+
 class Pipeline:
     """Resident PyTorch pipeline. Load once, generate many.
 
@@ -165,14 +249,20 @@ class Pipeline:
 
         t0 = time.time()
         model_name = DIT_CHOICES[dit]["model"]
-        self.model = StableAudioModel.from_pretrained(
-            model_name, device=device, model_half=self.model_half
-        )
+        local_dir = find_local_model_dir(model_name)
+        if local_dir is not None:
+            self.model = load_local_model(local_dir, device, self.model_half)
+            source = f"local {local_dir}"
+        else:
+            self.model = StableAudioModel.from_pretrained(
+                model_name, device=device, model_half=self.model_half
+            )
+            source = "hub"
         if verbose:
             dtype = "fp16" if self.model_half else "fp32"
             print(
                 f"[pipeline] {model_name} + {decoder} on {device} ({dtype}) "
-                f"loaded in {time.time() - t0:.2f}s",
+                f"loaded in {time.time() - t0:.2f}s [{source}]",
                 file=sys.stderr,
             )
 

@@ -464,6 +464,11 @@ private:
             const auto event = parsed["event"].toString();
             if (event == "error")
                 throw std::runtime_error(parsed["message"].toString().toStdString());
+            if (event == "status") {
+                // Progress, not a reply — surface it and keep waiting.
+                reportStatus(parsed["message"].toString().toStdString());
+                continue;
+            }
             if (wanted.contains(event)) return parsed;
         }
     }

@@ -86,6 +86,17 @@ class InferenceBackend {
 public:
     virtual ~InferenceBackend() = default;
 
+    // Progress text for the UI's status line, called from whichever thread is
+    // inside load()/runVariations() — in practice the engine's worker thread.
+    //
+    // This exists because a backend can spend a long time somewhere the engine
+    // can't see. The Python worker keeps one pipeline sized to a specific loop
+    // length, so the first generate after a differently-sized source is dropped
+    // rebuilds it (~12 s) *inside* runVariations. Without this the UI sits on
+    // "Generating 1/5..." and the model load reads as a very slow generation.
+    using StatusFn = std::function<void(const std::string&)>;
+    void setStatusCallback(StatusFn fn) { status_ = std::move(fn); }
+
     // Called once at engine construction, before any load. Must not throw —
     // a backend that can't probe should return conservative defaults.
     virtual MemoryInfo probeMemory() = 0;
@@ -117,6 +128,12 @@ public:
 
     // Builds the backend this platform was compiled for.
     static std::unique_ptr<InferenceBackend> create();
+
+protected:
+    void reportStatus(const std::string& text) const { if (status_) status_(text); }
+
+private:
+    StatusFn status_;
 };
 
 }  // namespace sa3plugin

@@ -77,6 +77,10 @@ int main(int argc, char** argv)
 
     try {
         auto backend = InferenceBackend::create();
+        // Surfaces the same progress the plugin puts in its status line —
+        // notably the pipeline rebuild a differently-sized loop triggers.
+        backend->setStatusCallback(
+            [](const std::string& text) { std::printf("status  : %s\n", text.c_str()); });
 
         const auto mem = backend->probeMemory();
         std::printf("probe   : %.2f GB | mediumSupported=%d comfortable=%d default=%s\n",

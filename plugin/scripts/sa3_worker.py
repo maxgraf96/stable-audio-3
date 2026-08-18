@@ -18,9 +18,13 @@ silently would hang the UI thread waiting for a line that never comes.
     <- {"event":"ready","loadSeconds":16.4}
 
     -> {"cmd":"generate","src":"C:/.../source.wav","preset":"free",...}
+    <- {"event":"status","message":"Loading SA3 Medium (10.7s loop)..."}   (optional)
     <- {"event":"candidate","idx":0,"path":"C:/.../var_000.wav","steer":"...","mode":"a2a"}
     <- ... one per candidate, emitted as each finishes ...
     <- {"event":"done","count":5,"elapsed":4.9}
+
+`status` is progress, not a reply: it may appear any number of times before a
+terminal event and the plugin forwards it to the UI's status line.
 
     -> {"cmd":"quit"}
 
@@ -53,6 +57,12 @@ sys.stdout = sys.stderr
 
 # Mirrors sa3plugin::ModelKind in plugin/Source/InferenceBackend.h.
 KIND_MEDIUM, KIND_SMALL_MUSIC, KIND_SMALL_SFX = 0, 1, 2
+
+_DISPLAY_NAME = {
+    "medium": "SA3 Medium",
+    "sm-music": "SA3 Small Music",
+    "sm-sfx": "SA3 Small SFX",
+}
 
 _MODEL_TO_DIT = {
     "medium": ("medium", "same-l"),
@@ -161,6 +171,14 @@ class Worker:
         if self.pipeline is not None and self.pipeline_key == key:
             self._last_load_seconds = 0.0
             return
+        # Announce before building, not after: this is the one place the
+        # plugin can stall for ~12 s inside a generate — the pipeline is sized
+        # to the loop length, so the first run after a differently-sized source
+        # rebuilds it. Silence here reads as "generation is very slow".
+        _emit({
+            "event": "status",
+            "message": "Loading %s (%.1fs loop)..." % (_DISPLAY_NAME[model], seconds),
+        })
         t0 = time.time()
         # Drop the old one first: loading is the memory-heaviest moment and
         # holding two sets of weights at once is what pushes a 12 GB card over.

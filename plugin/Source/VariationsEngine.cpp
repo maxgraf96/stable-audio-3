@@ -114,6 +114,10 @@ VariationsEngine::VariationsEngine()
     : juce::Thread("SA3 Inference Worker")
 {
     backend_ = InferenceBackend::create();
+    // Backends report their own long operations (e.g. the Python worker
+    // rebuilding its pipeline for a new loop length mid-generate).
+    backend_->setStatusCallback(
+        [this](const std::string& text) { writeStatus(juce::String(text)); });
     // Probe memory before anything else: it decides which model we default
     // to, and the UI asks for it while the pipeline is still loading.
     memory_info_ = backend_->probeMemory();

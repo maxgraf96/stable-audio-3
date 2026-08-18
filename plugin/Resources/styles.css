@@ -85,6 +85,14 @@ body {
   color: var(--error); font-size: 16px; line-height: 1;
   cursor: pointer; padding: 2px 8px;
 }
+/* Shown only when the failure is one a retry can actually fix - a dead
+   worker process - so it never invites pointless clicking. */
+.error-retry {
+  background: transparent; border: 1px solid currentColor; color: inherit;
+  border-radius: 4px; padding: 1px 8px; font: inherit; font-size: 11px;
+  cursor: pointer; margin-left: auto; opacity: 0.85;
+}
+.error-retry:hover { opacity: 1; }
 .error-dismiss:hover { color: var(--fg); }
 
 /* ── Notice banner ────────────────────────────────────────────────── */

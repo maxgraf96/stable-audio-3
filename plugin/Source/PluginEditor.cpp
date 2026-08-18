@@ -181,6 +181,16 @@ juce::WebBrowserComponent::Options buildOptions(SA3AudioProcessor& processor,
         .withNativeIntegrationEnabled(true)
         .withResourceProvider(resourceProvider)
         // ── Status / persistence ──────────────────────────────────────
+        // Re-attempt a failed model load. The worker is a separate process and
+        // can die outside the app's control; without this the only recovery is
+        // restarting, which the UI gives no hint of.
+        .withNativeFunction(
+            "retryLoad",
+            [&processor](const juce::Array<juce::var>& /*args*/,
+                         juce::WebBrowserComponent::NativeFunctionCompletion complete) {
+                processor.getVariationsEngine().requestLoad();
+                complete(juce::var(true));
+            })
         .withNativeFunction(
             "getStatus",
             [&processor](const juce::Array<juce::var>& /*args*/,

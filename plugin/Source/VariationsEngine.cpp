@@ -137,12 +137,21 @@ VariationsEngine::~VariationsEngine()
 
 void VariationsEngine::requestLoad()
 {
-    LoadPhase expected = LoadPhase::NotLoaded;
-    if (load_phase_.compare_exchange_strong(expected, LoadPhase::Loading,
-                                            std::memory_order_acq_rel)) {
-        load_pending_.store(true, std::memory_order_release);
-        writeStatus("Loading models...");
-        notify();
+    // Retry from Error as well as NotLoaded. The worker is a separate process
+    // and can die for reasons that are transient or outside the app entirely —
+    // killed from Task Manager, an antivirus interruption, a driver reset, the
+    // GPU running out of memory. Accepting only NotLoaded meant one such death
+    // wedged the app permanently: Generate stays disabled and the only way back
+    // is a restart, with nothing telling the user that.
+    for (auto from : { LoadPhase::NotLoaded, LoadPhase::Error }) {
+        LoadPhase expected = from;
+        if (load_phase_.compare_exchange_strong(expected, LoadPhase::Loading,
+                                                std::memory_order_acq_rel)) {
+            load_pending_.store(true, std::memory_order_release);
+            writeStatus("Loading models...");
+            notify();
+            return;
+        }
     }
 }
 
@@ -871,7 +880,19 @@ juce::var VariationsEngine::doUploadSource(juce::MemoryBlock bytes, int peaks_n)
 juce::var VariationsEngine::doGenerate(GenerateRequest req, int peaks_n)
 {
     try {
-        if (! backend_->isLoaded()) throw std::runtime_error("pipeline not loaded");
+        if (! backend_->isLoaded()) {
+            // Either it was never loaded, or the worker process has since died —
+            // WorkerBackend::isLoaded() checks the process is still alive, so a
+            // crash lands here rather than at some confusing point further in.
+            //
+            // Drop the phase back to Error: the UI reads that as "recoverable"
+            // and offers Retry, which re-runs doLoad and respawns the worker.
+            // Leaving it at Loaded would keep Generate enabled and fail the same
+            // way on every click, with no route back short of restarting.
+            load_phase_.store(LoadPhase::Error, std::memory_order_release);
+            throw std::runtime_error(
+                "the inference worker is not running — press Retry to restart it");
+        }
 
         // Snapshot the source buffer for use as init_audio (planar fp32
         // pointer + sample count — the orchestrator copies it internally).

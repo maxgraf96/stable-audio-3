@@ -44,6 +44,7 @@ const setOneShotMode           = getNativeFunction("setOneShotMode");
 const copyVariationToClipboard = getNativeFunction("copyVariationToClipboard");
 const switchModel              = getNativeFunction("switchModel");
 const getMemoryInfo            = getNativeFunction("getMemoryInfo");
+const retryLoad                = getNativeFunction("retryLoad");
 
 // Fire a JUCE event (vs a native-function call). emitEvent is
 // fire-and-forget and dispatches the listener on the C++ message thread
@@ -93,6 +94,7 @@ const statusText = $("status-text");
 const errorBanner = $("error-banner");
 const errorText = $("error-text");
 const errorDismiss = $("error-dismiss");
+const errorRetry = $("error-retry");
 const noticeBanner = $("notice-banner");
 const noticeText = $("notice-text");
 const noticeDismiss = $("notice-dismiss");
@@ -643,7 +645,11 @@ function updateStatus(s) {
     statusEl.className = cls;
 
     if (phase === "error" || status.startsWith("Error")) {
-        showError(status);
+        // A load failure is recoverable — the worker is a separate process and
+        // relaunching it fixes the common causes (it was killed, the GPU was
+        // busy, antivirus interrupted the spawn). Offer Retry for those; a
+        // per-generation error has nothing to retry at this level.
+        showError(status, phase === "error");
     }
 
     // Keep the model dropdown reflecting the engine's actual current kind,
@@ -702,8 +708,24 @@ function updateButton() {
 }
 
 // ── Error banner ─────────────────────────────────────────────────────
-function showError(msg) { errorText.textContent = msg; errorBanner.hidden = false; }
-function clearError() { errorBanner.hidden = true; errorText.textContent = ""; }
+// `retryable` offers a Retry control. Reserved for load failures, where the
+// worker process died and re-launching it genuinely can fix things — a bad
+// source file or an unknown preset would not benefit.
+function showError(msg, retryable) {
+    errorText.textContent = msg;
+    errorRetry.hidden = !retryable;
+    errorBanner.hidden = false;
+}
+function clearError() {
+    errorBanner.hidden = true;
+    errorText.textContent = "";
+    errorRetry.hidden = true;
+}
+
+errorRetry.addEventListener("click", async () => {
+    clearError();
+    await retryLoad();
+});
 
 // Advisory banner. `key` dedupes: once the user dismisses a given notice we
 // don't show that one again this session (but a different one still shows).

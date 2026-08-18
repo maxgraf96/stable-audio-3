@@ -426,7 +426,17 @@ public:
        #endif
     }
 
-    bool isLoaded() const override { return loaded_; }
+    // A worker that died after loading is not loaded, whatever we last set.
+    // Without this, generate() would report "pipeline not loaded" from deep in
+    // runVariations instead of the engine noticing and offering a reload.
+    bool isLoaded() const override
+    {
+       #if JUCE_WINDOWS
+        return loaded_ && proc_ != nullptr && proc_->isRunning();
+       #else
+        return loaded_;
+       #endif
+    }
 
     void runVariations(
         const float* init_planar,
